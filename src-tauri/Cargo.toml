@@ -1,0 +1,37 @@
+[package]
+name = "quick-trade"
+version = "0.1.0"
+description = "단일종목 ETF 스캘핑용 원클릭 트레이딩"
+edition = "2021"
+
+[lib]
+name = "quick_trade_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["macos-private-api"] }
+tauri-plugin-single-instance = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+async-trait = "0.1"
+thiserror = "2"
+chrono = "0.4"
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc", "block-padding"] }
+base64 = "0.22"
+rand = "0.8"
+dirs = "6"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[profile.release]
+strip = true
+lto = true
+opt-level = "s"

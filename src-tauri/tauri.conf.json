@@ -1,0 +1,44 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "QuickTrade",
+  "version": "0.1.0",
+  "identifier": "dev.jhchoi.quicktrade",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:41730",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "macOSPrivateApi": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "QuickTrade",
+        "width": 300,
+        "height": 460,
+        "minWidth": 260,
+        "minHeight": 160,
+        "resizable": true,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": false,
+        "skipTaskbar": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "category": "Finance",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}
