@@ -96,6 +96,9 @@ async fn run_once(cfg: &WsConfig, tx: &mpsc::Sender<FeedEvent>) -> AppResult<()>
                         write.send(Message::Text(raw.clone())).await.map_err(ws_err)?;
                     } else if let Some(kv) = extract_aes_keys(txt) {
                         aes_key_iv = Some(kv);
+                    } else if let Some((tr_id, msg)) = subscribe_failure(txt) {
+                        // 구독 거절(승인키 만료 등)을 조용히 넘기면 "연결됨인데 시세 없음"이 된다
+                        tracing::warn!("웹소켓 구독 실패({tr_id}): {msg}");
                     }
                 } else {
                     for ev in parse_data_frame(txt, &aes_key_iv) {
@@ -129,6 +132,18 @@ fn extract_aes_keys(txt: &str) -> Option<(String, String)> {
     let key = out["key"].as_str()?;
     let iv = out["iv"].as_str()?;
     Some((key.to_string(), iv.to_string()))
+}
+
+/// 구독 응답이 실패(rt_cd != "0")면 (tr_id, msg1) 반환
+fn subscribe_failure(txt: &str) -> Option<(String, String)> {
+    let v: serde_json::Value = serde_json::from_str(txt).ok()?;
+    let rt_cd = v["body"]["rt_cd"].as_str()?;
+    if rt_cd == "0" {
+        return None;
+    }
+    let tr_id = v["header"]["tr_id"].as_str().unwrap_or("?").to_string();
+    let msg = v["body"]["msg1"].as_str().unwrap_or("(메시지 없음)").trim().to_string();
+    Some((tr_id, msg))
 }
 
 /// 실시간 데이터 프레임: `암호화여부|TR_ID|건수|필드1^필드2^...`
@@ -354,5 +369,18 @@ mod tests {
     fn pingpong_detected() {
         assert!(is_pingpong(r#"{"header":{"tr_id":"PINGPONG","datetime":"20260717"}}"#));
         assert!(!is_pingpong(r#"{"header":{"tr_id":"H0STCNT0"}}"#));
+    }
+
+    #[test]
+    fn subscribe_failure_detected() {
+        let fail = r#"{"header":{"tr_id":"H0STCNT0"},"body":{"rt_cd":"9","msg1":"INVALID APPROVAL KEY"}}"#;
+        let (tr_id, msg) = subscribe_failure(fail).unwrap();
+        assert_eq!(tr_id, "H0STCNT0");
+        assert_eq!(msg, "INVALID APPROVAL KEY");
+
+        // 성공 응답과 rt_cd 없는 메시지는 실패로 판정하지 않는다
+        let ok = r#"{"header":{"tr_id":"H0STCNT0"},"body":{"rt_cd":"0","msg1":"SUBSCRIBE SUCCESS"}}"#;
+        assert!(subscribe_failure(ok).is_none());
+        assert!(subscribe_failure(r#"{"header":{"tr_id":"PINGPONG"}}"#).is_none());
     }
 }

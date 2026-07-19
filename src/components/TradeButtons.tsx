@@ -26,7 +26,9 @@ export function TradeButtons() {
       const result = side === "buy" ? await buyMax(tradeCode) : await sellAll(tradeCode);
       if (result.ok) {
         const label = side === "buy" ? "매수 주문" : "매도 주문";
-        pushToast("info", `${label} ${result.qty}주 @ ${formatPrice(result.price)}`);
+        // 시장가 매도는 price가 0으로 내려온다
+        const priceLabel = result.price > 0 ? formatPrice(result.price) : "시장가";
+        pushToast("info", `${label} ${result.qty}주 @ ${priceLabel}`);
       } else {
         pushToast("error", result.message);
       }

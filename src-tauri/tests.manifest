@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 테스트 실행 파일용 매니페스트.
+     tauri 코드가 comctl32 v6 심볼(SetWindowSubclass 등)을 임포트하는데,
+     매니페스트 없는 exe는 구버전 comctl32(5.82)가 로드되어
+     STATUS_ENTRYPOINT_NOT_FOUND(0xc0000139)로 시작조차 못 한다.
+     (앱 본체는 tauri-build가 bin 타겟에 매니페스트를 넣어주지만 테스트 타겟은 제외라 직접 임베드) -->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity
+        type="win32"
+        name="Microsoft.Windows.Common-Controls"
+        version="6.0.0.0"
+        processorArchitecture="*"
+        publicKeyToken="6595b64144ccf1df"
+        language="*"
+      />
+    </dependentAssembly>
+  </dependency>
+</assembly>

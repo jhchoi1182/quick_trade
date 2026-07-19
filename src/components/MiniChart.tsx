@@ -11,6 +11,7 @@ import type { Candle, Quote } from "../types";
 import { aggregate, applyTick, lastMovingAverage, MA_PERIODS, movingAverage } from "../lib/candles";
 import { CHART_COLORS } from "../lib/theme";
 import { getCandles } from "../lib/tauri";
+import { useAccountStore } from "../stores/accountStore";
 import { useMarketStore } from "../stores/marketStore";
 import { useSettingsStore } from "../stores/settingsStore";
 import { useUiStore } from "../stores/uiStore";
@@ -39,6 +40,20 @@ export function MiniChart() {
   const setChartInterval = useSettingsStore((s) => s.setChartInterval);
   // 캐시가 전혀 없는 종목을 로드하는 동안 표시 (첫 백필은 수 초 걸릴 수 있음)
   const [loading, setLoading] = useState(false);
+  // WS 재연결 시 +1 → 로드 effect 재실행 (끊긴 동안의 틱 공백을 REST 재조회로 메움)
+  const [reloadKey, setReloadKey] = useState(0);
+
+  // 순단 복구 감지: 끊긴 동안 놓친 틱은 돌아오지 않으므로 캐시를 버리고 다시 불러온다
+  useEffect(() => {
+    let prev = useAccountStore.getState().connected;
+    return useAccountStore.subscribe((state) => {
+      if (state.connected && !prev) {
+        oneMinCacheRef.current = new Map();
+        setReloadKey((k) => k + 1);
+      }
+      prev = state.connected;
+    });
+  }, []);
 
   useEffect(() => {
     const el = containerRef.current;
@@ -143,7 +158,7 @@ export function MiniChart() {
     return () => {
       cancelled = true;
     };
-  }, [chartCode, interval]);
+  }, [chartCode, interval, reloadKey]);
 
   // 실시간 체결 틱 → 마지막 봉/이동평균 갱신
   useEffect(() => {

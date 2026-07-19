@@ -42,28 +42,37 @@ fn session_bounds(div: &str) -> (NaiveTime, NaiveTime) {
     }
 }
 
-/// REST 폴백 스냅샷: 현재가/등락률 + 1호가
+/// REST 폴백 스냅샷 — 주문 직전 신선한 시세가 필요할 때만 호출된다.
+/// 주문에 필요한 건 1호가라 호가 API를 먼저 부르고, 호가가 비어있을 때(동시호가 등)만
+/// 현재가 API로 폴백해 리미터 슬롯 1건을 아낀다 (주문 대기 지연 절감).
 pub async fn snapshot(rest: &KisRest, code: &str) -> AppResult<Quote> {
     let params = vec![
         ("FID_COND_MRKT_DIV_CODE", market_div(rest).to_string()),
         ("FID_INPUT_ISCD", code.to_string()),
     ];
-    let v = rest.get(PATH_PRICE, "FHKST01010100", &params).await?;
+    let v = rest.get(PATH_ASKING, "FHKST01010200", &params).await?;
     KisRest::check_rt(&v)?;
-    let o = &v["output"];
-    let price = num_f64(&o["stck_prpr"]);
-    let change_rate = num_f64(&o["prdy_ctrt"]);
+    let o1 = &v["output1"];
+    let ask1 = num_f64(&o1["askp1"]);
+    let bid1 = num_f64(&o1["bidp1"]);
 
-    let v2 = rest.get(PATH_ASKING, "FHKST01010200", &params).await?;
-    KisRest::check_rt(&v2)?;
-    let o1 = &v2["output1"];
+    // price는 주문 경로에서 ask1이 없을 때의 폴백으로만 쓰인다.
+    // UI 시세는 웹소켓이 소스이므로 여기서 ask1로 근사해도 표시에 영향 없음.
+    let (price, change_rate) = if ask1 > 0.0 {
+        (ask1, 0.0)
+    } else {
+        let v2 = rest.get(PATH_PRICE, "FHKST01010100", &params).await?;
+        KisRest::check_rt(&v2)?;
+        let o = &v2["output"];
+        (num_f64(&o["stck_prpr"]), num_f64(&o["prdy_ctrt"]))
+    };
 
     Ok(Quote {
         code: code.to_string(),
         price,
         change_rate,
-        ask1: num_f64(&o1["askp1"]),
-        bid1: num_f64(&o1["bidp1"]),
+        ask1,
+        bid1,
         volume: 0.0,
         ts: now_kst_fake_epoch(),
     })
@@ -91,9 +100,9 @@ fn minus_one_minute(hhmmss: &str, session_open: NaiveTime) -> Option<String> {
 }
 
 /// 당일 1분봉 페이징 (커서 시각에서 과거 방향으로 30건씩)
-async fn today_minutes(rest: &KisRest, code: &str, out: &mut Vec<Candle>) -> AppResult<()> {
+async fn today_minutes(rest: &KisRest, code: &str, div: &str, out: &mut Vec<Candle>) -> AppResult<()> {
     let now = now_kst();
-    let (open, close) = session_bounds(market_div(rest));
+    let (open, close) = session_bounds(div);
     if now.time() < open || matches!(now.weekday(), Weekday::Sat | Weekday::Sun) {
         return Ok(());
     }
@@ -101,7 +110,7 @@ async fn today_minutes(rest: &KisRest, code: &str, out: &mut Vec<Candle>) -> App
     loop {
         let params = vec![
             ("FID_ETC_CLS_CODE", String::new()),
-            ("FID_COND_MRKT_DIV_CODE", market_div(rest).to_string()),
+            ("FID_COND_MRKT_DIV_CODE", div.to_string()),
             ("FID_INPUT_ISCD", code.to_string()),
             ("FID_INPUT_HOUR_1", cursor.clone()),
             ("FID_PW_DATA_INCU_YN", "Y".to_string()),
@@ -192,12 +201,22 @@ async fn past_day_minutes(
 /// 차트용 1분봉: 당일 + MA120이 가능해질 때까지 과거 영업일 백필
 pub async fn candles_1m(rest: &KisRest, code: &str) -> AppResult<Vec<Candle>> {
     let mut all: Vec<Candle> = Vec::new();
-    today_minutes(rest, code, &mut all).await?;
+    // 당일 분봉도 통합(UN) 지원 여부가 불확실하므로 실패 시 KRX(J)로 폴백
+    let mut div = market_div(rest);
+    if let Err(e) = today_minutes(rest, code, div, &mut all).await {
+        if div != "UN" {
+            return Err(e);
+        }
+        tracing::warn!("당일 분봉 통합(UN) 조회 실패({e}) — KRX(J)로 폴백");
+        div = "J";
+        all.clear();
+        today_minutes(rest, code, div, &mut all).await?;
+    }
 
     let mut date = now_kst().date();
     let mut scanned = 0usize;
-    // 과거 일별 분봉의 통합(UN) 지원 여부가 불확실하므로 실패 시 KRX(J)로 폴백
-    let mut past_div = market_div(rest);
+    // 과거 일별 분봉: 당일 조회가 이미 J로 폴백했으면 그대로 J를 쓴다
+    let mut past_div = div;
     while all.len() < MIN_BARS && scanned < MAX_SCAN_DAYS {
         date -= ChronoDuration::days(1);
         scanned += 1;

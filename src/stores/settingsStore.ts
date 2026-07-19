@@ -10,12 +10,24 @@ interface SettingsState {
   setChartInterval: (min: number) => void;
 }
 
-// 슬라이더 드래그 등으로 조용한 저장이 연발되지 않게 디바운스
+// 슬라이더 드래그 등으로 조용한 저장이 연발되지 않게 디바운스.
+// 예약 시점의 객체를 캡처하지 않고 발사 시점의 최신 스토어 상태를 저장한다 —
+// 그 사이 모달 저장(엔진 재시작 포함)이 있었을 때 옛 설정으로 되덮는 경합 방지.
 let silentSaveTimer: ReturnType<typeof setTimeout> | undefined;
-function debouncedSave(settings: Settings): void {
-  if (silentSaveTimer) clearTimeout(silentSaveTimer);
+
+function cancelSilentSave(): void {
+  if (silentSaveTimer) {
+    clearTimeout(silentSaveTimer);
+    silentSaveTimer = undefined;
+  }
+}
+
+function scheduleSilentSave(): void {
+  cancelSilentSave();
   silentSaveTimer = setTimeout(() => {
-    void saveSettings(settings).catch(() => {});
+    silentSaveTimer = undefined;
+    const latest = useSettingsStore.getState().settings;
+    if (latest) void saveSettings(latest).catch(() => {});
   }, 400);
 }
 
@@ -26,6 +38,7 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
     set({ settings });
   },
   save: async (next) => {
+    cancelSilentSave(); // 예약된 조용한 저장이 이 저장을 되덮지 않게 취소
     await saveSettings(next);
     set({ settings: next });
   },
@@ -33,15 +46,13 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
   setOpacity: (v) => {
     const cur = get().settings;
     if (!cur) return;
-    const next = { ...cur, opacity: v };
-    set({ settings: next });
-    debouncedSave(next);
+    set({ settings: { ...cur, opacity: v } });
+    scheduleSilentSave();
   },
   setChartInterval: (min) => {
     const cur = get().settings;
     if (!cur) return;
-    const next = { ...cur, chartInterval: min };
-    set({ settings: next });
-    debouncedSave(next);
+    set({ settings: { ...cur, chartInterval: min } });
+    scheduleSilentSave();
   },
 }));

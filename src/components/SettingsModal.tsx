@@ -95,7 +95,8 @@ export function SettingsModal() {
     setSaving(true);
     try {
       await save(draft);
-      pushToast("success", "설정 저장 완료 — 엔진 재시작됨");
+      // 엔진 재시작 여부는 백엔드가 변경 필드에 따라 판단하므로 여기서 단정하지 않는다
+      pushToast("success", "설정 저장 완료");
       setOpen(false);
     } catch (e) {
       pushToast("error", String(e));

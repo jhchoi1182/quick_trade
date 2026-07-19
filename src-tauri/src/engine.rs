@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use tauri::{AppHandle, Emitter};
@@ -21,6 +22,10 @@ const QUOTE_FRESH_SECS: i64 = 10;
 const QUOTE_STALE_LIMIT_SECS: i64 = 60;
 const ACCOUNT_REFRESH_SECS: u64 = 30;
 
+/// 프론트로 이벤트를 내보내는 콜백. Engine이 tauri 타입을 직접 들지 않게 분리한다 —
+/// tauri 심볼을 링크하면 매니페스트 없는 단위 테스트 exe가 comctl32 v6 로드 실패로 죽는다.
+type EmitFn = Box<dyn Fn(&str, serde_json::Value) + Send + Sync>;
+
 pub struct Engine {
     /// UI 전용 필드(버퍼틱 등)는 엔진 재시작 없이 갱신되므로 RwLock으로 보관
     settings: RwLock<Settings>,
@@ -29,7 +34,14 @@ pub struct Engine {
     account: RwLock<AccountSnapshot>,
     candle_cache: CandleCache,
     last_error: Mutex<String>,
-    app: AppHandle,
+    /// 지연 잔고 갱신이 이미 예약되어 있으면 true — 연속 체결통보를 1회 갱신으로 합류
+    refresh_pending: AtomicBool,
+    /// 잔고를 바꾼 사건(주문 접수/체결통보)마다 +1 — 캐시 최신성 판정용
+    account_gen: AtomicU64,
+    /// 마지막 성공 갱신이 반영한 account_gen 값. account_gen보다 작으면 캐시가 낡은 것
+    account_refreshed_gen: AtomicU64,
+    /// 테스트에서는 None (이벤트 emit 생략)
+    emit_fn: Option<EmitFn>,
     /// 지연 잔고 갱신 태스크에서 자기 자신을 참조하기 위한 약한 포인터
     weak: Weak<Engine>,
 }
@@ -61,7 +73,12 @@ pub async fn start(app: AppHandle, settings: Settings) -> AppResult<EngineHandle
         account: RwLock::new(AccountSnapshot { cash: 0, positions: Vec::new() }),
         candle_cache: CandleCache::new(),
         last_error: Mutex::new(String::new()),
-        app,
+        refresh_pending: AtomicBool::new(false),
+        account_gen: AtomicU64::new(0),
+        account_refreshed_gen: AtomicU64::new(0),
+        emit_fn: Some(Box::new(move |event, payload| {
+            let _ = app.emit(event, payload);
+        })),
         weak: weak.clone(),
     });
 
@@ -91,7 +108,7 @@ async fn consume_feed(engine: Arc<Engine>, mut rx: mpsc::Receiver<FeedEvent>) {
         match ev {
             FeedEvent::Quote(q) => {
                 engine.quotes.write().unwrap().insert(q.code.clone(), q.clone());
-                let _ = engine.app.emit("quote", &q);
+                engine.emit("quote", &q);
             }
             FeedEvent::Book { code, ask1, bid1, ts } => {
                 let merged = {
@@ -105,16 +122,17 @@ async fn consume_feed(engine: Arc<Engine>, mut rx: mpsc::Receiver<FeedEvent>) {
                     })
                 };
                 if let Some(q) = merged {
-                    let _ = engine.app.emit("quote", &q);
+                    engine.emit("quote", &q);
                 }
             }
             FeedEvent::Fill(fill) => {
-                let _ = engine.app.emit("fill", &fill);
-                let eng = Arc::clone(&engine);
-                tokio::spawn(async move { eng.refresh_account().await });
+                engine.emit("fill", &fill);
+                engine.mark_account_stale();
+                // 부분체결이 연발해도 잔고 조회는 1회로 합류 → 리미터 큐를 채우지 않는다
+                engine.schedule_account_refresh();
             }
             FeedEvent::Conn(connected) => {
-                let _ = engine.app.emit("conn", serde_json::json!({ "connected": connected }));
+                engine.emit("conn", &serde_json::json!({ "connected": connected }));
             }
         }
     }
@@ -134,19 +152,31 @@ impl Engine {
         *self.settings.write().unwrap() = new;
     }
 
+    /// 프론트로 이벤트 전송 (테스트 등 콜백이 없으면 생략)
+    fn emit<S: serde::Serialize>(&self, event: &str, payload: &S) {
+        let Some(f) = &self.emit_fn else { return };
+        match serde_json::to_value(payload) {
+            Ok(v) => f(event, v),
+            Err(e) => tracing::warn!("이벤트 직렬화 실패({event}): {e}"),
+        }
+    }
+
     pub async fn refresh_account(&self) {
+        // 조회 도중 새 체결이 오면 gen이 더 커져 다음 주문이 다시 갱신하게 된다
+        let gen = self.account_gen.load(Ordering::SeqCst);
         match self.broker.account().await {
             Ok(snap) => {
                 *self.account.write().unwrap() = snap.clone();
+                self.account_refreshed_gen.fetch_max(gen, Ordering::SeqCst);
                 self.last_error.lock().unwrap().clear();
-                let _ = self.app.emit("account", &snap);
+                self.emit("account", &snap);
             }
             Err(e) => {
                 let msg = e.to_string();
                 let mut last = self.last_error.lock().unwrap();
                 if *last != msg {
                     *last = msg.clone();
-                    let _ = self.app.emit("engine-error", format!("계좌 조회 실패: {msg}"));
+                    self.emit("engine-error", &format!("계좌 조회 실패: {msg}"));
                 }
             }
         }
@@ -216,16 +246,25 @@ impl Engine {
             (s.is_etf(code), s.buffer_ticks, s.mode)
         };
         let limit = buy_limit_price(ask1 as u64, buffer_ticks, etf);
+        // 매도 직후 재매수 등 직전 주문이 아직 캐시에 반영 전이면 동기 갱신 (스캘핑 연속 매매 대응)
+        self.sync_account_if_stale().await;
         let cash = self.account.read().unwrap().cash;
-        let qty = max_buy_qty(cash, limit);
+        let mut qty = max_buy_qty(cash, limit);
         if qty == 0 {
-            return fail(format!("주문가능금액 부족 (예수금 {cash}원)"));
+            // 앱 시작 직후 첫 갱신 전 등 캐시가 비어 있을 수 있다 — 동기 갱신 후 재계산
+            self.refresh_account().await;
+            let cash = self.account.read().unwrap().cash;
+            qty = max_buy_qty(cash, limit);
+            if qty == 0 {
+                return fail(format!("주문가능금액 부족 (예수금 {cash}원)"));
+            }
         }
 
         // 모의투자는 IOC 미지원이라 일반 지정가로 대체
         let ioc = !matches!(mode, TradeMode::Paper);
         match self.broker.place_buy(code, qty, limit, ioc).await {
             Ok(ack) => {
+                self.mark_account_stale();
                 self.schedule_account_refresh();
                 OrderResult {
                     ok: true,
@@ -254,21 +293,21 @@ impl Engine {
             message,
         };
 
-        let qty = self
-            .account
-            .read()
-            .unwrap()
-            .positions
-            .iter()
-            .find(|p| p.code == code)
-            .map(|p| p.qty)
-            .unwrap_or(0);
+        // 매수 체결 직후 매도 등 직전 주문이 아직 캐시에 반영 전이면 동기 갱신 (스캘핑 연속 매매 대응)
+        self.sync_account_if_stale().await;
+        let mut qty = self.cached_position_qty(code);
+        if qty == 0 {
+            // 앱 밖(HTS 등)에서 산 종목처럼 엔진이 모르는 변동일 수 있다 — 동기 갱신 후 재확인
+            self.refresh_account().await;
+            qty = self.cached_position_qty(code);
+        }
         if qty == 0 {
             return fail("보유 수량 없음".into());
         }
 
         match self.broker.place_sell_market(code, qty).await {
             Ok(ack) => {
+                self.mark_account_stale();
                 self.schedule_account_refresh();
                 OrderResult {
                     ok: true,
@@ -286,12 +325,161 @@ impl Engine {
         }
     }
 
-    /// 주문 직후 체결 반영을 위해 잠시 뒤 잔고 갱신 (체결통보와 별개의 안전망)
+    /// 잔고를 바꾼 사건(주문 접수/체결통보) 발생 표시 — 다음 주문이 캐시를 갱신하게 한다
+    fn mark_account_stale(&self) {
+        self.account_gen.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// 마지막 사건 이후 성공한 잔고 갱신이 없으면 동기로 1회 갱신.
+    /// 최신이면 REST 호출 없이 즉시 반환하므로 정상 주문 경로의 속도는 그대로다.
+    async fn sync_account_if_stale(&self) {
+        let stale = self.account_refreshed_gen.load(Ordering::SeqCst)
+            < self.account_gen.load(Ordering::SeqCst);
+        if stale {
+            self.refresh_account().await;
+        }
+    }
+
+    fn cached_position_qty(&self, code: &str) -> u64 {
+        self.account
+            .read()
+            .unwrap()
+            .positions
+            .iter()
+            .find(|p| p.code == code)
+            .map(|p| p.qty)
+            .unwrap_or(0)
+    }
+
+    /// 주문·체결 직후 잠시 뒤 잔고 갱신 (체결통보와 별개의 안전망).
+    /// 이미 예약된 갱신이 있으면 합류해 REST 호출(1회당 GET 2건)이 리미터 큐에 쌓이지 않게 한다.
     fn schedule_account_refresh(&self) {
-        let Some(engine) = self.weak.upgrade() else { return };
+        if self.refresh_pending.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let Some(engine) = self.weak.upgrade() else {
+            self.refresh_pending.store(false, Ordering::SeqCst);
+            return;
+        };
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+            // 대기 중 도착한 체결통보가 새 예약을 걸 수 있도록 조회 전에 해제
+            engine.refresh_pending.store(false, Ordering::SeqCst);
             engine.refresh_account().await;
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::broker::OrderAck;
+    use crate::error::{AppError, AppResult};
+    use crate::mock::MockBroker;
+    use std::sync::atomic::AtomicUsize;
+
+    fn test_engine(broker: Arc<dyn Broker>, settings: Settings) -> Arc<Engine> {
+        Arc::new_cyclic(|weak| Engine {
+            settings: RwLock::new(settings),
+            broker,
+            quotes: RwLock::new(HashMap::new()),
+            account: RwLock::new(AccountSnapshot { cash: 0, positions: Vec::new() }),
+            candle_cache: CandleCache::new(),
+            last_error: Mutex::new(String::new()),
+            refresh_pending: AtomicBool::new(false),
+            account_gen: AtomicU64::new(0),
+            account_refreshed_gen: AtomicU64::new(0),
+            emit_fn: None,
+            weak: weak.clone(),
+        })
+    }
+
+    /// 스캘핑 핵심 시나리오: 매수 체결 직후(지연 잔고 갱신 도착 전) 즉시 매도가 성공해야 한다
+    #[tokio::test]
+    async fn sell_right_after_buy_succeeds() {
+        let settings = Settings::default();
+        let engine = test_engine(Arc::new(MockBroker::new(&settings)), settings);
+        engine.refresh_account().await; // 초기 예수금 캐시 적재
+
+        let buy = engine.buy_max("0193T0").await;
+        assert!(buy.ok, "매수 실패: {}", buy.message);
+        assert!(buy.qty > 0);
+
+        // 캐시에는 아직 포지션이 없다 — 지연 갱신(700ms)을 기다리지 않고 즉시 매도
+        let sell = engine.sell_all("0193T0").await;
+        assert!(sell.ok, "매도 실패: {}", sell.message);
+        assert_eq!(sell.qty, buy.qty, "전량 매도여야 한다");
+    }
+
+    /// 매도 직후 재매수: 낡은 캐시의 잔돈이 아니라 매도 대금이 반영된 예수금으로 최대 수량이 잡혀야 한다
+    #[tokio::test]
+    async fn rebuy_right_after_sell_uses_fresh_cash() {
+        let settings = Settings::default();
+        let engine = test_engine(Arc::new(MockBroker::new(&settings)), settings);
+        engine.refresh_account().await;
+
+        let buy1 = engine.buy_max("0193T0").await;
+        assert!(buy1.ok, "{}", buy1.message);
+        let sell = engine.sell_all("0193T0").await;
+        assert!(sell.ok, "{}", sell.message);
+
+        let buy2 = engine.buy_max("0193T0").await;
+        assert!(buy2.ok, "재매수 실패: {}", buy2.message);
+        // 낡은 캐시(매수 후 잔돈)로 계산하면 한두 주만 사게 된다
+        assert!(
+            buy2.qty > buy1.qty / 2,
+            "재매수 수량이 너무 적음 (낡은 예수금 캐시 사용 의심): {} vs 첫 매수 {}",
+            buy2.qty,
+            buy1.qty
+        );
+    }
+
+    /// 잔고 조회 횟수만 세는 브로커 (합류 검증용)
+    struct CountingBroker {
+        account_calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Broker for CountingBroker {
+        async fn candles_1m(&self, _code: &str) -> AppResult<Vec<Candle>> {
+            Ok(Vec::new())
+        }
+        async fn account(&self) -> AppResult<AccountSnapshot> {
+            self.account_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(AccountSnapshot { cash: 0, positions: Vec::new() })
+        }
+        async fn snapshot(&self, _code: &str) -> AppResult<Quote> {
+            Err(AppError::Config("테스트에서 미사용".into()))
+        }
+        async fn place_buy(&self, _c: &str, _q: u64, _p: u64, _i: bool) -> AppResult<OrderAck> {
+            Err(AppError::Order("테스트에서 미사용".into()))
+        }
+        async fn place_sell_market(&self, _c: &str, _q: u64) -> AppResult<OrderAck> {
+            Err(AppError::Order("테스트에서 미사용".into()))
+        }
+        async fn start_feed(
+            &self,
+            _codes: Vec<String>,
+            _tx: mpsc::Sender<FeedEvent>,
+        ) -> AppResult<Vec<JoinHandle<()>>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// 부분체결 연발 등으로 갱신 예약이 몰려도 실제 잔고 조회는 1회로 합류돼야 한다
+    #[tokio::test]
+    async fn burst_refresh_requests_coalesce_into_one() {
+        let broker = Arc::new(CountingBroker { account_calls: AtomicUsize::new(0) });
+        let engine = test_engine(Arc::clone(&broker) as Arc<dyn Broker>, Settings::default());
+
+        for _ in 0..5 {
+            engine.schedule_account_refresh();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1_000)).await;
+        assert_eq!(
+            broker.account_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "연속 예약은 1회 조회로 합류돼야 한다"
+        );
     }
 }
