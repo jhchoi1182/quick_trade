@@ -33,6 +33,8 @@ export function MiniChart() {
   // 종목별 1분봉 캐시: 주기 전환은 재요청 없이 재집계, 종목 복귀는 TTL 이내면 재사용.
   // 활성 종목은 실시간 틱이 캐시를 갱신하므로 항상 신선하다. (KIS 유량 절약)
   const oneMinCacheRef = useRef<Map<string, { bars: Candle[]; fetchedAt: number }>>(new Map());
+  // 현재 차트에 그려진 종목: 같은 종목 재렌더(주기 전환·재조회)면 확대/위치를 보존하기 위함
+  const renderedCodeRef = useRef<string | null>(null);
 
   const chartCode = useUiStore((s) => s.chartCode);
   const collapsed = useUiStore((s) => s.chartCollapsed);
@@ -150,6 +152,9 @@ export function MiniChart() {
 
     const render = (oneMin: Candle[]) => {
       if (cancelled || !candleSeriesRef.current) return;
+      // 같은 종목이면 주기 전환·재조회 후에도 보고 있던 시간 범위(확대/위치)를 그대로 복원한다
+      const timeScale = chartRef.current?.timeScale();
+      const prevRange = renderedCodeRef.current === chartCode ? timeScale?.getVisibleRange() : null;
       const bars = aggregate(oneMin, interval);
       barsRef.current = bars;
       candleSeriesRef.current.setData(bars.map(toCandleData));
@@ -158,9 +163,12 @@ export function MiniChart() {
           .get(p)
           ?.setData(movingAverage(bars, p).map((m) => ({ time: m.time as UTCTimestamp, value: m.value })));
       }
-      chartRef.current
-        ?.timeScale()
-        .setVisibleLogicalRange({ from: bars.length - VISIBLE_BARS, to: bars.length + 2 });
+      if (prevRange) {
+        timeScale?.setVisibleRange(prevRange);
+      } else {
+        timeScale?.setVisibleLogicalRange({ from: bars.length - VISIBLE_BARS, to: bars.length + 2 });
+      }
+      renderedCodeRef.current = chartCode;
     };
 
     const cached = oneMinCacheRef.current.get(chartCode);
