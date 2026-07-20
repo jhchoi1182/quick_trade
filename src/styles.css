@@ -68,6 +68,10 @@ body {
 .app[data-theme="mono"] .btn-sell:hover { background: #787878; }
 .app[data-theme="mono"] .win-close:hover { background: #555; color: #eee; }
 .app[data-theme="mono"] .conn-dot.on { color: #bdbdbd; }
+/* 보유 수익률은 하락 회색(#686868)이 어두운 배경에 묻혀 안 보였다.
+   +/- 부호로 방향이 구분되므로 색 대신 밝은 글자로 통일한다. */
+.app[data-theme="mono"] .holding .up,
+.app[data-theme="mono"] .holding .down { color: var(--text); }
 .app[data-theme="mono"] .mode-real { background: #8a8a8a; color: #161616; }
 .app[data-theme="mono"] .mode-paper { background: #5a5a5a; color: #ddd; }
 .app[data-theme="mono"] .toast-success { border-color: #bdbdbd; color: #bdbdbd; }
