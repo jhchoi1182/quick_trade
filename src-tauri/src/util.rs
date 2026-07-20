@@ -37,26 +37,26 @@ pub fn tick_size(price: u64, etf: bool) -> u64 {
     }
 }
 
-/// 매수 지정가 프리미엄(%). 급등 중에도 IOC가 전량 즉시 체결되도록 현재가보다 높게 잡는다.
+/// 매수 지정가 프리미엄(%). 급등 중에도 IOC가 즉시 체결되도록 기준 가격보다 높게 잡는다.
 pub const BUY_PREMIUM_PCT: u64 = 3;
 
-/// 최대 수량 계산 시 예수금 사용 비율. 수수료 예상액까지 포함하는 주문가능금액 검사에
-/// 걸리지 않도록 0.5% 여유를 남긴다 ("주문가능금액 초과" 재발 시 이 값을 더 낮출 것).
-pub const CASH_USE_RATIO: f64 = 0.995;
+/// 즉시 매수 시 기준 가격으로 투입할 주문가능현금 비율.
+/// 매수가능수량을 다시 조회하지 않고 시드의 약 95%를 즉시 투입한다.
+pub const CASH_USE_RATIO: f64 = 0.95;
 
-/// 매수 지정가: 현재가 +3%, 호가단위에 맞춰 내림 정렬
+/// 매수 지정가: 기준 가격 +3%, 호가단위에 맞춰 내림 정렬
 pub fn buy_limit_price(base: u64, etf: bool) -> u64 {
     let raw = base + base * BUY_PREMIUM_PCT / 100;
     let tick = tick_size(raw, etf);
     raw - (raw % tick)
 }
 
-/// 예수금으로 살 수 있는 최대 수량 (수수료 여유분 0.5% 차감)
-pub fn max_buy_qty(cash: u64, limit_price: u64) -> u64 {
-    if limit_price == 0 {
+/// 주문가능현금의 95%로 기준 가격에 살 수 있는 최대 수량
+pub fn max_buy_qty(cash: u64, reference_price: u64) -> u64 {
+    if reference_price == 0 {
         return 0;
     }
-    ((cash as f64) * CASH_USE_RATIO / (limit_price as f64)).floor() as u64
+    ((cash as f64) * CASH_USE_RATIO / (reference_price as f64)).floor() as u64
 }
 
 #[cfg(test)]
@@ -95,9 +95,11 @@ mod tests {
     }
 
     #[test]
-    fn max_qty_reserves_fee_margin() {
-        // 1,000,000원 × 0.995 / 12,010원 = 82.84 → 82주
-        assert_eq!(max_buy_qty(1_000_000, 12_010), 82);
+    fn max_qty_uses_95_percent() {
+        // 1,000,000원 × 0.95 / 12,010원 = 79.10 → 79주
+        assert_eq!(max_buy_qty(1_000_000, 12_010), 79);
+        // 실계좌 재현값: 95% 투입 수량은 KIS가 허용한 4,179주보다 작다.
+        assert_eq!(max_buy_qty(63_956_290, 14_710), 4_130);
         assert_eq!(max_buy_qty(0, 12_010), 0);
         assert_eq!(max_buy_qty(1_000_000, 0), 0);
     }

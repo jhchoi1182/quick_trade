@@ -222,7 +222,7 @@ impl Engine {
         }
     }
 
-    /// 원클릭 최대 수량 매수: 현재가 +3% IOC지정가
+    /// 원클릭 즉시 매수: 매도1호가 +3% IOC지정가, 매도1호가 기준 주문가능현금의 95%
     pub async fn buy_max(&self, code: &str) -> OrderResult {
         let fail = |message: String| OrderResult {
             ok: false,
@@ -236,7 +236,9 @@ impl Engine {
         let Some(q) = self.fresh_quote(code).await else {
             return fail("시세 없음 — 연결 상태를 확인하세요".into());
         };
-        let base = if q.price > 0.0 { q.price } else { q.ask1 };
+        // 지금 살 수 있는 매물을 기준으로 삼고, 호가가 없을 때만 현재가로 폴백한다.
+        // 신선한 시세는 웹소켓 캐시에서 읽으므로 이 계산은 REST 호출을 추가하지 않는다.
+        let base = if q.ask1 > 0.0 { q.ask1 } else { q.price };
         if base <= 0.0 {
             return fail("시세 정보 없음".into());
         }
@@ -249,12 +251,14 @@ impl Engine {
         // 매도 직후 재매수 등 직전 주문이 아직 캐시에 반영 전이면 동기 갱신 (스캘핑 연속 매매 대응)
         self.sync_account_if_stale().await;
         let cash = self.account.read().unwrap().cash;
-        let mut qty = max_buy_qty(cash, limit);
+        // 수량은 매도1호가 기준 95%로 잡는다. +3%는 체결 허용 상한일 뿐 실제 체결가는
+        // 현재 매도호가부터 적용되므로 시드가 약 95% 투입된다.
+        let mut qty = max_buy_qty(cash, base as u64);
         if qty == 0 {
             // 앱 시작 직후 첫 갱신 전 등 캐시가 비어 있을 수 있다 — 동기 갱신 후 재계산
             self.refresh_account().await;
             let cash = self.account.read().unwrap().cash;
-            qty = max_buy_qty(cash, limit);
+            qty = max_buy_qty(cash, base as u64);
             if qty == 0 {
                 return fail(format!("주문가능금액 부족 (예수금 {cash}원)"));
             }
@@ -432,6 +436,91 @@ mod tests {
             buy2.qty,
             buy1.qty
         );
+    }
+
+    /// 신선한 웹소켓 시세와 계좌 캐시가 있으면 버튼 클릭 경로는 주문 외 REST 조회를 하지 않는다.
+    /// 현재가와 관계없이 지금 체결 가능한 매도1호가를 기준으로 상한과 95% 수량을 계산한다.
+    #[tokio::test]
+    async fn cached_buy_places_order_without_extra_queries() {
+        let broker = Arc::new(FastBuyBroker {
+            account_calls: AtomicUsize::new(0),
+            snapshot_calls: AtomicUsize::new(0),
+            order: Mutex::new(None),
+        });
+        let settings = Settings::default();
+        let engine = test_engine(Arc::clone(&broker) as Arc<dyn Broker>, settings);
+        engine.refresh_account().await;
+        engine.quotes.write().unwrap().insert(
+            "0193T0".into(),
+            Quote {
+                code: "0193T0".into(),
+                price: 10_500.0,
+                change_rate: 0.0,
+                ask1: 10_100.0,
+                bid1: 9_995.0,
+                volume: 0.0,
+                ts: now_kst_fake_epoch(),
+            },
+        );
+
+        let result = engine.buy_max("0193T0").await;
+
+        assert!(result.ok, "{}", result.message);
+        assert_eq!(result.price, 10_400); // 10,100원 +3%를 ETF 호가단위로 내림
+        assert_eq!(result.qty, 94); // 1,000,000원 × 95% / 매도1호가 10,100원
+        assert_eq!(broker.account_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(broker.snapshot_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            broker.order.lock().unwrap().as_ref(),
+            Some(&("0193T0".into(), 94, 10_400, true))
+        );
+    }
+
+    struct FastBuyBroker {
+        account_calls: AtomicUsize,
+        snapshot_calls: AtomicUsize,
+        order: Mutex<Option<(String, u64, u64, bool)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Broker for FastBuyBroker {
+        async fn candles_1m(&self, _code: &str) -> AppResult<Vec<Candle>> {
+            Ok(Vec::new())
+        }
+        async fn account(&self) -> AppResult<AccountSnapshot> {
+            self.account_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(AccountSnapshot {
+                cash: 1_000_000,
+                positions: Vec::new(),
+            })
+        }
+        async fn snapshot(&self, _code: &str) -> AppResult<Quote> {
+            self.snapshot_calls.fetch_add(1, Ordering::SeqCst);
+            Err(AppError::Config("신선한 캐시가 있어 호출되면 안 됨".into()))
+        }
+        async fn place_buy(
+            &self,
+            code: &str,
+            qty: u64,
+            price: u64,
+            ioc: bool,
+        ) -> AppResult<OrderAck> {
+            *self.order.lock().unwrap() = Some((code.into(), qty, price, ioc));
+            Ok(OrderAck {
+                order_no: "TEST-BUY".into(),
+                message: "주문 접수".into(),
+            })
+        }
+        async fn place_sell_market(&self, _code: &str, _qty: u64) -> AppResult<OrderAck> {
+            Err(AppError::Order("테스트에서 미사용".into()))
+        }
+        async fn start_feed(
+            &self,
+            _codes: Vec<String>,
+            _tx: mpsc::Sender<FeedEvent>,
+        ) -> AppResult<Vec<JoinHandle<()>>> {
+            Ok(Vec::new())
+        }
     }
 
     /// 잔고 조회 횟수만 세는 브로커 (합류 검증용)

@@ -20,10 +20,11 @@ async fn demo_buy_then_sell_roundtrip() {
     let quote = broker.snapshot(code).await.unwrap();
     assert!(quote.ask1 > 0.0);
 
-    // 엔진과 동일한 산식으로 최대 수량 매수 (현재가 +3% 지정가)
+    // 엔진과 동일한 산식으로 즉시 매수 (매도1호가 +3% 상한, 매도1호가 기준 현금 95%)
     let account0 = broker.account().await.unwrap();
-    let limit = buy_limit_price(quote.price as u64, true);
-    let qty = max_buy_qty(account0.cash, limit);
+    let base = if quote.ask1 > 0.0 { quote.ask1 } else { quote.price };
+    let limit = buy_limit_price(base as u64, true);
+    let qty = max_buy_qty(account0.cash, base as u64);
     assert!(qty > 0);
 
     broker.place_buy(code, qty, limit, true).await.unwrap();
