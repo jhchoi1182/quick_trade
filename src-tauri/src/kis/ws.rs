@@ -12,14 +12,9 @@ use crate::util::{kst_str_to_fake_epoch, now_kst};
 pub struct WsConfig {
     pub url: String,
     pub approval_key: String,
-    /// 체결가 TR: 실전 H0UNCNT0(KRX+NXT 통합) / 모의 H0STCNT0(KRX)
-    pub tr_price: String,
-    /// 호가 TR: 실전 H0UNASP0(통합) / 모의 H0STASP0(KRX)
-    pub tr_book: String,
-    /// 실시간 체결가 구독 종목
-    pub price_codes: Vec<String>,
-    /// 실시간 호가 구독 종목
-    pub book_codes: Vec<String>,
+    /// 실시간 구독 목록: (tr_id, tr_key). 체결가/호가 TR을 종목별로 지정한다 —
+    /// 통합(H0UN~)이 시세를 안 주는 종목(신형 코드 ETF/ETN)은 KRX 단독(H0ST~)으로 구독해야 한다.
+    pub subs: Vec<(String, String)>,
     /// 체결통보 구독: (tr_id, HTS ID)
     pub notice: Option<(String, String)>,
 }
@@ -66,12 +61,8 @@ async fn run_once(cfg: &WsConfig, tx: &mpsc::Sender<FeedEvent>) -> AppResult<()>
         .map_err(|e| AppError::Kis(format!("웹소켓 연결 실패: {e}")))?;
     let (mut write, mut read) = ws.split();
 
-    for code in &cfg.price_codes {
-        let msg = subscribe_msg(&cfg.approval_key, &cfg.tr_price, code);
-        write.send(Message::Text(msg.into())).await.map_err(ws_err)?;
-    }
-    for code in &cfg.book_codes {
-        let msg = subscribe_msg(&cfg.approval_key, &cfg.tr_book, code);
+    for (tr_id, tr_key) in &cfg.subs {
+        let msg = subscribe_msg(&cfg.approval_key, tr_id, tr_key);
         write.send(Message::Text(msg.into())).await.map_err(ws_err)?;
     }
     if let Some((tr_id, hts_id)) = &cfg.notice {

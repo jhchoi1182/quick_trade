@@ -202,6 +202,14 @@ impl Broker for MockBroker {
             .ok_or_else(|| AppError::Config(format!("데모에 없는 종목: {code}")))
     }
 
+    async fn max_buy_qty(&self, _code: &str, limit_price: u64) -> AppResult<u64> {
+        if limit_price == 0 {
+            return Ok(0);
+        }
+        let m = self.market.lock().unwrap();
+        Ok(m.cash / limit_price)
+    }
+
     async fn place_buy(&self, code: &str, qty: u64, limit_price: u64, _ioc: bool) -> AppResult<OrderAck> {
         let fill = {
             let mut m = self.market.lock().unwrap();

@@ -92,7 +92,13 @@ pub async fn start(app: AppHandle, settings: Settings) -> AppResult<EngineHandle
     // 프론트가 같은 종목을 요청하면 단일 비행으로 합쳐지므로 중복 호출은 없다.
     let warm_engine = Arc::clone(&engine);
     let warm_codes: Vec<String> = settings.chart_symbols.iter().map(|s| s.code.clone()).collect();
+    let seed_codes: Vec<String> = settings.trade_symbols.iter().map(|s| s.code.clone()).collect();
     tasks.push(tokio::spawn(async move {
+        // 매매 종목 시세 1회 시드: 첫 틱 도착 전에도 수익률 기준가가 있고,
+        // 기준 Quote 부재로 Book 이벤트가 버려지는 공백도 없앤다 (폴링 아님)
+        for code in &seed_codes {
+            warm_engine.fresh_quote(code).await;
+        }
         for code in warm_codes {
             if let Err(e) = warm_engine.candles(&code).await {
                 tracing::warn!("차트 워밍업 실패({code}): {e}");
@@ -104,9 +110,14 @@ pub async fn start(app: AppHandle, settings: Settings) -> AppResult<EngineHandle
 }
 
 async fn consume_feed(engine: Arc<Engine>, mut rx: mpsc::Receiver<FeedEvent>) {
+    // 실가동 검증용: 종목별 첫 틱 로그로 구독이 실제 시세를 내려주는지 즉시 판별
+    let mut first_tick_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     while let Some(ev) = rx.recv().await {
         match ev {
             FeedEvent::Quote(q) => {
+                if first_tick_seen.insert(q.code.clone()) {
+                    tracing::info!("실시간 체결가 첫 수신: {}", q.code);
+                }
                 engine.quotes.write().unwrap().insert(q.code.clone(), q.clone());
                 engine.emit("quote", &q);
             }
@@ -213,6 +224,8 @@ impl Engine {
         match self.broker.snapshot(code).await {
             Ok(q) => {
                 self.quotes.write().unwrap().insert(code.to_string(), q.clone());
+                // 백엔드 캐시만 채우면 화면 수익률은 낡은 값에 머문다 — 프론트에도 반영
+                self.emit("quote", &q);
                 Some(q)
             }
             Err(e) => {
@@ -280,9 +293,61 @@ impl Engine {
                 }
             }
             Err(e) => {
+                // 캐시 예수금이 실제 주문가능금액보다 부풀려졌을 수 있다(미정산 매도대금 등).
+                // KIS가 계산한 매수가능수량으로 1회만 재주문 — 첫 주문은 확정 거부라 이중 주문 위험 없음.
+                let retried = self.retry_buy_with_psbl(code, qty, limit, ioc).await;
                 self.schedule_account_refresh();
-                fail(e.to_string())
+                retried.unwrap_or_else(|| fail(e.to_string()))
             }
+        }
+    }
+
+    /// 매수 거부 시 KIS 매수가능수량(미수없는매수수량)으로 1회 재주문.
+    /// 수량이 줄지 않으면 금액 부족이 원인이 아니므로 None을 돌려 원래 에러를 노출한다.
+    async fn retry_buy_with_psbl(
+        &self,
+        code: &str,
+        rejected_qty: u64,
+        limit: u64,
+        ioc: bool,
+    ) -> Option<OrderResult> {
+        let fail = |message: String| OrderResult {
+            ok: false,
+            side: Side::Buy,
+            code: code.to_string(),
+            qty: 0,
+            price: 0,
+            message,
+        };
+
+        let qty = match self.broker.max_buy_qty(code, limit).await {
+            Ok(q) => q,
+            Err(e) => {
+                tracing::warn!("매수가능수량 조회 실패({code}): {e}");
+                return None;
+            }
+        };
+        if qty >= rejected_qty {
+            return None;
+        }
+        if qty == 0 {
+            return Some(fail("주문가능금액 부족".into()));
+        }
+
+        tracing::info!("매수 거부 → KIS 매수가능수량 {qty}주로 재주문 ({code}, 거부 수량 {rejected_qty}주)");
+        match self.broker.place_buy(code, qty, limit, ioc).await {
+            Ok(ack) => {
+                self.mark_account_stale();
+                Some(OrderResult {
+                    ok: true,
+                    side: Side::Buy,
+                    code: code.to_string(),
+                    qty,
+                    price: limit,
+                    message: ack.message,
+                })
+            }
+            Err(e) => Some(fail(e.to_string())),
         }
     }
 
@@ -383,6 +448,14 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     fn test_engine(broker: Arc<dyn Broker>, settings: Settings) -> Arc<Engine> {
+        test_engine_with_emit(broker, settings, None)
+    }
+
+    fn test_engine_with_emit(
+        broker: Arc<dyn Broker>,
+        settings: Settings,
+        emit_fn: Option<EmitFn>,
+    ) -> Arc<Engine> {
         Arc::new_cyclic(|weak| Engine {
             settings: RwLock::new(settings),
             broker,
@@ -393,9 +466,25 @@ mod tests {
             refresh_pending: AtomicBool::new(false),
             account_gen: AtomicU64::new(0),
             account_refreshed_gen: AtomicU64::new(0),
-            emit_fn: None,
+            emit_fn,
             weak: weak.clone(),
         })
+    }
+
+    /// 신선한 웹소켓 시세를 캐시에 심는다 (버튼 클릭 경로 테스트용)
+    fn seed_quote(engine: &Engine, ask1: f64) {
+        engine.quotes.write().unwrap().insert(
+            "0193T0".into(),
+            Quote {
+                code: "0193T0".into(),
+                price: 10_500.0,
+                change_rate: 0.0,
+                ask1,
+                bid1: 9_995.0,
+                volume: 0.0,
+                ts: now_kst_fake_epoch(),
+            },
+        );
     }
 
     /// 스캘핑 핵심 시나리오: 매수 체결 직후(지연 잔고 갱신 도착 전) 즉시 매도가 성공해야 한다
@@ -450,18 +539,7 @@ mod tests {
         let settings = Settings::default();
         let engine = test_engine(Arc::clone(&broker) as Arc<dyn Broker>, settings);
         engine.refresh_account().await;
-        engine.quotes.write().unwrap().insert(
-            "0193T0".into(),
-            Quote {
-                code: "0193T0".into(),
-                price: 10_500.0,
-                change_rate: 0.0,
-                ask1: 10_100.0,
-                bid1: 9_995.0,
-                volume: 0.0,
-                ts: now_kst_fake_epoch(),
-            },
-        );
+        seed_quote(&engine, 10_100.0);
 
         let result = engine.buy_max("0193T0").await;
 
@@ -497,6 +575,9 @@ mod tests {
         async fn snapshot(&self, _code: &str) -> AppResult<Quote> {
             self.snapshot_calls.fetch_add(1, Ordering::SeqCst);
             Err(AppError::Config("신선한 캐시가 있어 호출되면 안 됨".into()))
+        }
+        async fn max_buy_qty(&self, _code: &str, _limit_price: u64) -> AppResult<u64> {
+            Err(AppError::Config("빠른 경로에서 호출되면 안 됨".into()))
         }
         async fn place_buy(
             &self,
@@ -540,6 +621,9 @@ mod tests {
         async fn snapshot(&self, _code: &str) -> AppResult<Quote> {
             Err(AppError::Config("테스트에서 미사용".into()))
         }
+        async fn max_buy_qty(&self, _code: &str, _limit_price: u64) -> AppResult<u64> {
+            Err(AppError::Order("테스트에서 미사용".into()))
+        }
         async fn place_buy(&self, _c: &str, _q: u64, _p: u64, _i: bool) -> AppResult<OrderAck> {
             Err(AppError::Order("테스트에서 미사용".into()))
         }
@@ -569,6 +653,126 @@ mod tests {
             broker.account_calls.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "연속 예약은 1회 조회로 합류돼야 한다"
+        );
+    }
+
+    /// 첫 매수는 거부하고 두 번째부터 접수하는 브로커 (거부 시 재주문 검증용)
+    struct RejectFirstBuyBroker {
+        psbl_qty: u64,
+        buy_calls: AtomicUsize,
+        last_order: Mutex<Option<(u64, u64)>>, // (qty, price)
+    }
+
+    impl RejectFirstBuyBroker {
+        fn new(psbl_qty: u64) -> Arc<Self> {
+            Arc::new(Self {
+                psbl_qty,
+                buy_calls: AtomicUsize::new(0),
+                last_order: Mutex::new(None),
+            })
+        }
+    }
+
+    const REJECT_MSG: &str = "주문가능금액을 초과했습니다";
+
+    #[async_trait::async_trait]
+    impl Broker for RejectFirstBuyBroker {
+        async fn candles_1m(&self, _code: &str) -> AppResult<Vec<Candle>> {
+            Ok(Vec::new())
+        }
+        async fn account(&self) -> AppResult<AccountSnapshot> {
+            Ok(AccountSnapshot { cash: 1_000_000, positions: Vec::new() })
+        }
+        async fn snapshot(&self, _code: &str) -> AppResult<Quote> {
+            Err(AppError::Config("테스트에서 미사용".into()))
+        }
+        async fn max_buy_qty(&self, _code: &str, _limit_price: u64) -> AppResult<u64> {
+            Ok(self.psbl_qty)
+        }
+        async fn place_buy(&self, _c: &str, qty: u64, price: u64, _i: bool) -> AppResult<OrderAck> {
+            if self.buy_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(AppError::Order(REJECT_MSG.into()));
+            }
+            *self.last_order.lock().unwrap() = Some((qty, price));
+            Ok(OrderAck { order_no: "RETRY-BUY".into(), message: "주문 접수".into() })
+        }
+        async fn place_sell_market(&self, _c: &str, _q: u64) -> AppResult<OrderAck> {
+            Err(AppError::Order("테스트에서 미사용".into()))
+        }
+        async fn start_feed(
+            &self,
+            _codes: Vec<String>,
+            _tx: mpsc::Sender<FeedEvent>,
+        ) -> AppResult<Vec<JoinHandle<()>>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// 캐시 예수금이 부풀려져 거부돼도 KIS 매수가능수량으로 1회 재주문해 체결시킨다
+    #[tokio::test]
+    async fn rejected_buy_retries_with_kis_psbl_qty() {
+        let broker = RejectFirstBuyBroker::new(90); // 캐시 기준 94주 < 실제 허용 90주
+        let engine = test_engine(Arc::clone(&broker) as Arc<dyn Broker>, Settings::default());
+        engine.refresh_account().await;
+        seed_quote(&engine, 10_100.0);
+
+        let result = engine.buy_max("0193T0").await;
+
+        assert!(result.ok, "{}", result.message);
+        assert_eq!(result.qty, 90, "KIS가 계산한 수량으로 재주문해야 한다");
+        assert_eq!(result.price, 10_400);
+        assert_eq!(broker.buy_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(*broker.last_order.lock().unwrap(), Some((90, 10_400)));
+    }
+
+    /// 매수가능수량이 0이면 재주문 없이 명확한 실패를 돌려준다
+    #[tokio::test]
+    async fn rejected_buy_with_zero_psbl_fails_without_retry() {
+        let broker = RejectFirstBuyBroker::new(0);
+        let engine = test_engine(Arc::clone(&broker) as Arc<dyn Broker>, Settings::default());
+        engine.refresh_account().await;
+        seed_quote(&engine, 10_100.0);
+
+        let result = engine.buy_max("0193T0").await;
+
+        assert!(!result.ok);
+        assert!(result.message.contains("주문가능금액 부족"), "{}", result.message);
+        assert_eq!(broker.buy_calls.load(Ordering::SeqCst), 1, "재주문하면 안 된다");
+    }
+
+    /// 금액 부족이 원인이 아니면(수량이 줄지 않으면) 원래 에러를 그대로 노출한다
+    #[tokio::test]
+    async fn rejected_buy_for_other_reason_keeps_original_error() {
+        let broker = RejectFirstBuyBroker::new(1_000); // 허용 수량이 주문 수량보다 크다
+        let engine = test_engine(Arc::clone(&broker) as Arc<dyn Broker>, Settings::default());
+        engine.refresh_account().await;
+        seed_quote(&engine, 10_100.0);
+
+        let result = engine.buy_max("0193T0").await;
+
+        assert!(!result.ok);
+        assert!(result.message.contains(REJECT_MSG), "{}", result.message);
+        assert_eq!(broker.buy_calls.load(Ordering::SeqCst), 1, "재주문하면 안 된다");
+    }
+
+    /// REST 스냅샷 폴백으로 받은 시세도 프론트로 emit돼야 화면 수익률이 갱신된다
+    #[tokio::test]
+    async fn snapshot_fallback_emits_quote_event() {
+        let settings = Settings::default();
+        let broker = Arc::new(MockBroker::new(&settings));
+        let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        let emit: EmitFn = Box::new(move |event, _payload| {
+            sink.lock().unwrap().push(event.to_string());
+        });
+        let engine = test_engine_with_emit(broker, settings, Some(emit));
+
+        let q = engine.fresh_quote("0193T0").await;
+
+        assert!(q.is_some());
+        assert!(
+            events.lock().unwrap().iter().any(|e| e == "quote"),
+            "스냅샷 폴백 시 quote 이벤트가 emit돼야 한다"
         );
     }
 }

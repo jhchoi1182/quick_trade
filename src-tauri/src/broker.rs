@@ -23,6 +23,9 @@ pub trait Broker: Send + Sync {
     /// 실시간 캐시가 낡았을 때의 REST 폴백 스냅샷
     async fn snapshot(&self, code: &str) -> AppResult<Quote>;
 
+    /// 지정가 limit_price 기준 미수 없이 매수 가능한 최대 수량 (매수 거부 시 재주문 수량 산정용)
+    async fn max_buy_qty(&self, code: &str, limit_price: u64) -> AppResult<u64>;
+
     /// 지정가 매수 (ioc=true면 IOC지정가: 미체결 잔량 즉시 자동취소)
     async fn place_buy(&self, code: &str, qty: u64, limit_price: u64, ioc: bool) -> AppResult<OrderAck>;
 
