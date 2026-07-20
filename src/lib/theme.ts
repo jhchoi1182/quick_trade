@@ -6,6 +6,8 @@ type MaPeriod = (typeof MA_PERIODS)[number];
 export interface ChartPalette {
   up: string;
   down: string;
+  volUp: string;
+  volDown: string;
   text: string;
   grid: string;
   border: string;
@@ -20,6 +22,8 @@ const PALETTES: Record<ThemeName, ChartPalette> = {
   default: {
     up: "#e5484d",
     down: "#3b82f6",
+    volUp: "rgba(229,72,77,0.4)",
+    volDown: "rgba(59,130,246,0.4)",
     text: "#9aa0a6",
     grid: "rgba(255,255,255,0.05)",
     border: "rgba(255,255,255,0.1)",
@@ -28,6 +32,8 @@ const PALETTES: Record<ThemeName, ChartPalette> = {
   mono: {
     up: "#c9c9c9",
     down: "#686868",
+    volUp: "rgba(201,201,201,0.35)",
+    volDown: "rgba(104,104,104,0.35)",
     text: "#7d7d7d",
     grid: "rgba(255,255,255,0.05)",
     border: "rgba(255,255,255,0.1)",

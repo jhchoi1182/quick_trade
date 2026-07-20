@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import {
   CandlestickSeries,
   createChart,
+  HistogramSeries,
   LineSeries,
   type IChartApi,
   type ISeriesApi,
@@ -9,7 +10,7 @@ import {
 } from "lightweight-charts";
 import type { Candle, Quote } from "../types";
 import { aggregate, applyTick, lastMovingAverage, MA_PERIODS, movingAverage } from "../lib/candles";
-import { chartColors } from "../lib/theme";
+import { chartColors, type ChartPalette } from "../lib/theme";
 import { getCandles } from "../lib/tauri";
 import { useAccountStore } from "../stores/accountStore";
 import { useMarketStore } from "../stores/marketStore";
@@ -24,10 +25,19 @@ function toCandleData(b: Candle) {
   return { time: b.time as UTCTimestamp, open: b.open, high: b.high, low: b.low, close: b.close };
 }
 
+function toVolumeData(b: Candle, colors: ChartPalette) {
+  return {
+    time: b.time as UTCTimestamp,
+    value: b.volume,
+    color: b.close >= b.open ? colors.volUp : colors.volDown,
+  };
+}
+
 export function MiniChart() {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const candleSeriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
+  const volumeSeriesRef = useRef<ISeriesApi<"Histogram"> | null>(null);
   const maSeriesRef = useRef<Map<number, ISeriesApi<"Line">>>(new Map());
   const barsRef = useRef<Candle[]>([]);
   // 종목별 1분봉 캐시: 주기 전환은 재요청 없이 재집계, 종목 복귀는 TTL 이내면 재사용.
@@ -77,7 +87,8 @@ export function MiniChart() {
         vertLines: { color: colors.grid },
         horzLines: { color: colors.grid },
       },
-      rightPriceScale: { borderColor: colors.border },
+      // 아래 22%는 거래량 히스토그램 영역으로 비워둔다
+      rightPriceScale: { borderColor: colors.border, scaleMargins: { top: 0.05, bottom: 0.25 } },
       timeScale: {
         borderColor: colors.border,
         timeVisible: true,
@@ -94,6 +105,14 @@ export function MiniChart() {
       wickDownColor: colors.down,
       priceFormat: { type: "price", precision: 0, minMove: 1 },
     });
+    // 거래량: 캔들과 겹치지 않게 하단 오버레이 스케일에 배치. 색은 데이터 포인트별로 지정.
+    const volume = chart.addSeries(HistogramSeries, {
+      priceScaleId: "volume",
+      priceFormat: { type: "volume" },
+      priceLineVisible: false,
+      lastValueVisible: false,
+    });
+    chart.priceScale("volume").applyOptions({ scaleMargins: { top: 0.78, bottom: 0 } });
     for (const p of MA_PERIODS) {
       maSeriesRef.current.set(
         p,
@@ -108,10 +127,12 @@ export function MiniChart() {
     }
     chartRef.current = chart;
     candleSeriesRef.current = candle;
+    volumeSeriesRef.current = volume;
     return () => {
       chart.remove();
       chartRef.current = null;
       candleSeriesRef.current = null;
+      volumeSeriesRef.current = null;
       maSeriesRef.current = new Map();
     };
   }, []);
@@ -142,6 +163,8 @@ export function MiniChart() {
     for (const p of MA_PERIODS) {
       maSeriesRef.current.get(p)?.applyOptions({ color: colors.ma[p] });
     }
+    // 거래량 색은 포인트별 지정이라 applyOptions로 못 바꾼다 → 현재 봉 데이터로 다시 칠한다
+    volumeSeriesRef.current?.setData(barsRef.current.map((b) => toVolumeData(b, colors)));
   }, [theme]);
 
   // 종목/주기 변경 시: 캐시가 있으면 즉시 렌더(stale-while-revalidate),
@@ -158,6 +181,9 @@ export function MiniChart() {
       const bars = aggregate(oneMin, interval);
       barsRef.current = bars;
       candleSeriesRef.current.setData(bars.map(toCandleData));
+      // 테마는 이 effect 의존성이 아니므로 발사 시점의 최신 팔레트를 저장소에서 직접 읽는다
+      const colors = chartColors(useSettingsStore.getState().settings?.theme ?? "default");
+      volumeSeriesRef.current?.setData(bars.map((b) => toVolumeData(b, colors)));
       for (const p of MA_PERIODS) {
         maSeriesRef.current
           .get(p)
@@ -222,6 +248,8 @@ export function MiniChart() {
       const last = bars[bars.length - 1];
       if (!last) return;
       candleSeriesRef.current.update(toCandleData(last));
+      const colors = chartColors(useSettingsStore.getState().settings?.theme ?? "default");
+      volumeSeriesRef.current?.update(toVolumeData(last, colors));
       for (const p of MA_PERIODS) {
         const point = lastMovingAverage(bars, p);
         if (point) {
