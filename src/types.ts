@@ -22,7 +22,6 @@ export interface Settings {
   exchange: "KRX" | "SOR";
   tradeSymbols: SymbolConfig[];
   chartSymbols: SymbolConfig[];
-  bufferTicks: number;
   chartInterval: number;
   opacity: number;
 }

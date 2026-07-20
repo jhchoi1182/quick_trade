@@ -37,22 +37,26 @@ pub fn tick_size(price: u64, etf: bool) -> u64 {
     }
 }
 
-/// 매수 지정가: 매도1호가 + 버퍼틱, 호가단위에 맞춰 내림 정렬
-pub fn buy_limit_price(ask1: u64, buffer_ticks: u32, etf: bool) -> u64 {
-    let mut price = ask1;
-    for _ in 0..buffer_ticks {
-        price += tick_size(price, etf);
-    }
-    let tick = tick_size(price, etf);
-    price - (price % tick)
+/// 매수 지정가 프리미엄(%). 급등 중에도 IOC가 전량 즉시 체결되도록 현재가보다 높게 잡는다.
+pub const BUY_PREMIUM_PCT: u64 = 3;
+
+/// 최대 수량 계산 시 예수금 사용 비율. 수수료 예상액까지 포함하는 주문가능금액 검사에
+/// 걸리지 않도록 0.5% 여유를 남긴다 ("주문가능금액 초과" 재발 시 이 값을 더 낮출 것).
+pub const CASH_USE_RATIO: f64 = 0.995;
+
+/// 매수 지정가: 현재가 +3%, 호가단위에 맞춰 내림 정렬
+pub fn buy_limit_price(base: u64, etf: bool) -> u64 {
+    let raw = base + base * BUY_PREMIUM_PCT / 100;
+    let tick = tick_size(raw, etf);
+    raw - (raw % tick)
 }
 
-/// 예수금으로 살 수 있는 최대 수량 (수수료 여유분 0.1% 차감)
+/// 예수금으로 살 수 있는 최대 수량 (수수료 여유분 0.5% 차감)
 pub fn max_buy_qty(cash: u64, limit_price: u64) -> u64 {
     if limit_price == 0 {
         return 0;
     }
-    ((cash as f64) * 0.999 / (limit_price as f64)).floor() as u64
+    ((cash as f64) * CASH_USE_RATIO / (limit_price as f64)).floor() as u64
 }
 
 #[cfg(test)]
@@ -76,25 +80,24 @@ mod tests {
     }
 
     #[test]
-    fn buy_limit_adds_buffer_ticks() {
-        // ETF 12,000원 + 2틱 = 12,010
-        assert_eq!(buy_limit_price(12_000, 2, true), 12_010);
-        // 버퍼 0이면 그대로
-        assert_eq!(buy_limit_price(12_000, 0, true), 12_000);
+    fn buy_limit_adds_premium() {
+        // ETF 12,000원 × 1.03 = 12,360 (5원 배수라 그대로)
+        assert_eq!(buy_limit_price(12_000, true), 12_360);
+        // 10,001 × 1.03 = 10,301 → 5원 단위 내림 = 10,300
+        assert_eq!(buy_limit_price(10_001, true), 10_300);
     }
 
     #[test]
     fn buy_limit_aligns_to_tick() {
-        // 호가단위에 어긋난 입력도 내림 정렬된다
-        assert_eq!(buy_limit_price(12_003, 0, true), 12_000);
+        // 비ETF: 프리미엄 결과가 해당 가격대 호가단위로 내림 정렬된다
+        // 21,000 × 1.03 = 21,630 → 50원 단위 내림 = 21,600
+        assert_eq!(buy_limit_price(21_000, false), 21_600);
     }
 
     #[test]
     fn max_qty_reserves_fee_margin() {
-        // 1,000,000원 / 12,010원 = 83.26 → 83주보다 작거나 같아야 함
-        let qty = max_buy_qty(1_000_000, 12_010);
-        assert!(qty <= 83);
-        assert!(qty >= 82);
+        // 1,000,000원 × 0.995 / 12,010원 = 82.84 → 82주
+        assert_eq!(max_buy_qty(1_000_000, 12_010), 82);
         assert_eq!(max_buy_qty(0, 12_010), 0);
         assert_eq!(max_buy_qty(1_000_000, 0), 0);
     }

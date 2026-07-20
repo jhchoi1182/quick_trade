@@ -46,7 +46,6 @@ pub struct Settings {
     pub exchange: String,
     pub trade_symbols: Vec<SymbolConfig>,
     pub chart_symbols: Vec<SymbolConfig>,
-    pub buffer_ticks: u32,
     pub chart_interval: u32,
     pub opacity: f64,
 }
@@ -77,7 +76,6 @@ impl Default for Settings {
                 sym("000660", "SK하이닉스", false),
                 sym("005930", "삼성전자", false),
             ],
-            buffer_ticks: 2,
             chart_interval: 10,
             opacity: 1.0,
         }
@@ -199,7 +197,8 @@ mod tests {
 
     #[test]
     fn settings_deserializes_old_config_with_defaults() {
-        // theme/exchange 필드가 없던 예전 config.json도 기본값으로 읽혀야 한다
+        // theme/exchange 필드가 없던 예전 config.json도 기본값으로 읽혀야 하고,
+        // 폐기된 bufferTicks 키는 무시되어야 한다
         let old = r#"{
             "appKey":"","appSecret":"","cano":"","acntPrdtCd":"01","htsId":"",
             "mode":"demo",

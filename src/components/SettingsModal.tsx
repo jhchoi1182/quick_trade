@@ -82,7 +82,6 @@ export function SettingsModal() {
       if (!/^[A-Z0-9]{6}$/.test(s.code)) return `종목코드는 6자리 영숫자여야 합니다: "${s.code || s.label}"`;
       if (!s.label) return "라벨이 비어있는 종목이 있습니다";
     }
-    if (draft.bufferTicks < 0 || draft.bufferTicks > 20) return "매수 버퍼 틱은 0~20 사이여야 합니다";
     return null;
   };
 
@@ -193,17 +192,6 @@ export function SettingsModal() {
           />
 
           <div className="form-section">
-            <div className="form-section-title">주문</div>
-            <label className="inline-field">
-              매수 버퍼 틱 (매도1호가 + n틱 IOC지정가)
-              <input
-                type="number"
-                min={0}
-                max={20}
-                value={draft.bufferTicks}
-                onChange={(e) => patch({ bufferTicks: Number(e.target.value) })}
-              />
-            </label>
             <div className="form-section-title">주문 거래소</div>
             <div className="mode-toggle">
               {(

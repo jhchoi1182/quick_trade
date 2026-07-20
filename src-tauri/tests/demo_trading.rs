@@ -20,9 +20,9 @@ async fn demo_buy_then_sell_roundtrip() {
     let quote = broker.snapshot(code).await.unwrap();
     assert!(quote.ask1 > 0.0);
 
-    // 엔진과 동일한 산식으로 최대 수량 매수
+    // 엔진과 동일한 산식으로 최대 수량 매수 (현재가 +3% 지정가)
     let account0 = broker.account().await.unwrap();
-    let limit = buy_limit_price(quote.ask1 as u64, settings.buffer_ticks, true);
+    let limit = buy_limit_price(quote.price as u64, true);
     let qty = max_buy_qty(account0.cash, limit);
     assert!(qty > 0);
 

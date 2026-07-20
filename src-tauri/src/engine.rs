@@ -27,7 +27,7 @@ const ACCOUNT_REFRESH_SECS: u64 = 30;
 type EmitFn = Box<dyn Fn(&str, serde_json::Value) + Send + Sync>;
 
 pub struct Engine {
-    /// UI 전용 필드(버퍼틱 등)는 엔진 재시작 없이 갱신되므로 RwLock으로 보관
+    /// UI 전용 필드(테마·차트 주기 등)는 엔진 재시작 없이 갱신되므로 RwLock으로 보관
     settings: RwLock<Settings>,
     broker: Arc<dyn Broker>,
     quotes: RwLock<HashMap<String, Quote>>,
@@ -147,7 +147,7 @@ async fn periodic_refresh(engine: Arc<Engine>) {
 }
 
 impl Engine {
-    /// 브로커 재시작이 필요 없는 설정 변경(버퍼틱 등)을 반영
+    /// 브로커 재시작이 필요 없는 설정 변경(테마·차트 주기 등)을 반영
     pub fn update_settings(&self, new: Settings) {
         *self.settings.write().unwrap() = new;
     }
@@ -222,7 +222,7 @@ impl Engine {
         }
     }
 
-    /// 원클릭 최대 수량 매수: 매도1호가+버퍼틱 IOC지정가
+    /// 원클릭 최대 수량 매수: 현재가 +3% IOC지정가
     pub async fn buy_max(&self, code: &str) -> OrderResult {
         let fail = |message: String| OrderResult {
             ok: false,
@@ -236,16 +236,16 @@ impl Engine {
         let Some(q) = self.fresh_quote(code).await else {
             return fail("시세 없음 — 연결 상태를 확인하세요".into());
         };
-        let ask1 = if q.ask1 > 0.0 { q.ask1 } else { q.price };
-        if ask1 <= 0.0 {
-            return fail("호가 정보 없음".into());
+        let base = if q.price > 0.0 { q.price } else { q.ask1 };
+        if base <= 0.0 {
+            return fail("시세 정보 없음".into());
         }
 
-        let (etf, buffer_ticks, mode) = {
+        let (etf, mode) = {
             let s = self.settings.read().unwrap();
-            (s.is_etf(code), s.buffer_ticks, s.mode)
+            (s.is_etf(code), s.mode)
         };
-        let limit = buy_limit_price(ask1 as u64, buffer_ticks, etf);
+        let limit = buy_limit_price(base as u64, etf);
         // 매도 직후 재매수 등 직전 주문이 아직 캐시에 반영 전이면 동기 갱신 (스캘핑 연속 매매 대응)
         self.sync_account_if_stale().await;
         let cash = self.account.read().unwrap().cash;

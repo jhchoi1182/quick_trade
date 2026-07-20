@@ -9,7 +9,7 @@ import {
 } from "lightweight-charts";
 import type { Candle, Quote } from "../types";
 import { aggregate, applyTick, lastMovingAverage, MA_PERIODS, movingAverage } from "../lib/candles";
-import { CHART_COLORS } from "../lib/theme";
+import { chartColors } from "../lib/theme";
 import { getCandles } from "../lib/tauri";
 import { useAccountStore } from "../stores/accountStore";
 import { useMarketStore } from "../stores/marketStore";
@@ -38,6 +38,8 @@ export function MiniChart() {
   const collapsed = useUiStore((s) => s.chartCollapsed);
   const interval = useSettingsStore((s) => s.settings?.chartInterval ?? 10);
   const setChartInterval = useSettingsStore((s) => s.setChartInterval);
+  const theme = useSettingsStore((s) => s.settings?.theme ?? "default");
+  const palette = chartColors(theme);
   // 캐시가 전혀 없는 종목을 로드하는 동안 표시 (첫 백필은 수 초 걸릴 수 있음)
   const [loading, setLoading] = useState(false);
   // WS 재연결 시 +1 → 로드 effect 재실행 (끊긴 동안의 틱 공백을 REST 재조회로 메움)
@@ -58,40 +60,43 @@ export function MiniChart() {
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
+    // 생성 effect는 마운트 1회만 실행되므로 팔레트는 저장소에서 직접 읽는다
+    // (테마 변경은 아래 테마 effect가 applyOptions로 반영)
+    const colors = chartColors(useSettingsStore.getState().settings?.theme ?? "default");
     const chart = createChart(el, {
       autoSize: true,
       layout: {
         background: { color: "transparent" },
-        textColor: CHART_COLORS.text,
+        textColor: colors.text,
         fontSize: 10,
         attributionLogo: false,
       },
       grid: {
-        vertLines: { color: "rgba(255,255,255,0.05)" },
-        horzLines: { color: "rgba(255,255,255,0.05)" },
+        vertLines: { color: colors.grid },
+        horzLines: { color: colors.grid },
       },
-      rightPriceScale: { borderColor: "rgba(255,255,255,0.1)" },
+      rightPriceScale: { borderColor: colors.border },
       timeScale: {
-        borderColor: "rgba(255,255,255,0.1)",
+        borderColor: colors.border,
         timeVisible: true,
         secondsVisible: false,
       },
       crosshair: { horzLine: { visible: true }, vertLine: { visible: true } },
     });
     const candle = chart.addSeries(CandlestickSeries, {
-      upColor: CHART_COLORS.up,
-      borderUpColor: CHART_COLORS.up,
-      wickUpColor: CHART_COLORS.up,
-      downColor: CHART_COLORS.down,
-      borderDownColor: CHART_COLORS.down,
-      wickDownColor: CHART_COLORS.down,
+      upColor: colors.up,
+      borderUpColor: colors.up,
+      wickUpColor: colors.up,
+      downColor: colors.down,
+      borderDownColor: colors.down,
+      wickDownColor: colors.down,
       priceFormat: { type: "price", precision: 0, minMove: 1 },
     });
     for (const p of MA_PERIODS) {
       maSeriesRef.current.set(
         p,
         chart.addSeries(LineSeries, {
-          color: CHART_COLORS.ma[p],
+          color: colors.ma[p],
           lineWidth: 1,
           priceLineVisible: false,
           lastValueVisible: false,
@@ -109,6 +114,33 @@ export function MiniChart() {
     };
   }, []);
 
+  // 테마 변경 시 차트 캔버스 색을 회색조/기본색으로 전환 (차트 재생성·데이터 재요청 없음)
+  useEffect(() => {
+    const chart = chartRef.current;
+    const candle = candleSeriesRef.current;
+    if (!chart || !candle) return;
+    const colors = chartColors(theme);
+    chart.applyOptions({
+      layout: { textColor: colors.text },
+      grid: {
+        vertLines: { color: colors.grid },
+        horzLines: { color: colors.grid },
+      },
+      rightPriceScale: { borderColor: colors.border },
+      timeScale: { borderColor: colors.border },
+    });
+    candle.applyOptions({
+      upColor: colors.up,
+      borderUpColor: colors.up,
+      wickUpColor: colors.up,
+      downColor: colors.down,
+      borderDownColor: colors.down,
+      wickDownColor: colors.down,
+    });
+    for (const p of MA_PERIODS) {
+      maSeriesRef.current.get(p)?.applyOptions({ color: colors.ma[p] });
+    }
+  }, [theme]);
 
   // 종목/주기 변경 시: 캐시가 있으면 즉시 렌더(stale-while-revalidate),
   // TTL이 지난 경우에만 백그라운드 재조회 후 갱신. 실패해도 기존 화면 유지.
@@ -196,7 +228,7 @@ export function MiniChart() {
       <div className="chart-header">
         <div className="ma-legend">
           {MA_PERIODS.map((p) => (
-            <span key={p} style={{ color: CHART_COLORS.ma[p] }}>
+            <span key={p} style={{ color: palette.ma[p] }}>
               {p}
             </span>
           ))}

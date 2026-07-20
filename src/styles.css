@@ -387,15 +387,6 @@ body {
 
 .inline-inputs { display: flex; gap: 5px; }
 
-.inline-field {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 11px;
-}
-
-.inline-field input { width: 60px !important; }
-
 .mode-toggle { display: flex; gap: 4px; }
 .mode-toggle button { padding: 4px 10px; font-size: 11px; }
 

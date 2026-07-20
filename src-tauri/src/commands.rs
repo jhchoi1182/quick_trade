@@ -8,7 +8,7 @@ use crate::state::AppState;
 use crate::types::{AccountSnapshot, Candle, OrderResult, Settings, SymbolConfig};
 
 /// 브로커 연결·구독에 영향을 주는 필드가 바뀐 경우에만 엔진을 재시작한다.
-/// UI 전용 필드(opacity/chartInterval/theme/bufferTicks, 라벨)는 저장만 하고 유지 —
+/// UI 전용 필드(opacity/chartInterval/theme, 라벨)는 저장만 하고 유지 —
 /// 매 저장마다 재시작하면 웹소켓 재접속 + 백필 버스트로 유량 초과가 발생한다.
 fn needs_engine_restart(old: &Settings, new: &Settings) -> bool {
     fn codes(list: &[SymbolConfig]) -> Vec<&str> {
@@ -106,7 +106,6 @@ mod tests {
         new.opacity = 0.5;
         new.chart_interval = 15;
         new.theme = "mono".into();
-        new.buffer_ticks = 5;
         new.trade_symbols[0].label = "라벨만 변경".into();
         assert!(!needs_engine_restart(&old, &new));
     }
