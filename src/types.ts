@@ -78,3 +78,18 @@ export interface FillEvent {
 export interface ConnEvent {
   connected: boolean;
 }
+
+export type ReservationStatus = "waiting" | "filled" | "cancelled";
+
+/** 예약 매도 상태 (백엔드 emit("reservation") / get_reservations 페이로드) */
+export interface Reservation {
+  code: string;
+  /** 목표 수익률(%) — 평단 기준 */
+  targetPct: number;
+  /** 계산된 목표 지정가(호가단위 올림) */
+  targetPrice: number;
+  qty: number;
+  status: ReservationStatus;
+  /** 취소 사유 등 사용자 안내 (없을 수 있음) */
+  reason?: string;
+}

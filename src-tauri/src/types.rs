@@ -176,6 +176,25 @@ pub struct FillEvent {
     pub price: f64,
 }
 
+/// 예약 매도 상태 — 프론트로 emit("reservation") + get_reservations 반환에 사용.
+/// (원주문번호 등 내부 식별자는 엔진 메모리에만 두고 프론트로 보내지 않는다)
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReservationInfo {
+    pub code: String,
+    /// 목표 수익률(%) — 평단 기준
+    pub target_pct: f64,
+    /// 계산된 목표 지정가(호가단위 올림)
+    pub target_price: u64,
+    /// 걸어둔(남은) 수량
+    pub qty: u64,
+    /// "waiting" | "filled" | "cancelled"
+    pub status: String,
+    /// 취소 사유 등 사용자 안내 (없으면 생략)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 /// 실시간 피드(웹소켓/모의 피드)가 엔진으로 보내는 이벤트
 #[derive(Debug, Clone)]
 pub enum FeedEvent {

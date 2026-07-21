@@ -3,14 +3,16 @@ import { applyAlwaysOnTop, applyChartCollapsed, TitleBar } from "./components/Ti
 import { MiniChart } from "./components/MiniChart";
 import { TradeBar } from "./components/TradeBar";
 import { TradeButtons } from "./components/TradeButtons";
+import { ReservedSell } from "./components/ReservedSell";
 import { StatusStrip } from "./components/StatusStrip";
 import { SettingsModal } from "./components/SettingsModal";
 import { ToastOverlay } from "./components/Toast";
 import { useTauriEvents } from "./hooks/useTauriEvents";
 import { useSettingsStore } from "./stores/settingsStore";
 import { useUiStore } from "./stores/uiStore";
-import { getAccount } from "./lib/tauri";
+import { getAccount, getReservations } from "./lib/tauri";
 import { useAccountStore } from "./stores/accountStore";
+import { useReservationStore } from "./stores/reservationStore";
 
 export default function App() {
   useTauriEvents();
@@ -42,6 +44,9 @@ export default function App() {
     void getAccount()
       .then((snap) => useAccountStore.getState().applySnapshot(snap))
       .catch(() => {});
+    void getReservations()
+      .then((list) => useReservationStore.getState().hydrate(list))
+      .catch(() => {});
   }, [settings]);
 
   if (!settings) {
@@ -54,6 +59,7 @@ export default function App() {
       <MiniChart />
       <TradeBar />
       <TradeButtons />
+      <ReservedSell />
       <StatusStrip />
       <SettingsModal />
       <ToastOverlay />

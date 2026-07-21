@@ -5,7 +5,7 @@ use tauri::{AppHandle, State};
 use crate::config;
 use crate::engine::{self, Engine};
 use crate::state::AppState;
-use crate::types::{AccountSnapshot, Candle, OrderResult, Settings, SymbolConfig};
+use crate::types::{AccountSnapshot, Candle, OrderResult, ReservationInfo, Settings, SymbolConfig};
 
 /// 브로커 연결·구독에 영향을 주는 필드가 바뀐 경우에만 엔진을 재시작한다.
 /// UI 전용 필드(opacity/chartInterval/theme, 라벨)는 저장만 하고 유지 —
@@ -93,6 +93,32 @@ pub async fn buy_max(state: State<'_, AppState>, code: String) -> Result<OrderRe
 pub async fn sell_all(state: State<'_, AppState>, code: String) -> Result<OrderResult, String> {
     let engine = engine_of(&state).await?;
     Ok(engine.sell_all(&code).await)
+}
+
+/// 예약 매도 설정: 평단 기준 target_pct(%) 이상 첫 호가에 보유 전량 지정가 매도를 건다
+#[tauri::command]
+pub async fn place_reserved_sell(
+    state: State<'_, AppState>,
+    code: String,
+    target_pct: f64,
+) -> Result<OrderResult, String> {
+    let engine = engine_of(&state).await?;
+    Ok(engine.place_reserved_sell(&code, target_pct).await)
+}
+
+#[tauri::command]
+pub async fn cancel_reserved_sell(
+    state: State<'_, AppState>,
+    code: String,
+) -> Result<OrderResult, String> {
+    let engine = engine_of(&state).await?;
+    Ok(engine.cancel_reserved_sell(&code).await)
+}
+
+#[tauri::command]
+pub async fn get_reservations(state: State<'_, AppState>) -> Result<Vec<ReservationInfo>, String> {
+    let engine = engine_of(&state).await?;
+    Ok(engine.get_reservations())
 }
 
 #[cfg(test)]

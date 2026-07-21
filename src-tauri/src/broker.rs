@@ -8,6 +8,8 @@ use crate::types::{AccountSnapshot, Candle, FeedEvent, Quote};
 #[derive(Debug, Clone)]
 pub struct OrderAck {
     pub order_no: String,
+    /// 한국거래소전송주문조직번호(KRX_FWDG_ORD_ORGNO) — 정정취소 시 원주문 식별에 필요
+    pub org_no: String,
     pub message: String,
 }
 
@@ -31,6 +33,12 @@ pub trait Broker: Send + Sync {
 
     /// 시장가 전량 매도
     async fn place_sell_market(&self, code: &str, qty: u64) -> AppResult<OrderAck>;
+
+    /// 지정가 매도 (예약 매도용) — 목표 호가에 걸어두고 시세 도달 시 체결
+    async fn place_sell_limit(&self, code: &str, qty: u64, limit_price: u64) -> AppResult<OrderAck>;
+
+    /// 미체결 주문 취소 (예약 매도 취소용). order_no=원주문번호, org_no=주문조직번호
+    async fn cancel_order(&self, code: &str, order_no: &str, org_no: &str) -> AppResult<OrderAck>;
 
     /// 실시간 피드 시작. 생성된 백그라운드 태스크 핸들을 반환한다 (엔진 재시작 시 abort용)
     async fn start_feed(

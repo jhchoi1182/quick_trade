@@ -12,9 +12,10 @@ use crate::error::AppResult;
 use crate::kis::KisBroker;
 use crate::mock::MockBroker;
 use crate::types::{
-    AccountSnapshot, Candle, FeedEvent, OrderResult, Quote, Settings, Side, TradeMode,
+    AccountSnapshot, Candle, FeedEvent, OrderResult, Quote, ReservationInfo, Settings, Side,
+    TradeMode,
 };
-use crate::util::{buy_limit_price, max_buy_qty, now_kst_fake_epoch};
+use crate::util::{buy_limit_price, max_buy_qty, now_kst_fake_epoch, sell_target_price};
 
 /// 캐시가 이 초수보다 낡으면 주문 전에 REST 스냅샷으로 폴백
 const QUOTE_FRESH_SECS: i64 = 10;
@@ -26,12 +27,37 @@ const ACCOUNT_REFRESH_SECS: u64 = 30;
 /// tauri 심볼을 링크하면 매니페스트 없는 단위 테스트 exe가 comctl32 v6 로드 실패로 죽는다.
 type EmitFn = Box<dyn Fn(&str, serde_json::Value) + Send + Sync>;
 
+/// 걸어둔 예약 매도(지정가). 원주문번호/조직번호는 취소에 필요한 내부 식별자로 프론트에는 안 보낸다.
+#[derive(Clone)]
+struct Reservation {
+    target_pct: f64,
+    target_price: u64,
+    qty: u64,
+    order_no: String,
+    org_no: String,
+}
+
+/// 예약 상태를 프론트 emit/조회용 직렬화 타입으로 변환
+fn reservation_info(code: &str, r: &Reservation, status: &str, reason: Option<String>) -> ReservationInfo {
+    ReservationInfo {
+        code: code.to_string(),
+        target_pct: r.target_pct,
+        target_price: r.target_price,
+        qty: r.qty,
+        status: status.to_string(),
+        reason,
+    }
+}
+
 pub struct Engine {
     /// UI 전용 필드(테마·차트 주기 등)는 엔진 재시작 없이 갱신되므로 RwLock으로 보관
     settings: RwLock<Settings>,
     broker: Arc<dyn Broker>,
     quotes: RwLock<HashMap<String, Quote>>,
     account: RwLock<AccountSnapshot>,
+    /// 걸어둔 예약 매도 (code -> Reservation). 코드당 최대 1건.
+    /// 엔진 메모리에만 존재 — 엔진 재시작 시 유실(거래소 실주문은 남음)
+    reservations: RwLock<HashMap<String, Reservation>>,
     candle_cache: CandleCache,
     last_error: Mutex<String>,
     /// 지연 잔고 갱신이 이미 예약되어 있으면 true — 연속 체결통보를 1회 갱신으로 합류
@@ -71,6 +97,7 @@ pub async fn start(app: AppHandle, settings: Settings) -> AppResult<EngineHandle
         broker: Arc::clone(&broker),
         quotes: RwLock::new(HashMap::new()),
         account: RwLock::new(AccountSnapshot { cash: 0, positions: Vec::new() }),
+        reservations: RwLock::new(HashMap::new()),
         candle_cache: CandleCache::new(),
         last_error: Mutex::new(String::new()),
         refresh_pending: AtomicBool::new(false),
@@ -138,6 +165,12 @@ async fn consume_feed(engine: Arc<Engine>, mut rx: mpsc::Receiver<FeedEvent>) {
             }
             FeedEvent::Fill(fill) => {
                 engine.emit("fill", &fill);
+                // 매도 체결이면 걸어둔 예약 잔량을 차감하고, 소진 시 예약을 해제한다
+                if matches!(fill.side, Side::Sell) {
+                    if let Some(info) = engine.on_sell_fill(&fill.code, fill.qty) {
+                        engine.emit("reservation", &info);
+                    }
+                }
                 engine.mark_account_stale();
                 // 부분체결이 연발해도 잔고 조회는 1회로 합류 → 리미터 큐를 채우지 않는다
                 engine.schedule_account_refresh();
@@ -281,6 +314,7 @@ impl Engine {
         let ioc = !matches!(mode, TradeMode::Paper);
         match self.broker.place_buy(code, qty, limit, ioc).await {
             Ok(ack) => {
+                self.after_buy_success(code).await;
                 self.mark_account_stale();
                 self.schedule_account_refresh();
                 OrderResult {
@@ -337,6 +371,7 @@ impl Engine {
         tracing::info!("매수 거부 → KIS 매수가능수량 {qty}주로 재주문 ({code}, 거부 수량 {rejected_qty}주)");
         match self.broker.place_buy(code, qty, limit, ioc).await {
             Ok(ack) => {
+                self.after_buy_success(code).await;
                 self.mark_account_stale();
                 Some(OrderResult {
                     ok: true,
@@ -361,6 +396,11 @@ impl Engine {
             price: 0,
             message,
         };
+
+        // 예약 매도가 걸려 있으면 물량이 잠겨 시장가 매도가 거부되므로 먼저 취소한다
+        if let Some(r) = self.cancel_reservation_internal(code).await {
+            self.emit("reservation", &reservation_info(code, &r, "cancelled", None));
+        }
 
         // 매수 체결 직후 매도 등 직전 주문이 아직 캐시에 반영 전이면 동기 갱신 (스캘핑 연속 매매 대응)
         self.sync_account_if_stale().await;
@@ -420,6 +460,170 @@ impl Engine {
             .unwrap_or(0)
     }
 
+    /// 캐시된 보유 (수량, 평단). 없으면 (0, 0.0)
+    fn cached_position(&self, code: &str) -> (u64, f64) {
+        self.account
+            .read()
+            .unwrap()
+            .positions
+            .iter()
+            .find(|p| p.code == code)
+            .map(|p| (p.qty, p.avg_price))
+            .unwrap_or((0, 0.0))
+    }
+
+    /// 예약 매도 설정: 평단 × (1 + pct/100) 이상 첫 호가에 보유 전량 지정가 매도를 걸어둔다.
+    /// 기존 예약이 있으면 취소 후 교체한다.
+    pub async fn place_reserved_sell(&self, code: &str, target_pct: f64) -> OrderResult {
+        let fail = |message: String| OrderResult {
+            ok: false,
+            side: Side::Sell,
+            code: code.to_string(),
+            qty: 0,
+            price: 0,
+            message,
+        };
+
+        // 매수 직후 예약 등 직전 주문이 아직 캐시에 반영 전이면 동기 갱신
+        self.sync_account_if_stale().await;
+        let (mut qty, mut avg) = self.cached_position(code);
+        if qty == 0 || avg <= 0.0 {
+            // 앱 시작 직후 등 캐시가 비어 있을 수 있다 — 동기 갱신 후 재확인
+            self.refresh_account().await;
+            let (q, a) = self.cached_position(code);
+            qty = q;
+            avg = a;
+        }
+        if qty == 0 || avg <= 0.0 {
+            return fail("보유 수량 없음".into());
+        }
+
+        let etf = self.settings.read().unwrap().is_etf(code);
+        let target = sell_target_price(avg, target_pct, etf);
+        if target == 0 {
+            return fail("목표가 계산 실패".into());
+        }
+
+        // 같은 종목에 이미 예약이 있으면 먼저 취소 (물량 이중 주문 방지)
+        self.cancel_reservation_internal(code).await;
+
+        match self.broker.place_sell_limit(code, qty, target).await {
+            Ok(ack) => {
+                let r = Reservation {
+                    target_pct,
+                    target_price: target,
+                    qty,
+                    order_no: ack.order_no,
+                    org_no: ack.org_no,
+                };
+                self.reservations.write().unwrap().insert(code.to_string(), r.clone());
+                self.mark_account_stale();
+                self.schedule_account_refresh();
+                self.emit("reservation", &reservation_info(code, &r, "waiting", None));
+                OrderResult {
+                    ok: true,
+                    side: Side::Sell,
+                    code: code.to_string(),
+                    qty,
+                    price: target,
+                    message: ack.message,
+                }
+            }
+            Err(e) => {
+                self.schedule_account_refresh();
+                fail(e.to_string())
+            }
+        }
+    }
+
+    /// 예약 매도 취소 (사용자 요청). 이미 체결돼 예약이 사라진 경우는 실패로 안내.
+    pub async fn cancel_reserved_sell(&self, code: &str) -> OrderResult {
+        let Some(r) = self.reservations.read().unwrap().get(code).cloned() else {
+            return OrderResult {
+                ok: false,
+                side: Side::Sell,
+                code: code.to_string(),
+                qty: 0,
+                price: 0,
+                message: "취소할 예약이 없습니다".into(),
+            };
+        };
+        let result = self.broker.cancel_order(code, &r.order_no, &r.org_no).await;
+        // await 중 체결통보로 이미 제거됐을 수 있다 — 실제로 제거된 경우만 취소로 처리
+        let removed = self.reservations.write().unwrap().remove(code).is_some();
+        if removed {
+            self.emit("reservation", &reservation_info(code, &r, "cancelled", None));
+            self.mark_account_stale();
+            self.schedule_account_refresh();
+        }
+        match result {
+            Ok(ack) => OrderResult {
+                ok: true,
+                side: Side::Sell,
+                code: code.to_string(),
+                qty: r.qty,
+                price: r.target_price,
+                message: ack.message,
+            },
+            Err(e) => OrderResult {
+                ok: false,
+                side: Side::Sell,
+                code: code.to_string(),
+                qty: 0,
+                price: 0,
+                message: e.to_string(),
+            },
+        }
+    }
+
+    /// 현재 걸려 있는 예약 목록 (프론트 하이드레이션용)
+    pub fn get_reservations(&self) -> Vec<ReservationInfo> {
+        self.reservations
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(code, r)| reservation_info(code, r, "waiting", None))
+            .collect()
+    }
+
+    /// 예약이 있으면 브로커에 취소 요청(실패해도 로컬 상태는 제거)하고 제거된 예약을 반환.
+    /// emit은 호출자가 상황(교체/수동매도/추가매수)에 맞게 처리한다.
+    async fn cancel_reservation_internal(&self, code: &str) -> Option<Reservation> {
+        let r = self.reservations.read().unwrap().get(code).cloned()?;
+        if let Err(e) = self.broker.cancel_order(code, &r.order_no, &r.org_no).await {
+            tracing::warn!("예약 매도 취소 실패({code}): {e} — 로컬 예약만 해제");
+        }
+        self.reservations.write().unwrap().remove(code);
+        Some(r)
+    }
+
+    /// 매수 성공 시 걸려 있던 예약을 취소한다 (평단이 바뀌어 목표가가 무의미해짐).
+    async fn after_buy_success(&self, code: &str) {
+        if let Some(r) = self.cancel_reservation_internal(code).await {
+            let reason = Some("추가 매수로 예약 매도가 취소되었습니다. 다시 설정하세요.".to_string());
+            self.emit("reservation", &reservation_info(code, &r, "cancelled", reason));
+        }
+    }
+
+    /// 매도 체결 시 예약 잔량을 차감하고, 소진되면 예약을 제거한다.
+    /// 반환: 프론트로 emit할 예약 상태 변화 (예약이 없으면 None).
+    fn on_sell_fill(&self, code: &str, filled_qty: u64) -> Option<ReservationInfo> {
+        let mut map = self.reservations.write().unwrap();
+        let remaining = {
+            let r = map.get_mut(code)?;
+            r.qty = r.qty.saturating_sub(filled_qty);
+            r.qty
+        };
+        if remaining == 0 {
+            let r = map.remove(code)?;
+            Some(reservation_info(code, &r, "filled", None))
+        } else {
+            // 부분 체결 — 남은 수량으로 대기 상태 유지
+            let r = map.get(code)?;
+            Some(reservation_info(code, r, "waiting", None))
+        }
+    }
+
     /// 주문·체결 직후 잠시 뒤 잔고 갱신 (체결통보와 별개의 안전망).
     /// 이미 예약된 갱신이 있으면 합류해 REST 호출(1회당 GET 2건)이 리미터 큐에 쌓이지 않게 한다.
     fn schedule_account_refresh(&self) {
@@ -461,6 +665,7 @@ mod tests {
             broker,
             quotes: RwLock::new(HashMap::new()),
             account: RwLock::new(AccountSnapshot { cash: 0, positions: Vec::new() }),
+            reservations: RwLock::new(HashMap::new()),
             candle_cache: CandleCache::new(),
             last_error: Mutex::new(String::new()),
             refresh_pending: AtomicBool::new(false),
@@ -589,10 +794,17 @@ mod tests {
             *self.order.lock().unwrap() = Some((code.into(), qty, price, ioc));
             Ok(OrderAck {
                 order_no: "TEST-BUY".into(),
+                org_no: "TEST-ORG".into(),
                 message: "주문 접수".into(),
             })
         }
         async fn place_sell_market(&self, _code: &str, _qty: u64) -> AppResult<OrderAck> {
+            Err(AppError::Order("테스트에서 미사용".into()))
+        }
+        async fn place_sell_limit(&self, _c: &str, _q: u64, _p: u64) -> AppResult<OrderAck> {
+            Err(AppError::Order("테스트에서 미사용".into()))
+        }
+        async fn cancel_order(&self, _c: &str, _o: &str, _g: &str) -> AppResult<OrderAck> {
             Err(AppError::Order("테스트에서 미사용".into()))
         }
         async fn start_feed(
@@ -628,6 +840,12 @@ mod tests {
             Err(AppError::Order("테스트에서 미사용".into()))
         }
         async fn place_sell_market(&self, _c: &str, _q: u64) -> AppResult<OrderAck> {
+            Err(AppError::Order("테스트에서 미사용".into()))
+        }
+        async fn place_sell_limit(&self, _c: &str, _q: u64, _p: u64) -> AppResult<OrderAck> {
+            Err(AppError::Order("테스트에서 미사용".into()))
+        }
+        async fn cancel_order(&self, _c: &str, _o: &str, _g: &str) -> AppResult<OrderAck> {
             Err(AppError::Order("테스트에서 미사용".into()))
         }
         async fn start_feed(
@@ -694,9 +912,15 @@ mod tests {
                 return Err(AppError::Order(REJECT_MSG.into()));
             }
             *self.last_order.lock().unwrap() = Some((qty, price));
-            Ok(OrderAck { order_no: "RETRY-BUY".into(), message: "주문 접수".into() })
+            Ok(OrderAck { order_no: "RETRY-BUY".into(), org_no: "RETRY-ORG".into(), message: "주문 접수".into() })
         }
         async fn place_sell_market(&self, _c: &str, _q: u64) -> AppResult<OrderAck> {
+            Err(AppError::Order("테스트에서 미사용".into()))
+        }
+        async fn place_sell_limit(&self, _c: &str, _q: u64, _p: u64) -> AppResult<OrderAck> {
+            Err(AppError::Order("테스트에서 미사용".into()))
+        }
+        async fn cancel_order(&self, _c: &str, _o: &str, _g: &str) -> AppResult<OrderAck> {
             Err(AppError::Order("테스트에서 미사용".into()))
         }
         async fn start_feed(
@@ -774,5 +998,102 @@ mod tests {
             events.lock().unwrap().iter().any(|e| e == "quote"),
             "스냅샷 폴백 시 quote 이벤트가 emit돼야 한다"
         );
+    }
+
+    /// 예약 매도: 평단 기준 목표가(+0.3% 이상 첫 호가)에 걸리고 목록에 반영된다
+    #[tokio::test]
+    async fn reserved_sell_arms_at_target_above_avg() {
+        let settings = Settings::default();
+        let engine = test_engine(Arc::new(MockBroker::new(&settings)), settings);
+        engine.refresh_account().await;
+
+        let buy = engine.buy_max("0193T0").await;
+        assert!(buy.ok, "{}", buy.message);
+
+        let resv = engine.place_reserved_sell("0193T0", 0.3).await;
+        assert!(resv.ok, "{}", resv.message);
+        let avg = engine.cached_position("0193T0").1;
+        assert!(avg > 0.0);
+        // 목표가는 평단 +0.3% 이상이어야 한다
+        assert!(
+            resv.price as f64 >= avg * 1.003,
+            "목표가 {} < 평단*1.003 {}",
+            resv.price,
+            avg * 1.003
+        );
+        assert_eq!(engine.get_reservations().len(), 1);
+    }
+
+    /// 매도 체결 통보가 오면 걸려 있던 예약이 자동 해제된다
+    #[tokio::test]
+    async fn reserved_sell_clears_on_fill() {
+        let settings = Settings::default();
+        let engine = test_engine(Arc::new(MockBroker::new(&settings)), settings);
+        engine.refresh_account().await;
+        let buy = engine.buy_max("0193T0").await;
+        assert!(buy.ok, "{}", buy.message);
+        assert!(engine.place_reserved_sell("0193T0", 0.5).await.ok);
+
+        // 전량 체결 → filled 상태로 예약 제거
+        let info = engine.on_sell_fill("0193T0", buy.qty).expect("예약 상태 변화");
+        assert_eq!(info.status, "filled");
+        assert!(engine.get_reservations().is_empty());
+    }
+
+    /// 부분 체결이면 남은 수량으로 대기 상태를 유지한다
+    #[tokio::test]
+    async fn reserved_sell_partial_fill_keeps_waiting() {
+        let settings = Settings::default();
+        let engine = test_engine(Arc::new(MockBroker::new(&settings)), settings);
+        engine.refresh_account().await;
+        let buy = engine.buy_max("0193T0").await;
+        assert!(buy.ok && buy.qty >= 2, "{}", buy.message);
+        assert!(engine.place_reserved_sell("0193T0", 0.5).await.ok);
+
+        let info = engine.on_sell_fill("0193T0", 1).expect("예약 상태 변화");
+        assert_eq!(info.status, "waiting");
+        assert_eq!(info.qty, buy.qty - 1);
+        assert_eq!(engine.get_reservations().len(), 1);
+    }
+
+    /// 수동 전량 매도는 걸려 있던 예약을 먼저 취소한 뒤 시장가로 판다
+    #[tokio::test]
+    async fn manual_sell_cancels_reservation_first() {
+        let settings = Settings::default();
+        let engine = test_engine(Arc::new(MockBroker::new(&settings)), settings);
+        engine.refresh_account().await;
+        let buy = engine.buy_max("0193T0").await;
+        assert!(buy.ok, "{}", buy.message);
+        assert!(engine.place_reserved_sell("0193T0", 0.5).await.ok);
+        assert_eq!(engine.get_reservations().len(), 1);
+
+        let sell = engine.sell_all("0193T0").await;
+        assert!(sell.ok, "매도 실패: {}", sell.message);
+        assert!(engine.get_reservations().is_empty(), "매도 시 예약이 취소돼야 한다");
+    }
+
+    /// 추가 매수는 평단이 바뀌므로 기존 예약을 취소한다
+    #[tokio::test]
+    async fn additional_buy_cancels_reservation() {
+        let settings = Settings::default();
+        let engine = test_engine(Arc::new(MockBroker::new(&settings)), settings);
+        engine.refresh_account().await;
+        assert!(engine.buy_max("0193T0").await.ok);
+        assert!(engine.place_reserved_sell("0193T0", 0.5).await.ok);
+        assert_eq!(engine.get_reservations().len(), 1);
+
+        assert!(engine.buy_max("0193T0").await.ok);
+        assert!(engine.get_reservations().is_empty(), "추가 매수 시 예약이 취소돼야 한다");
+    }
+
+    /// 보유가 없으면 예약 매도는 거부된다
+    #[tokio::test]
+    async fn reserved_sell_without_holding_fails() {
+        let settings = Settings::default();
+        let engine = test_engine(Arc::new(MockBroker::new(&settings)), settings);
+        engine.refresh_account().await;
+        let resv = engine.place_reserved_sell("0193T0", 0.3).await;
+        assert!(!resv.ok);
+        assert!(resv.message.contains("보유 수량 없음"), "{}", resv.message);
     }
 }

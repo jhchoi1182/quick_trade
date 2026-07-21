@@ -52,6 +52,9 @@ pub fn run() {
             commands::get_account,
             commands::buy_max,
             commands::sell_all,
+            commands::place_reserved_sell,
+            commands::cancel_reserved_sell,
+            commands::get_reservations,
         ])
         .run(tauri::generate_context!())
         .expect("Tauri 실행 실패");

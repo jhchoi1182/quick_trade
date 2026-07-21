@@ -59,6 +59,19 @@ pub fn max_buy_qty(cash: u64, reference_price: u64) -> u64 {
     ((cash as f64) * CASH_USE_RATIO / (reference_price as f64)).floor() as u64
 }
 
+/// 예약 매도 목표가: 평단 × (1 + pct/100) "이상"인 첫 호가(올림 정렬).
+/// buy_limit_price가 내림인 것과 달리, 입력 수익률 이상을 보장하려고 올림한다.
+/// (예: 0.3% 지정 시 평단보다 0.3% 이상인 가장 낮은 호가에 매도 주문을 건다)
+pub fn sell_target_price(avg_price: f64, pct: f64, etf: bool) -> u64 {
+    if avg_price <= 0.0 {
+        return 0;
+    }
+    let raw = avg_price * (1.0 + pct / 100.0);
+    let tick = tick_size(raw as u64, etf);
+    let ticks = (raw / tick as f64).ceil() as u64;
+    ticks * tick
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,6 +115,22 @@ mod tests {
         assert_eq!(max_buy_qty(63_956_290, 14_710), 4_130);
         assert_eq!(max_buy_qty(0, 12_010), 0);
         assert_eq!(max_buy_qty(1_000_000, 0), 0);
+    }
+
+    #[test]
+    fn sell_target_ceils_to_first_tick_at_or_above() {
+        // ETF 평단 10,000원 +0.3% = 10,030 (5원 배수라 그대로)
+        assert_eq!(sell_target_price(10_000.0, 0.3, true), 10_030);
+        // 평단 10,001원 +0.3% = 10,031.003 → 5원 올림 = 10,035
+        assert_eq!(sell_target_price(10_001.0, 0.3, true), 10_035);
+        // 딱 맞는 경우: 12,000원 +0.5% = 12,060 (5원 배수) 그대로
+        assert_eq!(sell_target_price(12_000.0, 0.5, true), 12_060);
+        // pct 0 → 평단 이상 첫 호가 = 평단(호가배수면 그대로)
+        assert_eq!(sell_target_price(10_000.0, 0.0, true), 10_000);
+        // 비ETF 호가단위(50원) 적용: 20,000원 +0.2% = 20,040 → 50원 올림 = 20,050
+        assert_eq!(sell_target_price(20_000.0, 0.2, false), 20_050);
+        // 평단 0 방어
+        assert_eq!(sell_target_price(0.0, 0.3, true), 0);
     }
 
     #[test]

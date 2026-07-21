@@ -91,6 +91,20 @@ impl Broker for KisBroker {
         .await
     }
 
+    async fn place_sell_limit(&self, code: &str, qty: u64, limit_price: u64) -> AppResult<OrderAck> {
+        order::order_cash(
+            &self.rest, self.cano(), self.prdt(), Side::Sell, code, qty, order::ORD_DVSN_LIMIT, limit_price, self.exchange(),
+        )
+        .await
+    }
+
+    async fn cancel_order(&self, _code: &str, order_no: &str, org_no: &str) -> AppResult<OrderAck> {
+        order::cancel_order(
+            &self.rest, self.cano(), self.prdt(), order_no, org_no, self.exchange(),
+        )
+        .await
+    }
+
     async fn start_feed(
         &self,
         codes: Vec<String>,

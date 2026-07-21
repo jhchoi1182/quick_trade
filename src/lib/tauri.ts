@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { AccountSnapshot, Candle, OrderResult, Settings } from "../types";
+import type { AccountSnapshot, Candle, OrderResult, Reservation, Settings } from "../types";
 
 export function getSettings(): Promise<Settings> {
   return invoke<Settings>("get_settings");
@@ -23,4 +23,16 @@ export function buyMax(code: string): Promise<OrderResult> {
 
 export function sellAll(code: string): Promise<OrderResult> {
   return invoke<OrderResult>("sell_all", { code });
+}
+
+export function placeReservedSell(code: string, targetPct: number): Promise<OrderResult> {
+  return invoke<OrderResult>("place_reserved_sell", { code, targetPct });
+}
+
+export function cancelReservedSell(code: string): Promise<OrderResult> {
+  return invoke<OrderResult>("cancel_reserved_sell", { code });
+}
+
+export function getReservations(): Promise<Reservation[]> {
+  return invoke<Reservation[]>("get_reservations");
 }
