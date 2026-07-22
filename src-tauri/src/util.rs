@@ -44,6 +44,10 @@ pub const BUY_PREMIUM_PCT: u64 = 3;
 /// 매수가능수량을 다시 조회하지 않고 시드의 약 95%를 즉시 투입한다.
 pub const CASH_USE_RATIO: f64 = 0.95;
 
+/// 강제 손절 기준 수익률(%). 보유 수익률이 이 값 "이하"로 떨어지면 무조건 전량 매도한다.
+/// 사용자 설정으로 바꿀 수 없는 기계적 하한이라 Settings가 아니라 상수로 고정한다.
+pub const STOP_LOSS_PCT: f64 = -0.6;
+
 /// 매수 지정가: 기준 가격 +3%, 호가단위에 맞춰 내림 정렬
 pub fn buy_limit_price(base: u64, etf: bool) -> u64 {
     let raw = base + base * BUY_PREMIUM_PCT / 100;
@@ -70,6 +74,24 @@ pub fn sell_target_price(avg_price: f64, pct: f64, etf: bool) -> u64 {
     let tick = tick_size(raw as u64, etf);
     let ticks = (raw / tick as f64).ceil() as u64;
     ticks * tick
+}
+
+/// 실시간 체결가 기준 파생 수익률(%). 화면 표시(livePnlRate)와 같은 식이라
+/// 사용자가 보는 수익률과 손절 판정 기준이 어긋나지 않는다. (수수료 미반영)
+pub fn pnl_rate(avg_price: f64, price: f64) -> f64 {
+    if avg_price <= 0.0 {
+        return 0.0;
+    }
+    (price / avg_price - 1.0) * 100.0
+}
+
+/// 강제 손절 발동 여부: 현재 수익률이 STOP_LOSS_PCT 이하인가.
+/// 평단/체결가가 유효하지 않으면(주문 정보 부재) 발동하지 않는다.
+pub fn hits_stop_loss(avg_price: f64, price: f64) -> bool {
+    if avg_price <= 0.0 || price <= 0.0 {
+        return false;
+    }
+    pnl_rate(avg_price, price) <= STOP_LOSS_PCT
 }
 
 #[cfg(test)]
@@ -131,6 +153,20 @@ mod tests {
         assert_eq!(sell_target_price(20_000.0, 0.2, false), 20_050);
         // 평단 0 방어
         assert_eq!(sell_target_price(0.0, 0.3, true), 0);
+    }
+
+    #[test]
+    fn stop_loss_triggers_at_or_below_threshold() {
+        // 평단 10,000원 기준 -0.6% = 9,940원. 딱 -0.6%면 발동한다.
+        assert!(hits_stop_loss(10_000.0, 9_940.0)); // 정확히 -0.6%
+        assert!(hits_stop_loss(10_000.0, 9_900.0)); // -1.0%
+        // -0.6%보다 덜 빠졌으면(-0.59%) 발동하지 않는다
+        assert!(!hits_stop_loss(10_000.0, 9_941.0)); // -0.59%
+        assert!(!hits_stop_loss(10_000.0, 10_000.0)); // 0%
+        assert!(!hits_stop_loss(10_000.0, 10_500.0)); // +5%
+        // 평단/가격 부재(주문 정보 없음)는 발동 금지
+        assert!(!hits_stop_loss(0.0, 9_000.0));
+        assert!(!hits_stop_loss(10_000.0, 0.0));
     }
 
     #[test]

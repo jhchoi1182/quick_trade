@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
@@ -16,6 +16,11 @@ use crate::types::{
     TradeMode,
 };
 use crate::util::{buy_limit_price, max_buy_qty, now_kst_fake_epoch, sell_target_price};
+
+/// 강제 손절 발동 후 같은 종목의 재발동을 막는 잠금 시간.
+/// 정상 체결이면 그 전에 잔고 갱신(700ms)이 포지션을 지워 재발동이 없고,
+/// 주문이 거부되면 이 간격만큼 쉬었다가 재시도해 초당 주문 폭주를 막는다.
+const STOP_LOSS_RELOCK: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// 캐시가 이 초수보다 낡으면 주문 전에 REST 스냅샷으로 폴백
 const QUOTE_FRESH_SECS: i64 = 10;
@@ -58,6 +63,10 @@ pub struct Engine {
     /// 걸어둔 예약 매도 (code -> Reservation). 코드당 최대 1건.
     /// 엔진 메모리에만 존재 — 엔진 재시작 시 유실(거래소 실주문은 남음)
     reservations: RwLock<HashMap<String, Reservation>>,
+    /// 강제 손절 재발동 잠금 (code -> 이 시각 전에는 재발동 금지).
+    /// 발동 시 STOP_LOSS_RELOCK만큼 잠가 연속 틱의 중복 매도를 막는다.
+    /// 포지션 청산/재매수 시 즉시 해제된다.
+    stop_loss_lock: Mutex<HashMap<String, std::time::Instant>>,
     candle_cache: CandleCache,
     last_error: Mutex<String>,
     /// 지연 잔고 갱신이 이미 예약되어 있으면 true — 연속 체결통보를 1회 갱신으로 합류
@@ -98,6 +107,7 @@ pub async fn start(app: AppHandle, settings: Settings) -> AppResult<EngineHandle
         quotes: RwLock::new(HashMap::new()),
         account: RwLock::new(AccountSnapshot { cash: 0, positions: Vec::new() }),
         reservations: RwLock::new(HashMap::new()),
+        stop_loss_lock: Mutex::new(HashMap::new()),
         candle_cache: CandleCache::new(),
         last_error: Mutex::new(String::new()),
         refresh_pending: AtomicBool::new(false),
@@ -147,6 +157,13 @@ async fn consume_feed(engine: Arc<Engine>, mut rx: mpsc::Receiver<FeedEvent>) {
                 }
                 engine.quotes.write().unwrap().insert(q.code.clone(), q.clone());
                 engine.emit("quote", &q);
+                // 실시간 체결가 기준 수익률이 강제 손절선(-0.6%) 이하면 전량 시장가 매도.
+                // 등록까지 원자적이라 연속 틱이 중복 매도를 내지 않는다.
+                if engine.arm_stop_loss_if_breached(&q.code, q.price) {
+                    let engine = Arc::clone(&engine);
+                    let code = q.code.clone();
+                    tokio::spawn(async move { engine.force_stop_loss(&code).await });
+                }
             }
             FeedEvent::Book { code, ask1, bid1, ts } => {
                 let merged = {
@@ -213,6 +230,18 @@ impl Engine {
                 *self.account.write().unwrap() = snap.clone();
                 self.account_refreshed_gen.fetch_max(gen, Ordering::SeqCst);
                 self.last_error.lock().unwrap().clear();
+                // 실제로 보유가 사라진 종목은 손절 잠금을 해제해 재무장한다
+                // (다시 매수해 손절선에 닿으면 또 발동해야 한다)
+                let held: HashSet<&str> = snap
+                    .positions
+                    .iter()
+                    .filter(|p| p.qty > 0)
+                    .map(|p| p.code.as_str())
+                    .collect();
+                self.stop_loss_lock
+                    .lock()
+                    .unwrap()
+                    .retain(|code, _| held.contains(code.as_str()));
                 self.emit("account", &snap);
             }
             Err(e) => {
@@ -472,6 +501,42 @@ impl Engine {
             .unwrap_or((0, 0.0))
     }
 
+    /// 현재 체결가 기준 수익률이 강제 손절선 이하이고 재발동 잠금이 풀려 있으면
+    /// 잠금을 걸고 true를 돌려준다. 판정과 잠금을 한 번에 처리해 연속 틱의 중복 매도를 막는다.
+    fn arm_stop_loss_if_breached(&self, code: &str, price: f64) -> bool {
+        let (qty, avg) = self.cached_position(code);
+        if qty == 0 || !crate::util::hits_stop_loss(avg, price) {
+            return false;
+        }
+        let now = std::time::Instant::now();
+        let mut lock = self.stop_loss_lock.lock().unwrap();
+        if lock.get(code).is_some_and(|until| now < *until) {
+            return false; // 발동 직후 or 실패 후 재시도 대기 중
+        }
+        lock.insert(code.to_string(), now + STOP_LOSS_RELOCK);
+        true
+    }
+
+    /// 강제 손절 실행: 보유 전량 시장가 매도(예약 매도가 걸려 있으면 sell_all이 먼저 취소).
+    /// 성공하면 잠금이 풀리기 전에 잔고 갱신이 포지션을 지우고, 실패하면 잠금이 만료된 뒤 재시도된다.
+    async fn force_stop_loss(&self, code: &str) {
+        let (qty, avg) = self.cached_position(code);
+        let price = self.quotes.read().unwrap().get(code).map(|q| q.price).unwrap_or(0.0);
+        let rate = crate::util::pnl_rate(avg, price);
+        tracing::warn!("강제 손절 발동: {code} 수익률 {rate:.2}% (평단 {avg}, 현재가 {price}, {qty}주) — 전량 매도");
+        self.emit(
+            "engine-error",
+            &format!("🛑 강제 손절: {code} 수익률 {rate:.2}% (손절선 {}%) → 전량 매도", crate::util::STOP_LOSS_PCT),
+        );
+
+        let result = self.sell_all(code).await;
+        if !result.ok {
+            tracing::error!("강제 손절 매도 실패({code}): {}", result.message);
+            self.emit("engine-error", &format!("강제 손절 매도 실패({code}): {}", result.message));
+            // 잠금은 유지 — STOP_LOSS_RELOCK 뒤 다음 틱에 재시도된다(초당 주문 폭주 방지)
+        }
+    }
+
     /// 예약 매도 설정: 평단 × (1 + pct/100) 이상 첫 호가에 보유 전량 지정가 매도를 걸어둔다.
     /// 기존 예약이 있으면 취소 후 교체한다.
     pub async fn place_reserved_sell(&self, code: &str, target_pct: f64) -> OrderResult {
@@ -599,6 +664,9 @@ impl Engine {
 
     /// 매수 성공 시 걸려 있던 예약을 취소한다 (평단이 바뀌어 목표가가 무의미해짐).
     async fn after_buy_success(&self, code: &str) {
+        // 새로 산 포지션은 평단이 바뀌었으니 손절 잠금을 풀어 다시 감시한다.
+        // (직전 손절 매도 체결이 잔고에 반영되기 전 재매수하는 경합도 이걸로 커버)
+        self.stop_loss_lock.lock().unwrap().remove(code);
         if let Some(r) = self.cancel_reservation_internal(code).await {
             let reason = Some("추가 매수로 예약 매도가 취소되었습니다. 다시 설정하세요.".to_string());
             self.emit("reservation", &reservation_info(code, &r, "cancelled", reason));
@@ -666,6 +734,7 @@ mod tests {
             quotes: RwLock::new(HashMap::new()),
             account: RwLock::new(AccountSnapshot { cash: 0, positions: Vec::new() }),
             reservations: RwLock::new(HashMap::new()),
+            stop_loss_lock: Mutex::new(HashMap::new()),
             candle_cache: CandleCache::new(),
             last_error: Mutex::new(String::new()),
             refresh_pending: AtomicBool::new(false),
@@ -1095,5 +1164,90 @@ mod tests {
         let resv = engine.place_reserved_sell("0193T0", 0.3).await;
         assert!(!resv.ok);
         assert!(resv.message.contains("보유 수량 없음"), "{}", resv.message);
+    }
+
+    /// 지정 체결가로 캐시 시세를 갈아끼운다 (손절 판정 경로 테스트용)
+    fn set_quote_price(engine: &Engine, code: &str, price: f64) {
+        engine.quotes.write().unwrap().insert(
+            code.into(),
+            Quote {
+                code: code.into(),
+                price,
+                change_rate: 0.0,
+                ask1: price,
+                bid1: price,
+                volume: 0.0,
+                ts: now_kst_fake_epoch(),
+            },
+        );
+    }
+
+    /// 손절선(-0.6%) 이하로 떨어지면 한 번만 발동해 전량 매도한다
+    #[tokio::test]
+    async fn stop_loss_arms_once_and_sells_entire_position() {
+        let settings = Settings::default();
+        let engine = test_engine(Arc::new(MockBroker::new(&settings)), settings);
+        engine.refresh_account().await;
+        let buy = engine.buy_max("0193T0").await;
+        assert!(buy.ok, "{}", buy.message);
+        engine.refresh_account().await; // 보유 캐시 적재
+        let (qty, avg) = engine.cached_position("0193T0");
+        assert!(qty > 0 && avg > 0.0);
+
+        // 평단 대비 -1% 체결가 → 손절선(-0.6%) 이하
+        let low = avg * 0.99;
+        set_quote_price(&engine, "0193T0", low);
+
+        // 첫 틱만 발동, 연속 틱은 중복 매도 금지
+        assert!(engine.arm_stop_loss_if_breached("0193T0", low));
+        assert!(!engine.arm_stop_loss_if_breached("0193T0", low), "이미 발동했으면 재발동 금지");
+
+        engine.force_stop_loss("0193T0").await;
+        engine.refresh_account().await;
+        assert_eq!(engine.cached_position("0193T0").0, 0, "손절로 전량 매도돼야 한다");
+        // 포지션이 사라졌으니 손절 잠금도 풀려야 한다 (재무장)
+        assert!(!engine.stop_loss_lock.lock().unwrap().contains_key("0193T0"));
+    }
+
+    /// 손절선 위(-0.6% 초과)에서는 발동하지 않는다
+    #[tokio::test]
+    async fn stop_loss_does_not_arm_above_threshold() {
+        let settings = Settings::default();
+        let engine = test_engine(Arc::new(MockBroker::new(&settings)), settings);
+        engine.refresh_account().await;
+        assert!(engine.buy_max("0193T0").await.ok);
+        engine.refresh_account().await;
+        let (_, avg) = engine.cached_position("0193T0");
+        assert!(!engine.arm_stop_loss_if_breached("0193T0", avg), "0%에서는 발동 금지");
+        assert!(!engine.arm_stop_loss_if_breached("0193T0", avg * 0.995), "-0.5%는 발동 금지");
+    }
+
+    /// 보유가 없으면 손절은 무시된다 (평단 부재)
+    #[tokio::test]
+    async fn stop_loss_ignored_without_holding() {
+        let settings = Settings::default();
+        let engine = test_engine(Arc::new(MockBroker::new(&settings)), settings);
+        engine.refresh_account().await;
+        assert!(!engine.arm_stop_loss_if_breached("0193T0", 1.0));
+    }
+
+    /// 재매수하면 평단이 바뀌므로 손절 발동 락이 풀려 다시 감시한다
+    #[tokio::test]
+    async fn stop_loss_rearms_after_rebuy() {
+        let settings = Settings::default();
+        let engine = test_engine(Arc::new(MockBroker::new(&settings)), settings);
+        engine.refresh_account().await;
+        // 직전 손절이 발동해 잠금이 걸린 상태를 흉내
+        engine
+            .stop_loss_lock
+            .lock()
+            .unwrap()
+            .insert("0193T0".into(), std::time::Instant::now() + STOP_LOSS_RELOCK);
+
+        assert!(engine.buy_max("0193T0").await.ok);
+        assert!(
+            !engine.stop_loss_lock.lock().unwrap().contains_key("0193T0"),
+            "재매수 시 손절 잠금이 풀려야 한다"
+        );
     }
 }
