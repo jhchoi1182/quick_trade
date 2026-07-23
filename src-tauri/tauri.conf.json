@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "QuickTrade",
+  "productName": "EasyScalping",
   "version": "0.1.0",
-  "identifier": "dev.jhchoi.quicktrade",
+  "identifier": "dev.jhchoi.easyscalping",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:41730",
@@ -14,7 +14,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "QuickTrade",
+        "title": "EasyScalping",
         "width": 300,
         "height": 460,
         "minWidth": 260,

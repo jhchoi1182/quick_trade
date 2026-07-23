@@ -24,6 +24,9 @@ pub fn run() {
         .with_max_level(tracing::Level::INFO)
         .init();
 
+    // config::load() 전에 구 폴더명(quick-trade)을 새 폴더명으로 이관한다.
+    config::migrate_legacy_dir();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             // 이중 실행 = 이중 주문 위험 → 기존 창 포커스만

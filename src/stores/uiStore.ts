@@ -36,6 +36,18 @@ interface UiState {
 
 let toastSeq = 0;
 
+const PERSIST_KEY = "easy-scalping-ui";
+const LEGACY_PERSIST_KEY = "quick-trade-ui";
+
+// 구 quick-trade-ui 영속 데이터를 새 키로 1회 이관한다(차트/매매 종목·창 설정 보존).
+if (typeof localStorage !== "undefined") {
+  const legacy = localStorage.getItem(LEGACY_PERSIST_KEY);
+  if (legacy !== null && localStorage.getItem(PERSIST_KEY) === null) {
+    localStorage.setItem(PERSIST_KEY, legacy);
+    localStorage.removeItem(LEGACY_PERSIST_KEY);
+  }
+}
+
 export const useUiStore = create<UiState>()(
   persist(
     (set) => ({
@@ -68,7 +80,7 @@ export const useUiStore = create<UiState>()(
       removeToast: (id) => set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
     }),
     {
-      name: "quick-trade-ui",
+      name: PERSIST_KEY,
       partialize: (s) => ({
         chartCode: s.chartCode,
         tradeCode: s.tradeCode,

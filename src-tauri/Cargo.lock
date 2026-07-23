@@ -926,6 +926,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
+name = "easy-scalping"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "async-trait",
+ "base64 0.22.1",
+ "cbc",
+ "chrono",
+ "dirs",
+ "futures-util",
+ "image",
+ "rand 0.8.7",
+ "reqwest 0.12.28",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-single-instance",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "embed-resource"
 version = "3.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2755,33 +2782,6 @@ name = "pxfm"
 version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
-
-[[package]]
-name = "quick-trade"
-version = "0.1.0"
-dependencies = [
- "aes",
- "async-trait",
- "base64 0.22.1",
- "cbc",
- "chrono",
- "dirs",
- "futures-util",
- "image",
- "rand 0.8.7",
- "reqwest 0.12.28",
- "rusqlite",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-single-instance",
- "thiserror 2.0.18",
- "tokio",
- "tokio-tungstenite",
- "tracing",
- "tracing-subscriber",
-]
 
 [[package]]
 name = "quick-xml"

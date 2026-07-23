@@ -1,4 +1,4 @@
-# QuickTrade
+# EasyScalping
 
 단일종목 ETF(레버리지/곱버스) 스캘핑용 원클릭 트레이딩 데스크톱 앱.
 본주 차트를 보다가 **클릭 한 번으로 최대 수량 매수 / 보유 전량 매도**를 실행한다.
@@ -45,7 +45,7 @@ cd src-tauri && cargo test    # Rust
 2. 앱 내 ⚙ 설정에서 KIS 정보, **HTS ID**, OpenAI API 키를 입력하고 실전 연결을 확인
 3. 저장 후 상단에서 수동·자동·섀도 제어 모드 선택
 
-설정 파일 위치: Windows `%APPDATA%\quick-trade\config.json`, macOS `~/Library/Application Support/quick-trade/`
+설정 파일 위치: Windows `%APPDATA%\easy-scalping\config.json`, macOS `~/Library/Application Support/easy-scalping/`
 (사용 편의를 위해 평문 저장 — 공용 PC에서는 사용하지 말 것)
 
 ## 기본 종목 (설정에서 자유롭게 수정)

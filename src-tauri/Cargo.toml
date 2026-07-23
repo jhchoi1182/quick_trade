@@ -1,11 +1,11 @@
 [package]
-name = "quick-trade"
+name = "easy-scalping"
 version = "0.1.0"
 description = "단일종목 ETF 스캘핑용 원클릭 트레이딩"
 edition = "2021"
 
 [lib]
-name = "quick_trade_lib"
+name = "easy_scalping_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

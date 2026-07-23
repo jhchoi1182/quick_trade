@@ -7,7 +7,28 @@ use crate::types::{AutoSymbols, Settings};
 pub fn config_dir() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("quick-trade")
+        .join("easy-scalping")
+}
+
+/// 구 quick-trade 폴더를 easy-scalping으로 1회 이관한다.
+/// 실전 KIS 키(config.json)·토큰(token.json)·거래 장부(trading.db)가 그대로 넘어간다.
+/// 새 폴더가 이미 있으면(=이관 완료 또는 신규 설치) 아무것도 하지 않는다.
+pub fn migrate_legacy_dir() {
+    let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
+    let legacy = base.join("quick-trade");
+    let current = config_dir();
+    if legacy.exists() && !current.exists() {
+        match fs::rename(&legacy, &current) {
+            Ok(()) => tracing::info!(
+                "설정 폴더 이관: {} → {}",
+                legacy.display(),
+                current.display()
+            ),
+            Err(error) => {
+                tracing::warn!("설정 폴더 이관 실패(기존 경로 유지): {error}")
+            }
+        }
+    }
 }
 
 pub fn config_path() -> PathBuf {

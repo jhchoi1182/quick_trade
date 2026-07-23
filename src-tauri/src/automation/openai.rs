@@ -162,7 +162,7 @@ impl OpenAiClient {
         }
         let http = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
-            .user_agent("quick-trade/0.1")
+            .user_agent("easy-scalping/0.1")
             .build()?;
         Ok(Self { http, api_key })
     }
