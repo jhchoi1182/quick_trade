@@ -23,7 +23,7 @@ cd src-tauri && cargo test buy_limit                # 이름으로 단일 테스
 
 - 개발 서버 포트 **41730(dev) / 41731(HMR)** 은 회사 프로젝트와 안 겹치게 예약한 값 — **바꾸지 말 것** (`vite.config.ts`, `tauri.conf.json`).
 - 앱은 `tauri-plugin-single-instance`로 이중 실행이 차단된다 (이중 주문 방지). 두 번째 실행은 기존 창만 포커스.
-- Windows에서 `cargo test`가 되는 건 `build.rs`가 `tests.manifest`(comctl32 v6)를 테스트 exe에 임베드해 주기 때문이다. 이 두 파일을 지우거나 링크 인자를 건드리면 테스트가 STATUS_ENTRYPOINT_NOT_FOUND(0xc0000139)로 시작조차 못 한다.
+- Windows에서 `cargo test`가 되는 건 `build.rs`가 `tests.manifest`(comctl32 v6)를 테스트 exe에 임베드해 주기 때문이다. Cargo 1.97+가 `cargo:rustc-link-arg-tests`를 인정하려면 `tests/manifest_smoke.rs` 통합 테스트 타깃도 필요하다. 이 세 파일을 지우거나 링크 인자를 건드리면 빌드가 실패하거나 테스트가 STATUS_ENTRYPOINT_NOT_FOUND(0xc0000139)로 시작조차 못 한다.
 
 ## 아키텍처
 
