@@ -1,5 +1,18 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { AccountSnapshot, Candle, OrderResult, Reservation, Settings } from "../types";
+import type {
+  AccountSnapshot,
+  AutomationSnapshot,
+  Candle,
+  ControlMode,
+  CursorPage,
+  HistoryCursor,
+  LlmDecisionRecord,
+  OrderResult,
+  Reservation,
+  Settings,
+  TradeRecord,
+  TradeRecordKind,
+} from "../types";
 
 export function getSettings(): Promise<Settings> {
   return invoke<Settings>("get_settings");
@@ -35,4 +48,40 @@ export function cancelReservedSell(code: string): Promise<OrderResult> {
 
 export function getReservations(): Promise<Reservation[]> {
   return invoke<Reservation[]>("get_reservations");
+}
+
+export function getAutomationStatus(): Promise<AutomationSnapshot> {
+  return invoke<AutomationSnapshot>("get_automation_status");
+}
+
+export function setControlMode(mode: ControlMode): Promise<AutomationSnapshot> {
+  return invoke<AutomationSnapshot>("set_control_mode", { mode });
+}
+
+function normalizePage<T>(value: CursorPage<T> | T[]): CursorPage<T> {
+  return Array.isArray(value) ? { items: value, nextCursor: null } : value;
+}
+
+export async function listTradeRecords(
+  kind: TradeRecordKind,
+  cursor: HistoryCursor = null,
+  limit = 40,
+): Promise<CursorPage<TradeRecord>> {
+  const page = await invoke<CursorPage<TradeRecord> | TradeRecord[]>("list_trade_records", {
+    kind,
+    cursor,
+    limit,
+  });
+  return normalizePage(page);
+}
+
+export async function listLlmDecisions(
+  cursor: HistoryCursor = null,
+  limit = 40,
+): Promise<CursorPage<LlmDecisionRecord>> {
+  const page = await invoke<CursorPage<LlmDecisionRecord> | LlmDecisionRecord[]>("list_llm_decisions", {
+    cursor,
+    limit,
+  });
+  return normalizePage(page);
 }

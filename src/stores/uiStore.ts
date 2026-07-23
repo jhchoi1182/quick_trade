@@ -11,6 +11,9 @@ interface UiState {
   chartCode: string;
   tradeCode: string;
   settingsOpen: boolean;
+  historyOpen: boolean;
+  /** 장부 변경 이벤트를 기록 모달의 지연 재조회 신호로 변환한다. */
+  historyRevision: number;
   chartCollapsed: boolean;
   /** 접기 전 창 높이(logical px) — 펼칠 때 복원 */
   expandedHeight: number;
@@ -21,6 +24,8 @@ interface UiState {
   setChartCode: (code: string) => void;
   setTradeCode: (code: string) => void;
   setSettingsOpen: (open: boolean) => void;
+  setHistoryOpen: (open: boolean) => void;
+  bumpHistoryRevision: () => void;
   setChartCollapsed: (collapsed: boolean) => void;
   setExpandedHeight: (h: number) => void;
   setAlwaysOnTop: (on: boolean) => void;
@@ -37,6 +42,8 @@ export const useUiStore = create<UiState>()(
       chartCode: "",
       tradeCode: "",
       settingsOpen: false,
+      historyOpen: false,
+      historyRevision: 0,
       chartCollapsed: false,
       expandedHeight: 460,
       alwaysOnTop: false,
@@ -45,6 +52,8 @@ export const useUiStore = create<UiState>()(
       setChartCode: (code) => set({ chartCode: code }),
       setTradeCode: (code) => set({ tradeCode: code }),
       setSettingsOpen: (open) => set({ settingsOpen: open }),
+      setHistoryOpen: (open) => set({ historyOpen: open }),
+      bumpHistoryRevision: () => set((s) => ({ historyRevision: s.historyRevision + 1 })),
       setChartCollapsed: (collapsed) => set({ chartCollapsed: collapsed }),
       setExpandedHeight: (h) => set({ expandedHeight: h }),
       setAlwaysOnTop: (on) => set({ alwaysOnTop: on }),

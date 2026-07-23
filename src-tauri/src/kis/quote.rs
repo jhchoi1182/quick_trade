@@ -2,16 +2,13 @@ use chrono::{Datelike, Duration as ChronoDuration, NaiveTime, Weekday};
 use serde_json::Value;
 
 use crate::error::AppResult;
-use crate::kis::rest::{num_f64, KisRest};
-use crate::types::{Candle, Quote, TradeMode};
+use crate::kis::rest::{num_f64, num_u64, KisRest};
+use crate::types::{Candle, Quote};
 use crate::util::{kst_str_to_fake_epoch, now_kst, now_kst_fake_epoch};
 
-/// 시장 구분: 실전은 KRX+NXT 통합(UN), 모의는 KRX(J)만 지원
-fn market_div(rest: &KisRest) -> &'static str {
-    match rest.mode {
-        TradeMode::Real => "UN",
-        _ => "J",
-    }
+/// 실전 차트는 KRX+NXT 통합을 우선하고, 호출부에서 KRX로 폴백한다.
+fn market_div(_rest: &KisRest) -> &'static str {
+    "UN"
 }
 
 const PATH_PRICE: &str = "/uapi/domestic-stock/v1/quotations/inquire-price";
@@ -55,6 +52,8 @@ pub async fn snapshot(rest: &KisRest, code: &str) -> AppResult<Quote> {
     let o1 = &v["output1"];
     let ask1 = num_f64(&o1["askp1"]);
     let bid1 = num_f64(&o1["bidp1"]);
+    let ask1_qty = num_u64(&o1["askp_rsqn1"]);
+    let bid1_qty = num_u64(&o1["bidp_rsqn1"]);
 
     // price는 주문 경로에서 ask1이 없을 때의 폴백으로만 쓰인다.
     // UI 시세는 웹소켓이 소스이므로 여기서 ask1로 근사해도 표시에 영향 없음.
@@ -67,14 +66,23 @@ pub async fn snapshot(rest: &KisRest, code: &str) -> AppResult<Quote> {
         (num_f64(&o["stck_prpr"]), num_f64(&o["prdy_ctrt"]))
     };
 
+    let now = now_kst_fake_epoch();
     Ok(Quote {
         code: code.to_string(),
         price,
         change_rate,
         ask1,
         bid1,
+        ask1_qty,
+        bid1_qty,
         volume: 0.0,
-        ts: now_kst_fake_epoch(),
+        trade_sequence: 0,
+        received_at_micros: crate::util::monotonic_now()
+            .as_micros()
+            .try_into()
+            .unwrap_or(u64::MAX),
+        trade_ts: now,
+        book_ts: now,
     })
 }
 
@@ -96,11 +104,20 @@ fn minus_one_minute(hhmmss: &str, session_open: NaiveTime) -> Option<String> {
     if t <= session_open {
         return None;
     }
-    Some((t - ChronoDuration::minutes(1)).format("%H%M%S").to_string())
+    Some(
+        (t - ChronoDuration::minutes(1))
+            .format("%H%M%S")
+            .to_string(),
+    )
 }
 
 /// 당일 1분봉 페이징 (커서 시각에서 과거 방향으로 30건씩)
-async fn today_minutes(rest: &KisRest, code: &str, div: &str, out: &mut Vec<Candle>) -> AppResult<()> {
+async fn today_minutes(
+    rest: &KisRest,
+    code: &str,
+    div: &str,
+    out: &mut Vec<Candle>,
+) -> AppResult<()> {
     let now = now_kst();
     let (open, close) = session_bounds(div);
     if now.time() < open || matches!(now.weekday(), Weekday::Sat | Weekday::Sun) {
@@ -133,7 +150,10 @@ async fn today_minutes(rest: &KisRest, code: &str, div: &str, out: &mut Vec<Cand
                 }
             }
         }
-        match oldest_hour.as_deref().and_then(|h| minus_one_minute(h, open)) {
+        match oldest_hour
+            .as_deref()
+            .and_then(|h| minus_one_minute(h, open))
+        {
             Some(next) => cursor = next,
             None => break,
         }
@@ -185,7 +205,10 @@ async fn past_day_minutes(
                 }
             }
         }
-        match oldest_hour.as_deref().and_then(|h| minus_one_minute(h, open)) {
+        match oldest_hour
+            .as_deref()
+            .and_then(|h| minus_one_minute(h, open))
+        {
             Some(next) => cursor = next,
             None => break,
         }

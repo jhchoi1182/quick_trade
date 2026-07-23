@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import type { Settings, SymbolConfig, ThemeName, TradeMode } from "../types";
+import type { Settings, SymbolConfig, ThemeName } from "../types";
 import { useSettingsStore } from "../stores/settingsStore";
 import { useUiStore } from "../stores/uiStore";
 
@@ -70,11 +70,15 @@ export function SettingsModal() {
   const patch = (p: Partial<Settings>) => setDraft((d) => (d ? { ...d, ...p } : d));
 
   const validate = (): string | null => {
-    if (draft.mode !== "demo") {
-      if (!draft.appKey || !draft.appSecret) return "실전/모의 모드에는 APP KEY와 SECRET이 필요합니다";
-      if (!/^\d{8}$/.test(draft.cano)) return "계좌번호 앞 8자리를 숫자로 입력하세요";
-      if (!/^\d{2}$/.test(draft.acntPrdtCd)) return "계좌 상품코드 2자리를 입력하세요";
+    if (!draft.appKey || !draft.appSecret) return "실전 연결에는 APP KEY와 SECRET이 필요합니다";
+    if (!/^\d{8}$/.test(draft.cano)) return "계좌번호 앞 8자리를 숫자로 입력하세요";
+    if (!/^\d{2}$/.test(draft.acntPrdtCd)) return "계좌 상품코드 2자리를 입력하세요";
+    if (!draft.realTradingConfirmed) return "실전 주문 전송 확인에 동의해야 저장할 수 있습니다";
+    const autoCodes = Object.values(draft.autoSymbols);
+    for (const code of autoCodes) {
+      if (!/^[A-Z0-9]{6}$/.test(code)) return `자동매매 종목코드는 6자리 영숫자여야 합니다: "${code}"`;
     }
+    if (new Set(autoCodes).size !== autoCodes.length) return "자동매매의 본주·레버리지·곱버스 코드는 달라야 합니다";
     const codes = [...draft.tradeSymbols, ...draft.chartSymbols];
     if (draft.tradeSymbols.length === 0) return "매매 종목이 최소 1개 필요합니다";
     if (draft.chartSymbols.length === 0) return "차트 종목이 최소 1개 필요합니다";
@@ -109,22 +113,6 @@ export function SettingsModal() {
       <div className="modal">
         <div className="modal-title">설정</div>
         <div className="modal-body">
-          <div className="form-section">
-            <div className="form-section-title">모드</div>
-            <div className="mode-toggle">
-              {(["demo", "paper", "real"] as TradeMode[]).map((m) => (
-                <button
-                  key={m}
-                  className={draft.mode === m ? "active" : ""}
-                  onClick={() => patch({ mode: m })}
-                >
-                  {m === "demo" ? "데모" : m === "paper" ? "모의투자" : "실전"}
-                </button>
-              ))}
-            </div>
-            {draft.mode === "demo" && <div className="form-hint">데모: API 키 없이 가상 시세/체결로 동작</div>}
-          </div>
-
           <div className="form-section">
             <div className="form-section-title">테마</div>
             <div className="mode-toggle">
@@ -178,6 +166,38 @@ export function SettingsModal() {
               value={draft.htsId}
               onChange={(e) => patch({ htsId: e.target.value.trim() })}
             />
+            <label className="real-confirm-row">
+              <input
+                type="checkbox"
+                checked={draft.realTradingConfirmed}
+                onChange={(e) => patch({ realTradingConfirmed: e.target.checked })}
+              />
+              <span>이 계좌로 실전 주문이 즉시 전송됨을 확인합니다</span>
+            </label>
+          </div>
+
+          <div className="form-section">
+            <div className="form-section-title">OpenAI 자동 매매</div>
+            <input
+              placeholder="OPENAI API KEY"
+              type="password"
+              value={draft.openaiApiKey}
+              onChange={(e) => patch({ openaiApiKey: e.target.value.trim() })}
+            />
+            <div className="form-hint">자동·섀도 전환 시 필요 · 모델 gpt-5.6-sol 고정</div>
+            <label className="auto-symbol-row">
+              <span>본주</span>
+              <input value={draft.autoSymbols.underlying} readOnly aria-readonly="true" />
+            </label>
+            <label className="auto-symbol-row">
+              <span>레버리지</span>
+              <input value={draft.autoSymbols.leverage} readOnly aria-readonly="true" />
+            </label>
+            <label className="auto-symbol-row">
+              <span>곱버스</span>
+              <input value={draft.autoSymbols.inverse} readOnly aria-readonly="true" />
+            </label>
+            <div className="form-hint">자동 전략의 세 종목은 고정되어 변경할 수 없습니다.</div>
           </div>
 
           <SymbolListEditor
@@ -209,9 +229,7 @@ export function SettingsModal() {
                 </button>
               ))}
             </div>
-            <div className="form-hint">
-              SOR: KRX/NXT 중 유리한 호가로 자동 라우팅 (모의투자는 KRX 고정)
-            </div>
+            <div className="form-hint">SOR: KRX/NXT 중 유리한 호가로 자동 라우팅</div>
           </div>
         </div>
         <div className="modal-actions">

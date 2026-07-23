@@ -72,8 +72,9 @@ body {
    +/- 부호로 방향이 구분되므로 색 대신 밝은 글자로 통일한다. */
 .app[data-theme="mono"] .holding .up,
 .app[data-theme="mono"] .holding .down { color: var(--text); }
-.app[data-theme="mono"] .mode-real { background: #8a8a8a; color: #161616; }
-.app[data-theme="mono"] .mode-paper { background: #5a5a5a; color: #ddd; }
+.app[data-theme="mono"] .mode-manual { background: #6d6d6d; color: #eee; }
+.app[data-theme="mono"] .mode-auto { background: #bdbdbd; color: #161616; }
+.app[data-theme="mono"] .mode-shadow { background: #4d4d4d; color: #ddd; }
 .app[data-theme="mono"] .toast-success { border-color: #bdbdbd; color: #bdbdbd; }
 .app[data-theme="mono"] .toast-info { border-color: #9e9e9e; color: #9e9e9e; }
 
@@ -121,6 +122,35 @@ body {
   background: rgba(255, 255, 255, 0.06);
 }
 .win-close:hover { background: var(--up); color: #fff; }
+
+/* ── 수동/자동/섀도 제어 모드 ─────────── */
+.control-mode-bar {
+  display: flex;
+  gap: 3px;
+  padding: 3px 6px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+  flex-shrink: 0;
+}
+
+.control-mode-bar button {
+  flex: 1;
+  height: 22px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 10px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.control-mode-bar button:hover:not(:disabled) { color: var(--text); }
+.control-mode-bar button:disabled { cursor: default; opacity: 0.55; }
+.control-mode-bar button.active { color: #fff; }
+.control-mode-bar button.active.mode-manual { background: #3d4455; }
+.control-mode-bar button.active.mode-auto { background: var(--up); border-color: var(--up); }
+.control-mode-bar button.active.mode-shadow { background: #7655c9; border-color: #7655c9; }
 
 /* ── 차트 ─────────────────────────────── */
 .chart-wrap {
@@ -248,6 +278,114 @@ body {
 .btn-sell:hover { background: #5b96f7; }
 .trade-buttons button:disabled { opacity: 0.5; cursor: default; }
 .trade-buttons button:active { transform: scale(0.98); }
+
+/* ── 자동 OCO 상태 ───────────────────── */
+.automation-panel {
+  flex-shrink: 0;
+  margin: 4px 7px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.018);
+  font-variant-numeric: tabular-nums;
+}
+
+.automation-panel.shadow { border-color: rgba(118, 85, 201, 0.55); }
+
+.automation-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 22px;
+  padding: 3px 6px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-2);
+  font-size: 9px;
+}
+
+.automation-kind {
+  color: var(--accent);
+  font-weight: 800;
+  letter-spacing: 0.4px;
+}
+
+.automation-panel.shadow .automation-kind { color: #a992e8; }
+.automation-phase { flex: 1; color: var(--text); }
+.automation-next { color: var(--text-dim); white-space: nowrap; }
+
+.automation-scenarios { display: flex; flex-direction: column; }
+
+.automation-scenario {
+  display: flex;
+  align-items: center;
+  min-height: 34px;
+  padding: 4px 6px;
+}
+
+.automation-scenario + .automation-scenario { border-top: 1px solid var(--border); }
+
+.scenario-arrow {
+  width: 18px;
+  font-size: 17px;
+  font-weight: 800;
+  text-align: center;
+}
+
+.up-scenario .scenario-arrow { color: var(--up); }
+.down-scenario .scenario-arrow { color: var(--down); }
+.scenario-main { flex: 1; min-width: 0; }
+
+.scenario-condition {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  color: var(--text);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.scenario-condition b { font-size: 11px; }
+.scenario-target { margin-left: auto; color: var(--accent); font-weight: 700; }
+.scenario-progress { margin-top: 1px; color: var(--text-dim); font-size: 9px; }
+.status-confirming { color: var(--accent); }
+.status-triggered { color: #2ecc71; }
+.status-cancelledByOco,
+.status-expired,
+.status-replaced,
+.status-invalid { color: var(--text-dim); }
+
+.automation-empty {
+  padding: 8px;
+  color: var(--text-dim);
+  font-size: 10px;
+  text-align: center;
+}
+
+.automation-position {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 8px 7px;
+  font-size: 10px;
+}
+
+.automation-position > :first-child { font-weight: 700; }
+.position-timer { margin-left: auto; color: var(--accent); }
+
+.shadow-cash {
+  padding: 2px 6px 4px;
+  color: var(--text-dim);
+  font-size: 9px;
+  text-align: right;
+}
+
+.automation-error {
+  padding: 4px 6px;
+  border-top: 1px solid rgba(229, 72, 77, 0.3);
+  color: var(--up);
+  font-size: 9px;
+  overflow-wrap: anywhere;
+}
 
 /* ── 예약 매도 ─────────────────────────── */
 .reserved-sell {
@@ -388,9 +526,9 @@ body {
   font-weight: 700;
 }
 
-.mode-real { background: var(--up); color: #fff; }
-.mode-paper { background: #b98700; color: #fff; }
-.mode-demo { background: #3d4455; color: var(--text); }
+.mode-manual { background: #3d4455; color: var(--text); }
+.mode-auto { background: var(--up); color: #fff; }
+.mode-shadow { background: #7655c9; color: #fff; }
 
 .opacity-row {
   display: flex;
@@ -485,6 +623,28 @@ body {
 
 .form-hint { font-size: 10px; color: var(--text-dim); }
 
+.real-confirm-row {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--up);
+  font-size: 9px;
+  line-height: 1.35;
+}
+
+.real-confirm-row input { accent-color: var(--up); }
+
+.auto-symbol-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-dim);
+  font-size: 10px;
+}
+
+.auto-symbol-row span { width: 48px; flex-shrink: 0; }
+.auto-symbol-row input { font-variant-numeric: tabular-nums; }
+
 .modal input[type="text"],
 .modal input[type="password"],
 .modal input[type="number"],
@@ -563,3 +723,156 @@ body {
 .btn-cancel { background: #3d4455; color: var(--text); }
 .btn-save { background: var(--accent); color: #131722; }
 .btn-save:disabled { opacity: 0.5; }
+
+/* ── 거래·LLM 판단 기록 (열 때만 번들/데이터 로드) ── */
+.history-backdrop { z-index: 60; }
+
+.history-loading {
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-2);
+  color: var(--text-dim);
+}
+
+.history-modal {
+  width: calc(100% - 14px);
+  height: calc(100% - 14px);
+  max-height: none;
+}
+
+.history-titlebar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 31px;
+  padding: 5px 8px 4px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.history-titlebar button {
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.history-titlebar button:hover { color: var(--text); background: rgba(255, 255, 255, 0.08); }
+
+.history-tabs {
+  display: flex;
+  gap: 3px;
+  padding: 5px 7px;
+  border-bottom: 1px solid var(--border);
+}
+
+.history-tabs button {
+  flex: 1;
+  padding: 4px 0;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.history-tabs button.active { border-color: var(--accent); color: var(--accent); background: var(--bg); }
+
+.history-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 6px;
+}
+
+.history-card {
+  content-visibility: auto;
+  contain-intrinsic-size: 74px;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--bg);
+}
+
+.history-card + .history-card { margin-top: 5px; }
+
+.history-card-head,
+.history-prices,
+.history-result,
+.decision-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.history-card-head time { margin-left: auto; color: var(--text-dim); font-size: 9px; }
+
+.origin-tag {
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: #3d4455;
+  color: var(--text);
+  font-size: 8px;
+  font-weight: 700;
+}
+
+.origin-auto { background: var(--up); color: #fff; }
+.origin-auto_handoff { background: #7b5d20; color: #fff; }
+.origin-shadow { background: #7655c9; color: #fff; }
+.origin-external { background: #555; color: #eee; }
+
+.history-prices,
+.history-result,
+.decision-meta {
+  margin-top: 4px;
+  color: var(--text-dim);
+  font-size: 9px;
+}
+
+.history-result b { font-size: 11px; }
+.history-result time { margin-left: auto; }
+
+.decision-scenarios {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-top: 5px;
+}
+
+.decision-scenarios > div {
+  display: grid;
+  grid-template-columns: 12px 48px 1fr 36px auto;
+  gap: 4px;
+  align-items: center;
+  font-size: 9px;
+}
+
+.decision-status { color: var(--text-dim); text-align: right; }
+.decision-meta span + span { margin-left: 5px; }
+.history-error { color: var(--up); overflow-wrap: anywhere; }
+
+.history-message {
+  padding: 18px 8px;
+  color: var(--text-dim);
+  text-align: center;
+  font-size: 10px;
+}
+
+.history-more {
+  width: 100%;
+  margin-top: 6px;
+  padding: 6px 0;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--bg);
+  color: var(--text-dim);
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.history-more:hover:not(:disabled) { color: var(--text); }
+.history-more:disabled { opacity: 0.5; cursor: default; }

@@ -4,8 +4,14 @@ use tauri::{AppHandle, State};
 
 use crate::config;
 use crate::engine::{self, Engine};
+use crate::ledger::{
+    CursorPage, DecisionQuery, DecisionRecord, LedgerExecutionKind, TradeQuery, TradeRecord,
+};
 use crate::state::AppState;
-use crate::types::{AccountSnapshot, Candle, OrderResult, ReservationInfo, Settings, SymbolConfig};
+use crate::types::{
+    AccountSnapshot, AutoSymbols, AutomationSnapshot, Candle, ControlMode, OrderResult,
+    ReservationInfo, Settings, SymbolConfig,
+};
 
 /// 브로커 연결·구독에 영향을 주는 필드가 바뀐 경우에만 엔진을 재시작한다.
 /// UI 전용 필드(opacity/chartInterval/theme, 라벨)는 저장만 하고 유지 —
@@ -19,8 +25,9 @@ fn needs_engine_restart(old: &Settings, new: &Settings) -> bool {
         || old.cano != new.cano
         || old.acnt_prdt_cd != new.acnt_prdt_cd
         || old.hts_id != new.hts_id
-        || old.mode != new.mode
+        || old.real_trading_confirmed != new.real_trading_confirmed
         || old.exchange != new.exchange
+        || old.auto_symbols != new.auto_symbols
         || codes(&old.trade_symbols) != codes(&new.trade_symbols)
         || codes(&old.chart_symbols) != codes(&new.chart_symbols)
 }
@@ -44,18 +51,26 @@ pub async fn save_settings(
     state: State<'_, AppState>,
     settings: Settings,
 ) -> Result<(), String> {
-    config::save(&settings).map_err(|e| e.to_string())?;
-    let old = {
-        let mut s = state.settings.write().unwrap();
-        std::mem::replace(&mut *s, settings.clone())
-    };
-
+    if settings.auto_symbols != AutoSymbols::default() {
+        return Err("자동매매 종목은 SK하이닉스 000660 / 0193T0 / 0197X0으로 고정됩니다".into());
+    }
+    let old = state.settings.read().unwrap().clone();
     let mut guard = state.engine.lock().await;
     let restart = guard.is_none() || needs_engine_restart(&old, &settings);
     if restart {
+        if let Some(handle) = guard.as_ref() {
+            handle.engine.ensure_broker_restart_safe().await?;
+        }
+    }
+
+    // 안전 조건을 모두 확인한 뒤에만 디스크와 공유 설정을 바꾼다. 거부된 설정이
+    // 다음 시작에 적용되어 기존 계좌 보호를 우회하는 일을 막는다.
+    config::save(&settings).map_err(|e| e.to_string())?;
+    *state.settings.write().unwrap() = settings.clone();
+    if restart {
         // 브로커 관련 변경 → 기존 엔진 중단 후 재시작
         guard.take();
-        match engine::start(app, settings).await {
+        match engine::start(app, settings, Arc::clone(&state.ledger)).await {
             Ok(handle) => {
                 *guard = Some(handle);
                 Ok(())
@@ -121,6 +136,60 @@ pub async fn get_reservations(state: State<'_, AppState>) -> Result<Vec<Reservat
     Ok(engine.get_reservations())
 }
 
+#[tauri::command]
+pub async fn get_automation_status(
+    state: State<'_, AppState>,
+) -> Result<AutomationSnapshot, String> {
+    let engine = engine_of(&state).await?;
+    Ok(engine.automation_snapshot())
+}
+
+#[tauri::command]
+pub async fn set_control_mode(
+    state: State<'_, AppState>,
+    mode: ControlMode,
+) -> Result<AutomationSnapshot, String> {
+    let engine = engine_of(&state).await?;
+    engine.set_control_mode(mode).await
+}
+
+#[tauri::command]
+pub fn list_trade_records(
+    state: State<'_, AppState>,
+    kind: String,
+    cursor: Option<i64>,
+    limit: usize,
+) -> Result<CursorPage<TradeRecord>, String> {
+    let execution_kind = match kind.as_str() {
+        "real" => LedgerExecutionKind::Real,
+        "shadow" => LedgerExecutionKind::Shadow,
+        _ => return Err("기록 종류는 real 또는 shadow여야 합니다".into()),
+    };
+    state
+        .ledger
+        .list_trades(
+            &TradeQuery {
+                execution_kind: Some(execution_kind),
+                ..TradeQuery::default()
+            },
+            cursor,
+            limit,
+        )
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn list_llm_decisions(
+    state: State<'_, AppState>,
+    cursor: Option<i64>,
+    limit: usize,
+) -> Result<CursorPage<DecisionRecord>, String> {
+    state
+        .ledger
+        .list_decisions(&DecisionQuery::default(), cursor, limit)
+        .map_err(|error| error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,8 +221,12 @@ mod tests {
         sym.trade_symbols[0].code = "999999".into();
         assert!(needs_engine_restart(&old, &sym));
 
-        let mut mode = old.clone();
-        mode.mode = crate::types::TradeMode::Paper;
-        assert!(needs_engine_restart(&old, &mode));
+        let mut confirmation = old.clone();
+        confirmation.real_trading_confirmed = true;
+        assert!(needs_engine_restart(&old, &confirmation));
+
+        let mut auto_symbol = old.clone();
+        auto_symbol.auto_symbols.leverage = "999999".into();
+        assert!(needs_engine_restart(&old, &auto_symbol));
     }
 }

@@ -14,12 +14,12 @@ describe("livePnlRate", () => {
     expect(livePnlRate(10_000, 10_000)).toBe(0);
   });
 
-  it("평균단가가 0 이하이면 null (서버값 폴백)", () => {
+  it("평균단가가 0 이하이면 대체값 없이 null이다", () => {
     expect(livePnlRate(0, 10_000)).toBeNull();
     expect(livePnlRate(-1, 10_000)).toBeNull();
   });
 
-  it("현재가가 없거나 0 이하이면 null (서버값 폴백)", () => {
+  it("현재가가 없거나 0 이하이면 대체값 없이 null이다", () => {
     expect(livePnlRate(10_000, undefined)).toBeNull();
     expect(livePnlRate(10_000, 0)).toBeNull();
     expect(livePnlRate(10_000, -1)).toBeNull();

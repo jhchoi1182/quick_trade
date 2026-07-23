@@ -235,7 +235,7 @@ export function MiniChart() {
       if (!q || q === prev) return;
       prev = q;
       if (q.volume <= 0 || !candleSeriesRef.current) return;
-      const tick = { price: q.price, volume: q.volume, ts: q.ts };
+      const tick = { price: q.price, volume: q.volume, ts: q.tradeTs ?? q.ts ?? 0 };
       // 1분봉 캐시도 함께 갱신해 주기 전환 시 재요청 없이 최신 상태를 유지한다
       const cached = oneMinCacheRef.current.get(chartCode);
       if (cached) {

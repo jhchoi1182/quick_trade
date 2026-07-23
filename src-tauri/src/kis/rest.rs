@@ -6,12 +6,15 @@ use tokio::sync::Mutex;
 use crate::config;
 use crate::error::{AppError, AppResult};
 use crate::kis::auth::TokenManager;
-use crate::types::{Settings, TradeMode};
+use crate::types::Settings;
 
 pub const REAL_BASE: &str = "https://openapi.koreainvestment.com:9443";
-pub const PAPER_BASE: &str = "https://openapivts.koreainvestment.com:29443";
 pub const REAL_WS: &str = "ws://ops.koreainvestment.com:21000";
-pub const PAPER_WS: &str = "ws://ops.koreainvestment.com:31000";
+
+pub struct RestPage {
+    pub body: Value,
+    pub tr_cont: String,
+}
 
 /// 균일 간격 리미터. KIS 게이트웨이는 고정 초 단위로 건수를 집계하므로
 /// 슬라이딩 윈도우 방식은 초 경계에서 버스트가 생겨 EGW00201(초당 거래건수 초과)을 유발한다.
@@ -24,7 +27,10 @@ struct RateLimiter {
 
 impl RateLimiter {
     fn new(min_gap: Duration) -> Self {
-        Self { next_slot: Mutex::new(Instant::now()), min_gap }
+        Self {
+            next_slot: Mutex::new(Instant::now()),
+            min_gap,
+        }
     }
 
     async fn acquire(&self) {
@@ -46,7 +52,6 @@ pub fn is_rate_limit_error(msg: &str) -> bool {
 pub struct KisRest {
     http: reqwest::Client,
     pub base: String,
-    pub mode: TradeMode,
     app_key: String,
     app_secret: String,
     pub token: TokenManager,
@@ -55,15 +60,17 @@ pub struct KisRest {
 
 impl KisRest {
     pub fn new(settings: &Settings) -> AppResult<Self> {
-        if settings.app_key.is_empty() || settings.app_secret.is_empty() {
-            return Err(AppError::Config("APP KEY/SECRET이 설정되지 않았습니다".into()));
+        if !settings.real_trading_confirmed {
+            return Err(AppError::Config("실전 연결 확인이 필요합니다".into()));
         }
-        // 실전 한도 20건/s, 모의 2건/s — 안전 마진을 둔 균일 간격
-        let (base, gap_ms) = match settings.mode {
-            TradeMode::Real => (REAL_BASE, 90),
-            TradeMode::Paper => (PAPER_BASE, 550),
-            TradeMode::Demo => return Err(AppError::Config("데모 모드는 KIS 연결을 사용하지 않습니다".into())),
-        };
+        if settings.app_key.is_empty() || settings.app_secret.is_empty() {
+            return Err(AppError::Config(
+                "APP KEY/SECRET이 설정되지 않았습니다".into(),
+            ));
+        }
+        // 실전 한도에 안전 마진을 둔 균일 간격. 기존 유량 방어값을 유지한다.
+        let base = REAL_BASE;
+        let gap_ms = 90;
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(7))
             .build()?;
@@ -77,7 +84,6 @@ impl KisRest {
         Ok(Self {
             http,
             base: base.to_string(),
-            mode: settings.mode,
             app_key: settings.app_key.clone(),
             app_secret: settings.app_secret.clone(),
             token,
@@ -86,19 +92,32 @@ impl KisRest {
     }
 
     pub fn ws_url(&self) -> &'static str {
-        match self.mode {
-            TradeMode::Paper => PAPER_WS,
-            _ => REAL_WS,
-        }
+        REAL_WS
     }
 
     /// 조회 요청. 유량 초과(EGW00201) 시 자동 재시도한다 (읽기 전용이라 안전).
-    pub async fn get(&self, path: &str, tr_id: &str, params: &[(&str, String)]) -> AppResult<Value> {
+    pub async fn get(
+        &self,
+        path: &str,
+        tr_id: &str,
+        params: &[(&str, String)],
+    ) -> AppResult<Value> {
+        Ok(self.get_page(path, tr_id, params, None).await?.body)
+    }
+
+    /// 연속조회가 필요한 주문·체결 조회용. 응답의 tr_cont 헤더를 보존한다.
+    pub async fn get_page(
+        &self,
+        path: &str,
+        tr_id: &str,
+        params: &[(&str, String)],
+        tr_cont: Option<&str>,
+    ) -> AppResult<RestPage> {
         let mut attempt = 0u32;
         loop {
             self.limiter.acquire().await;
             let bearer = self.token.bearer().await?;
-            let resp = self
+            let mut request = self
                 .http
                 .get(format!("{}{}", self.base, path))
                 .query(params)
@@ -106,16 +125,29 @@ impl KisRest {
                 .header("appkey", &self.app_key)
                 .header("appsecret", &self.app_secret)
                 .header("tr_id", tr_id)
-                .header("custtype", "P")
-                .send()
-                .await?;
-            let result = Self::into_json(resp).await;
+                .header("custtype", "P");
+            if let Some(cont) = tr_cont.filter(|v| !v.is_empty()) {
+                request = request.header("tr_cont", cont);
+            }
+            let resp = request.send().await?;
+            let response_cont = resp
+                .headers()
+                .get("tr_cont")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let result = Self::into_json(resp).await.map(|body| RestPage {
+                body,
+                tr_cont: response_cont,
+            });
             match &result {
                 Err(AppError::Kis(msg)) if is_rate_limit_error(msg) && attempt < 4 => {
                     // 지수 백오프: 0.5s → 1s → 2s → 4s (읽기 전용이라 재시도 안전)
                     let delay = Duration::from_millis(500u64 << attempt);
                     attempt += 1;
-                    tracing::warn!("KIS 유량 초과({tr_id}) — {attempt}번째 재시도 ({delay:?} 대기)");
+                    tracing::warn!(
+                        "KIS 유량 초과({tr_id}) — {attempt}번째 재시도 ({delay:?} 대기)"
+                    );
                     tokio::time::sleep(delay).await;
                 }
                 _ => return result,
@@ -159,7 +191,11 @@ impl KisRest {
         if v["rt_cd"].as_str() == Some("0") {
             Ok(())
         } else {
-            let msg = v["msg1"].as_str().unwrap_or("알 수 없는 KIS 오류").trim().to_string();
+            let msg = v["msg1"]
+                .as_str()
+                .unwrap_or("알 수 없는 KIS 오류")
+                .trim()
+                .to_string();
             Err(AppError::Kis(msg))
         }
     }
@@ -167,7 +203,9 @@ impl KisRest {
 
 /// KIS 응답의 문자열 숫자 필드 파싱 ("12345", "-1.23" 등)
 pub fn num_f64(v: &Value) -> f64 {
-    v.as_str().and_then(|s| s.trim().parse().ok()).unwrap_or(0.0)
+    v.as_str()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0.0)
 }
 
 pub fn num_u64(v: &Value) -> u64 {
@@ -183,7 +221,9 @@ mod tests {
 
     #[test]
     fn rate_limit_error_detection() {
-        assert!(is_rate_limit_error("HTTP 500 Internal Server Error: 초당 거래건수를 초과하였습니다."));
+        assert!(is_rate_limit_error(
+            "HTTP 500 Internal Server Error: 초당 거래건수를 초과하였습니다."
+        ));
         assert!(is_rate_limit_error("EGW00201"));
         assert!(!is_rate_limit_error("주문가능금액이 부족합니다"));
         assert!(!is_rate_limit_error("모의투자 장종료"));

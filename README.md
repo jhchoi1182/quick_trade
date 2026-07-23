@@ -5,9 +5,10 @@
 
 - 한국투자증권(KIS) 오픈API — REST 주문 + WebSocket 실시간 시세/체결통보
 - Tauri 2 (Rust) + React + TypeScript — Windows / macOS
-- 매수: **매도1호가 + 버퍼틱(기본 2) IOC지정가** → 예수금 기준 최대 수량, 미체결 잔량은 거래소가 즉시 자동취소 (호가창에 절대 안 쌓임)
+- 매수: **매도1호가 +3% IOC지정가** → 미수없는매수금액의 95%, 미체결 잔량은 거래소가 즉시 자동취소
 - 매도: **보유 전량 시장가**
-- 시세는 실전 모드에서 **KRX+NXT 통합(UN)** — 프리·애프터마켓에도 차트/현재가 갱신. 주문 거래소는 설정에서 KRX/SOR 선택 (모의는 KRX 고정)
+- 시세는 **KRX+NXT 통합(UN)**, 주문 거래소는 설정에서 KRX/SOR 선택
+- 자동·섀도: SK하이닉스 상단/하단 조건을 5분마다 독립 판단하는 양방향 클라이언트 OCO
 - 테마: 기본(빨강/파랑) / **무채색**(버튼·배지 등 UI 회색조, 업무 중 위장용) — 차트 색상은 가독성을 위해 테마와 무관하게 기본색 유지
 - 타이틀바 ▴ 버튼으로 **차트 접기** (창 높이도 같이 줄어 초소형으로; 상태 기억됨)
 - 타이틀바 📌 버튼으로 **맨위로 고정 토글** (상태 기억됨)
@@ -17,7 +18,7 @@
 
 ```bash
 npm install
-npm run tauri dev     # 개발 실행 (키 없으면 자동 데모 모드)
+npm run tauri dev     # 개발 실행 (KIS 실전 키와 1회 확인 필요)
 npm run tauri build   # 배포 빌드 (Windows .msi / macOS .dmg는 mac에서)
 ```
 
@@ -32,15 +33,17 @@ cd src-tauri && cargo test    # Rust
 
 | 모드 | 설명 |
 |---|---|
-| 데모 | API 키 불필요. 가상 시세 + 모의 체결로 전체 UX 동작 |
-| 모의투자 | KIS 모의투자 서버. IOC 미지원이라 매수는 일반 지정가로 대체됨 |
-| 실전 | 실제 주문. **클릭 = 즉시 주문** (확인 절차 없음) |
+| 수동 | 기존 원클릭 실주문. **클릭 = 즉시 주문** (확인 절차 없음) |
+| 자동 | `gpt-5.6-sol` 양방향 OCO 판단과 KIS 실주문 |
+| 섀도 | 같은 OCO 판단을 실시간 호가·체결로 가상 실행. 수동 실주문은 병행 가능 |
+
+브로커 연결은 KIS 실전만 지원한다. 데모·모의투자 런타임은 없다.
 
 ## KIS API 신청 (실전 사용 전)
 
-1. [KIS Developers](https://apiportal.koreainvestment.com) 가입 → 앱 등록 → **APP KEY / APP SECRET** 발급 (실전·모의 각각)
-2. 앱 내 ⚙ 설정에서 입력: APP KEY, APP SECRET, 계좌번호 8자리, 상품코드(보통 `01`), **HTS ID**(실시간 체결통보용)
-3. 모드 선택 후 저장 → 엔진이 자동 재시작
+1. [KIS Developers](https://apiportal.koreainvestment.com) 가입 → 실전 앱의 **APP KEY / APP SECRET** 발급
+2. 앱 내 ⚙ 설정에서 KIS 정보, **HTS ID**, OpenAI API 키를 입력하고 실전 연결을 확인
+3. 저장 후 상단에서 수동·자동·섀도 제어 모드 선택
 
 설정 파일 위치: Windows `%APPDATA%\quick-trade\config.json`, macOS `~/Library/Application Support/quick-trade/`
 (사용 편의를 위해 평문 저장 — 공용 PC에서는 사용하지 말 것)
@@ -63,10 +66,11 @@ cd src-tauri && cargo test    # Rust
 ```
 src/            React UI (차트·셀렉터·매수/매도 버튼·상태줄·설정)
 src-tauri/src/
-  engine.rs     주문 엔진: 시세/잔고 캐시 + 원클릭 매수/매도
-  broker.rs     Broker trait (KIS/데모 공용 인터페이스)
+  engine.rs     직렬 주문 actor + 수동/자동/섀도 실행·복구
+  automation/   OpenAI 판단, OCO, 스케줄, Shadow 체결기
+  ledger.rs     SQLite 주문·체결·거래·LLM 판단 장부
+  broker.rs     KIS 실전 브로커 추상화 (테스트 더블용 seam)
   kis/          KIS REST(토큰·주문·잔고·분봉) + WebSocket(체결가·호가·체결통보 AES)
-  mock.rs       데모 모드 (가상 시세·모의 체결)
 ```
 
 ## 주의
@@ -74,3 +78,5 @@ src-tauri/src/
 - 실전 모드는 오클릭 방지 장치가 없다 (의도된 설계 — 속도 우선)
 - 앱은 이중 실행이 차단된다 (이중 주문 방지)
 - 장 운영시간 외 주문은 KIS가 거부하며 그 메시지가 토스트로 표시된다
+- 클라이언트 OCO, 자동 손절, 최대 보유시간, 15:15 정리는 앱이 실행 중이고 절전 상태가 아닐 때만 동작한다
+- 3초·3틱 확인과 -0.3% 손절은 판단·청산 트리거이며 체결가격이나 수익을 보장하지 않는다

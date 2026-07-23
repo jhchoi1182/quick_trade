@@ -1,11 +1,12 @@
 import { useEffect } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { AccountSnapshot, ConnEvent, FillEvent, Quote, Reservation } from "../types";
+import type { AccountSnapshot, AutomationSnapshot, ConnEvent, FillEvent, Quote, Reservation } from "../types";
 import { useMarketStore } from "../stores/marketStore";
 import { useAccountStore } from "../stores/accountStore";
 import { useUiStore } from "../stores/uiStore";
 import { useReservationStore } from "../stores/reservationStore";
 import { formatPrice } from "../lib/format";
+import { useAutomationStore } from "../stores/automationStore";
 
 /** Rust 엔진이 emit하는 이벤트를 스토어에 연결한다. App에서 1회만 사용. */
 export function useTauriEvents(): void {
@@ -36,6 +37,12 @@ export function useTauriEvents(): void {
       }),
       listen<ConnEvent>("conn", (e) => {
         useAccountStore.getState().setConnected(e.payload.connected);
+      }),
+      listen<AutomationSnapshot>("automation-state", (e) => {
+        useAutomationStore.getState().applySnapshot(e.payload);
+      }),
+      listen<unknown>("trade-recorded", () => {
+        useUiStore.getState().bumpHistoryRevision();
       }),
       listen<string>("engine-error", (e) => {
         useUiStore.getState().pushToast("error", e.payload);

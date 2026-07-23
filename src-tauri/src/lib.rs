@@ -1,15 +1,20 @@
+mod automation;
 pub mod broker;
-pub mod candle_cache;
+mod chart_image;
 mod commands;
 mod config;
 mod engine;
 pub mod error;
 mod kis;
-pub mod mock;
+mod ledger;
+mod market_history;
+#[cfg(test)]
+mod mock;
 mod state;
 pub mod types;
 pub mod util;
 
+use std::sync::Arc;
 use tauri::{Emitter, Manager};
 
 use crate::state::AppState;
@@ -26,13 +31,13 @@ pub fn run() {
                 let _ = win.set_focus();
             }
         }))
-        .manage(AppState::new(config::load()))
+        .manage(AppState::new(config::load()).expect("거래 장부 초기화 실패"))
         .setup(|app| {
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let state = handle.state::<AppState>();
                 let settings = state.settings.read().unwrap().clone();
-                match engine::start(handle.clone(), settings).await {
+                match engine::start(handle.clone(), settings, Arc::clone(&state.ledger)).await {
                     Ok(engine_handle) => {
                         *state.engine.lock().await = Some(engine_handle);
                         tracing::info!("엔진 시작 완료");
@@ -55,6 +60,10 @@ pub fn run() {
             commands::place_reserved_sell,
             commands::cancel_reserved_sell,
             commands::get_reservations,
+            commands::get_automation_status,
+            commands::set_control_mode,
+            commands::list_trade_records,
+            commands::list_llm_decisions,
         ])
         .run(tauri::generate_context!())
         .expect("Tauri 실행 실패");

@@ -11,6 +11,10 @@ struct CachedToken {
     access_token: String,
     /// 실제 UTC epoch 초
     expires_at: i64,
+    #[serde(default)]
+    base: String,
+    #[serde(default)]
+    app_key_fingerprint: String,
 }
 
 pub struct TokenManager {
@@ -23,14 +27,32 @@ pub struct TokenManager {
 }
 
 impl TokenManager {
-    pub fn new(http: reqwest::Client, base: String, app_key: String, app_secret: String, path: PathBuf) -> Self {
-        Self { http, base, app_key, app_secret, path, cached: Mutex::new(None) }
+    pub fn new(
+        http: reqwest::Client,
+        base: String,
+        app_key: String,
+        app_secret: String,
+        path: PathBuf,
+    ) -> Self {
+        Self {
+            http,
+            base,
+            app_key,
+            app_secret,
+            path,
+            cached: Mutex::new(None),
+        }
     }
 
     pub async fn bearer(&self) -> AppResult<String> {
         let mut guard = self.cached.lock().await;
         let now = chrono::Utc::now().timestamp();
-        let still_valid = |t: &CachedToken| t.expires_at - 300 > now;
+        let expected_fingerprint = app_key_fingerprint(&self.app_key);
+        let still_valid = |t: &CachedToken| {
+            t.expires_at - 300 > now
+                && t.base == self.base
+                && t.app_key_fingerprint == expected_fingerprint
+        };
 
         if let Some(t) = guard.as_ref() {
             if still_valid(t) {
@@ -64,7 +86,12 @@ impl TokenManager {
             .ok_or_else(|| AppError::Kis(format!("토큰 발급 실패: {v}")))?
             .to_string();
         let expires_in = v["expires_in"].as_i64().unwrap_or(86_400);
-        let t = CachedToken { access_token: token.clone(), expires_at: now + expires_in };
+        let t = CachedToken {
+            access_token: token.clone(),
+            expires_at: now + expires_in,
+            base: self.base.clone(),
+            app_key_fingerprint: expected_fingerprint,
+        };
         self.save_to_disk(&t);
         *guard = Some(t);
         tracing::info!("KIS 접근토큰 신규 발급");
@@ -103,5 +130,26 @@ impl TokenManager {
             .as_str()
             .map(str::to_string)
             .ok_or_else(|| AppError::Kis(format!("approval_key 발급 실패: {v}")))
+    }
+}
+
+/// 키 원문을 토큰 파일에 복제하지 않고 환경 혼용만 판별하기 위한 안정적인 fingerprint.
+fn app_key_fingerprint(value: &str) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fingerprint_is_stable_and_key_specific() {
+        assert_eq!(app_key_fingerprint("abc"), app_key_fingerprint("abc"));
+        assert_ne!(app_key_fingerprint("abc"), app_key_fingerprint("abd"));
     }
 }

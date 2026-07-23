@@ -3,8 +3,8 @@ import { LogicalSize } from "@tauri-apps/api/dpi";
 import { useSettingsStore } from "../stores/settingsStore";
 import { useUiStore } from "../stores/uiStore";
 
-/** 접었을 때 창 높이: 타이틀바 + 매매바 + 버튼 + 상태줄만 남는 크기 */
-export const COLLAPSED_HEIGHT = 168;
+/** 접었을 때 창 높이: 모드바와 최대 2행 OCO 패널까지 잘리지 않는 크기 */
+export const COLLAPSED_HEIGHT = 340;
 
 /** 맨위로 고정 적용 + 상태 갱신 (시작 시 복원과 토글 버튼이 공용) */
 export async function applyAlwaysOnTop(on: boolean): Promise<void> {
@@ -34,6 +34,7 @@ export function TitleBar() {
   const alwaysOnTop = useUiStore((s) => s.alwaysOnTop);
   const setChartCode = useUiStore((s) => s.setChartCode);
   const setSettingsOpen = useUiStore((s) => s.setSettingsOpen);
+  const setHistoryOpen = useUiStore((s) => s.setHistoryOpen);
 
   return (
     <div className="titlebar" data-tauri-drag-region>
@@ -87,6 +88,9 @@ export function TitleBar() {
       </button>
       <button className="win-btn" title="설정" onClick={() => setSettingsOpen(true)}>
         ⚙
+      </button>
+      <button className="win-btn" title="거래·판단 기록" onClick={() => setHistoryOpen(true)}>
+        ≡
       </button>
       <button className="win-btn" title="최소화" onClick={() => void getCurrentWindow().minimize()}>
         ─

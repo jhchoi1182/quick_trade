@@ -1,6 +1,7 @@
 pub mod account;
 pub mod auth;
 pub mod crypto;
+pub mod inquiry;
 pub mod order;
 pub mod quote;
 pub mod rest;
@@ -11,9 +12,9 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::broker::{Broker, OrderAck};
+use crate::broker::{Broker, BrokerFill, BrokerOpenOrder, BrokerOrderStatus, OrderAck};
 use crate::error::{AppError, AppResult};
-use crate::types::{AccountSnapshot, Candle, FeedEvent, Quote, Settings, Side, TradeMode};
+use crate::types::{AccountSnapshot, Candle, FeedEvent, Quote, Settings, Side};
 
 pub struct KisBroker {
     rest: Arc<rest::KisRest>,
@@ -39,13 +40,8 @@ impl KisBroker {
         &self.settings.acnt_prdt_cd
     }
 
-    /// 주문 거래소: 모의투자는 SOR 미지원이므로 KRX 강제
     fn exchange(&self) -> &str {
-        if matches!(self.settings.mode, TradeMode::Paper) {
-            "KRX"
-        } else {
-            &self.settings.exchange
-        }
+        &self.settings.exchange
     }
 }
 
@@ -57,7 +53,8 @@ impl Broker for KisBroker {
 
     async fn account(&self) -> AppResult<AccountSnapshot> {
         let positions = account::positions(&self.rest, self.cano(), self.prdt()).await?;
-        // 매수가능조회는 PDNO가 필수라 매매 종목 중 하나를 넣는다 (ord_psbl_cash는 종목 무관)
+        // 계좌 스냅샷용 대표 현금값이다. 실제 Auto/수동 재주문 수량은 주문할
+        // 종목을 넣은 orderable_cash/max_buy_qty로 다시 확인한다.
         let any_code = self
             .settings
             .trade_symbols
@@ -68,6 +65,10 @@ impl Broker for KisBroker {
         Ok(AccountSnapshot { cash, positions })
     }
 
+    async fn orderable_cash(&self, code: &str) -> AppResult<u64> {
+        account::orderable_cash(&self.rest, self.cano(), self.prdt(), code).await
+    }
+
     async fn snapshot(&self, code: &str) -> AppResult<Quote> {
         quote::snapshot(&self.rest, code).await
     }
@@ -76,33 +77,93 @@ impl Broker for KisBroker {
         account::max_buy_qty(&self.rest, self.cano(), self.prdt(), code, limit_price).await
     }
 
-    async fn place_buy(&self, code: &str, qty: u64, limit_price: u64, ioc: bool) -> AppResult<OrderAck> {
-        let dvsn = if ioc { order::ORD_DVSN_IOC_LIMIT } else { order::ORD_DVSN_LIMIT };
+    async fn place_buy(
+        &self,
+        code: &str,
+        qty: u64,
+        limit_price: u64,
+        ioc: bool,
+    ) -> AppResult<OrderAck> {
+        let dvsn = if ioc {
+            order::ORD_DVSN_IOC_LIMIT
+        } else {
+            order::ORD_DVSN_LIMIT
+        };
         order::order_cash(
-            &self.rest, self.cano(), self.prdt(), Side::Buy, code, qty, dvsn, limit_price, self.exchange(),
+            &self.rest,
+            self.cano(),
+            self.prdt(),
+            Side::Buy,
+            code,
+            qty,
+            dvsn,
+            limit_price,
+            self.exchange(),
         )
         .await
     }
 
     async fn place_sell_market(&self, code: &str, qty: u64) -> AppResult<OrderAck> {
         order::order_cash(
-            &self.rest, self.cano(), self.prdt(), Side::Sell, code, qty, order::ORD_DVSN_MARKET, 0, self.exchange(),
+            &self.rest,
+            self.cano(),
+            self.prdt(),
+            Side::Sell,
+            code,
+            qty,
+            order::ORD_DVSN_MARKET,
+            0,
+            self.exchange(),
         )
         .await
     }
 
-    async fn place_sell_limit(&self, code: &str, qty: u64, limit_price: u64) -> AppResult<OrderAck> {
+    async fn place_sell_limit(
+        &self,
+        code: &str,
+        qty: u64,
+        limit_price: u64,
+    ) -> AppResult<OrderAck> {
         order::order_cash(
-            &self.rest, self.cano(), self.prdt(), Side::Sell, code, qty, order::ORD_DVSN_LIMIT, limit_price, self.exchange(),
+            &self.rest,
+            self.cano(),
+            self.prdt(),
+            Side::Sell,
+            code,
+            qty,
+            order::ORD_DVSN_LIMIT,
+            limit_price,
+            self.exchange(),
         )
         .await
     }
 
     async fn cancel_order(&self, _code: &str, order_no: &str, org_no: &str) -> AppResult<OrderAck> {
         order::cancel_order(
-            &self.rest, self.cano(), self.prdt(), order_no, org_no, self.exchange(),
+            &self.rest,
+            self.cano(),
+            self.prdt(),
+            order_no,
+            org_no,
+            self.exchange(),
         )
         .await
+    }
+
+    async fn open_orders(&self) -> AppResult<Vec<BrokerOpenOrder>> {
+        inquiry::open_orders(&self.rest, self.cano(), self.prdt()).await
+    }
+
+    async fn today_fills(&self) -> AppResult<Vec<BrokerFill>> {
+        inquiry::today_fills(&self.rest, self.cano(), self.prdt()).await
+    }
+
+    async fn order_status(
+        &self,
+        trading_date: &str,
+        order_no: &str,
+    ) -> AppResult<Option<BrokerOrderStatus>> {
+        inquiry::order_status(&self.rest, self.cano(), self.prdt(), trading_date, order_no).await
     }
 
     async fn start_feed(
@@ -111,22 +172,29 @@ impl Broker for KisBroker {
         tx: mpsc::Sender<FeedEvent>,
     ) -> AppResult<Vec<JoinHandle<()>>> {
         let approval_key = self.rest.token.ws_approval_key().await?;
-        let trade_codes: Vec<String> =
-            self.settings.trade_symbols.iter().map(|s| s.code.clone()).collect();
-        let notice_tr = match self.settings.mode {
-            TradeMode::Paper => "H0STCNI9",
-            _ => "H0STCNI0",
-        };
+        let mut trade_codes: Vec<String> = self
+            .settings
+            .trade_symbols
+            .iter()
+            .map(|s| s.code.clone())
+            .collect();
+        trade_codes.extend([
+            self.settings.auto_symbols.underlying.clone(),
+            self.settings.auto_symbols.leverage.clone(),
+            self.settings.auto_symbols.inverse.clone(),
+        ]);
+        trade_codes.sort();
+        trade_codes.dedup();
         let notice = if self.settings.hts_id.is_empty() {
             tracing::warn!("HTS ID 미설정 — 실시간 체결통보 없이 동작 (잔고는 주기 갱신)");
             None
         } else {
-            Some((notice_tr.to_string(), self.settings.hts_id.clone()))
+            Some(("H0STCNI0".to_string(), self.settings.hts_id.clone()))
         };
         let cfg = ws::WsConfig {
             url: self.rest.ws_url().to_string(),
             approval_key,
-            subs: build_subs(self.settings.mode, &codes, &trade_codes),
+            subs: build_subs(&codes, &trade_codes),
             notice,
         };
         Ok(vec![ws::spawn_ws(cfg, tx)])
@@ -138,10 +206,10 @@ impl Broker for KisBroker {
 /// KRX+NXT 통합 TR(H0UN~)이 시세를 내려주지 않아 수익률 틱 갱신이 끊긴다.
 /// 차트 전용 종목은 통합 TR로 NXT 프리/애프터 시세까지 유지한다.
 /// 같은 종목을 두 TR로 겹쳐 구독하면 차트 거래량이 이중 집계되므로 코드당 체결가 구독은 1회.
-fn build_subs(mode: TradeMode, all_codes: &[String], trade_codes: &[String]) -> Vec<(String, String)> {
+fn build_subs(all_codes: &[String], trade_codes: &[String]) -> Vec<(String, String)> {
     let mut subs: Vec<(String, String)> = Vec::new();
     for code in all_codes {
-        let krx_only = matches!(mode, TradeMode::Paper) || trade_codes.contains(code);
+        let krx_only = trade_codes.contains(code);
         let tr_price = if krx_only { "H0STCNT0" } else { "H0UNCNT0" };
         subs.push((tr_price.to_string(), code.clone()));
     }
@@ -163,27 +231,23 @@ mod tests {
     fn build_subs_real_trade_codes_use_krx_tr() {
         let all = codes(&["000660", "005930", "0193T0"]);
         let trade = codes(&["0193T0"]);
-        let subs = build_subs(TradeMode::Real, &all, &trade);
+        let subs = build_subs(&all, &trade);
 
         // 매매 종목: KRX 체결가 + KRX 호가, 통합 TR로는 구독하지 않는다
         assert!(subs.contains(&("H0STCNT0".into(), "0193T0".into())));
         assert!(subs.contains(&("H0STASP0".into(), "0193T0".into())));
-        assert!(!subs.iter().any(|(tr, c)| tr.starts_with("H0UN") && c == "0193T0"));
+        assert!(!subs
+            .iter()
+            .any(|(tr, c)| tr.starts_with("H0UN") && c == "0193T0"));
         // 차트 전용 종목: 통합 체결가 유지, 호가 없음
         assert!(subs.contains(&("H0UNCNT0".into(), "000660".into())));
         assert!(!subs.iter().any(|(tr, c)| tr == "H0STASP0" && c == "000660"));
         // 코드당 체결가 구독은 1회 (거래량 이중 집계 방지)
-        let price_subs = subs.iter().filter(|(tr, c)| tr.ends_with("CNT0") && c == "0193T0").count();
+        let price_subs = subs
+            .iter()
+            .filter(|(tr, c)| tr.ends_with("CNT0") && c == "0193T0")
+            .count();
         assert_eq!(price_subs, 1);
-    }
-
-    #[test]
-    fn build_subs_paper_is_all_krx() {
-        let all = codes(&["005930", "0193T0"]);
-        let trade = codes(&["0193T0"]);
-        let subs = build_subs(TradeMode::Paper, &all, &trade);
-        assert!(subs.iter().all(|(tr, _)| tr.starts_with("H0ST")));
-        assert!(subs.contains(&("H0STCNT0".into(), "005930".into())));
     }
 
     #[test]
@@ -191,10 +255,13 @@ mod tests {
         // 매매 종목을 차트에도 넣은 경우: KRX 체결가 1회 + 호가 1회만
         let all = codes(&["0193T0"]);
         let trade = codes(&["0193T0"]);
-        let subs = build_subs(TradeMode::Real, &all, &trade);
-        assert_eq!(subs, vec![
-            ("H0STCNT0".to_string(), "0193T0".to_string()),
-            ("H0STASP0".to_string(), "0193T0".to_string()),
-        ]);
+        let subs = build_subs(&all, &trade);
+        assert_eq!(
+            subs,
+            vec![
+                ("H0STCNT0".to_string(), "0193T0".to_string()),
+                ("H0STASP0".to_string(), "0193T0".to_string()),
+            ]
+        );
     }
 }

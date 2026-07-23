@@ -1,4 +1,5 @@
 use futures_util::{SinkExt, StreamExt};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::connect_async;
@@ -8,6 +9,10 @@ use crate::error::{AppError, AppResult};
 use crate::kis::crypto::aes_cbc_decrypt;
 use crate::types::{FeedEvent, FillEvent, Quote, Side};
 use crate::util::{kst_str_to_fake_epoch, now_kst};
+
+/// H0STCNI0에는 체결 건별 고유 ID가 없으므로 수신 프레임 자체의 로컬 순번을 붙인다.
+/// 같은 초에 같은 수량·가격으로 체결된 두 건을 하나로 합치면 안 된다.
+static FILL_NOTICE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 pub struct WsConfig {
     pub url: String,
@@ -63,11 +68,17 @@ async fn run_once(cfg: &WsConfig, tx: &mpsc::Sender<FeedEvent>) -> AppResult<()>
 
     for (tr_id, tr_key) in &cfg.subs {
         let msg = subscribe_msg(&cfg.approval_key, tr_id, tr_key);
-        write.send(Message::Text(msg.into())).await.map_err(ws_err)?;
+        write
+            .send(Message::Text(msg.into()))
+            .await
+            .map_err(ws_err)?;
     }
     if let Some((tr_id, hts_id)) = &cfg.notice {
         let msg = subscribe_msg(&cfg.approval_key, tr_id, hts_id);
-        write.send(Message::Text(msg.into())).await.map_err(ws_err)?;
+        write
+            .send(Message::Text(msg.into()))
+            .await
+            .map_err(ws_err)?;
     }
     let _ = tx.send(FeedEvent::Conn(true)).await;
 
@@ -84,7 +95,10 @@ async fn run_once(cfg: &WsConfig, tx: &mpsc::Sender<FeedEvent>) -> AppResult<()>
                 let txt = raw.as_str();
                 if txt.starts_with('{') {
                     if is_pingpong(txt) {
-                        write.send(Message::Text(raw.clone())).await.map_err(ws_err)?;
+                        write
+                            .send(Message::Text(raw.clone()))
+                            .await
+                            .map_err(ws_err)?;
                     } else if let Some(kv) = extract_aes_keys(txt) {
                         aes_key_iv = Some(kv);
                     } else if let Some((tr_id, msg)) = subscribe_failure(txt) {
@@ -133,7 +147,11 @@ fn subscribe_failure(txt: &str) -> Option<(String, String)> {
         return None;
     }
     let tr_id = v["header"]["tr_id"].as_str().unwrap_or("?").to_string();
-    let msg = v["body"]["msg1"].as_str().unwrap_or("(메시지 없음)").trim().to_string();
+    let msg = v["body"]["msg1"]
+        .as_str()
+        .unwrap_or("(메시지 없음)")
+        .trim()
+        .to_string();
     Some((tr_id, msg))
 }
 
@@ -152,7 +170,7 @@ fn parse_data_frame(txt: &str, aes: &Option<(String, String)>) -> Vec<FeedEvent>
         // KRX 단독(H0ST~)과 KRX+NXT 통합(H0UN~)은 필드 배열이 동일하다
         "H0STCNT0" | "H0UNCNT0" => parse_ticks(payload, cnt, &today),
         "H0STASP0" | "H0UNASP0" => parse_books(payload, cnt, &today),
-        "H0STCNI0" | "H0STCNI9" => {
+        "H0STCNI0" => {
             let plain = if flag == "1" {
                 let Some((key, iv)) = aes else {
                     tracing::warn!("체결통보 수신했으나 AES 키 없음");
@@ -168,14 +186,20 @@ fn parse_data_frame(txt: &str, aes: &Option<(String, String)>) -> Vec<FeedEvent>
             } else {
                 payload.to_string()
             };
-            parse_notice(&plain).map(FeedEvent::Fill).into_iter().collect()
+            parse_notice(&plain)
+                .map(FeedEvent::Fill)
+                .into_iter()
+                .collect()
         }
         _ => Vec::new(),
     }
 }
 
 fn f64_at(fields: &[&str], i: usize) -> f64 {
-    fields.get(i).and_then(|s| s.trim().parse().ok()).unwrap_or(0.0)
+    fields
+        .get(i)
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0.0)
 }
 
 /// H0STCNT0: [0]종목코드 [1]체결시간 [2]현재가 [5]등락률 [10]매도호가1 [11]매수호가1 [12]체결거래량
@@ -199,14 +223,26 @@ fn parse_ticks(payload: &str, cnt: usize, today: &str) -> Vec<FeedEvent> {
                 change_rate: f64_at(f, 5),
                 ask1: f64_at(f, 10),
                 bid1: f64_at(f, 11),
+                ask1_qty: 0,
+                bid1_qty: 0,
                 volume: f64_at(f, 12),
-                ts,
+                // H0STCNT0 [13] 누적거래량은 실제 새 체결마다 증가하고 동일
+                // 프레임 재전송에서는 같아 distinct tick 식별자로 사용할 수 있다.
+                trade_sequence: f64_at(f, 13).max(0.0) as u64,
+                received_at_micros: crate::util::monotonic_now()
+                    .as_micros()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+                trade_ts: ts,
+                // 체결 프레임은 호가 수신 시각을 갱신하지 않는다.
+                book_ts: 0,
             }))
         })
         .collect()
 }
 
 /// H0STASP0: [0]종목코드 [1]영업시간 [3]매도호가1 [13]매수호가1
+/// [23]매도호가잔량1 [33]매수호가잔량1
 fn parse_books(payload: &str, cnt: usize, today: &str) -> Vec<FeedEvent> {
     let fields: Vec<&str> = payload.split('^').collect();
     let per = fields.len() / cnt;
@@ -225,13 +261,16 @@ fn parse_books(payload: &str, cnt: usize, today: &str) -> Vec<FeedEvent> {
                 code,
                 ask1: f64_at(f, 3),
                 bid1: f64_at(f, 13),
+                ask1_qty: f64_at(f, 23).max(0.0) as u64,
+                bid1_qty: f64_at(f, 33).max(0.0) as u64,
                 ts,
             })
         })
         .collect()
 }
 
-/// 체결통보: [4]매도매수구분(01매도/02매수) [8]종목코드 [9]체결수량 [10]체결단가 [12]거부여부(0정상) [13]체결여부(2체결)
+/// 체결통보: [2]주문번호 [3]원주문번호 [4]매도매수구분(01매도/02매수)
+/// [8]종목코드 [9]체결수량 [10]체결단가 [11]체결시각 [12]거부여부 [13]체결여부.
 fn parse_notice(plain: &str) -> Option<FillEvent> {
     let f: Vec<&str> = plain.split('^').collect();
     if f.len() < 14 {
@@ -244,14 +283,43 @@ fn parse_notice(plain: &str) -> Option<FillEvent> {
     }
     let qty: u64 = f[9].trim().parse().ok()?;
     let price: f64 = f[10].trim().parse().ok()?;
-    if qty == 0 {
+    let side = match f[4] {
+        "01" => Side::Sell,
+        "02" => Side::Buy,
+        _ => return None,
+    };
+    if qty == 0
+        || !price.is_finite()
+        || price <= 0.0
+        || f[2].trim().is_empty()
+        || f[8].trim().is_empty()
+    {
         return None;
     }
+    let filled_at = kst_str_to_fake_epoch(&now_kst().format("%Y%m%d").to_string(), f[11])?;
+    let order_no = f[2].to_string();
+    let receive_sequence = FILL_NOTICE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let received_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    // 주문번호·통보시각은 식별 힌트로 최대한 보존하되, 동일 원문의 별도 수신도
+    // 구분하도록 수신 나노초와 프로세스 단조 순번을 함께 넣는다.
+    let fill_id = format!(
+        "ws-notice:{order_no}:{}:{received_nanos}:{receive_sequence}",
+        f[11]
+    );
     Some(FillEvent {
+        fill_id,
+        order_no,
+        original_order_no: f[3].to_string(),
+        org_no: String::new(),
         code: f[8].to_string(),
-        side: if f[4] == "01" { Side::Sell } else { Side::Buy },
+        side,
         qty,
         price,
+        filled_at,
+        status: "filled".into(),
     })
 }
 
@@ -270,6 +338,7 @@ mod tests {
         fields[10] = "12805";
         fields[11] = "12795";
         fields[12] = "150";
+        fields[13] = "123456";
         let payload = fields.join("^");
         let txt = format!("0|H0STCNT0|001|{payload}");
 
@@ -282,6 +351,8 @@ mod tests {
                 assert_eq!(q.ask1, 12805.0);
                 assert_eq!(q.bid1, 12795.0);
                 assert_eq!(q.volume, 150.0);
+                assert_eq!(q.trade_sequence, 123_456);
+                assert!(q.received_at_micros > 0);
                 assert!((q.change_rate - 1.19).abs() < 1e-9);
             }
             other => panic!("unexpected event: {other:?}"),
@@ -322,16 +393,27 @@ mod tests {
         fields[1] = "093015";
         fields[3] = "12810";
         fields[13] = "12790";
+        fields[23] = "1200";
+        fields[33] = "900";
         let payload = fields.join("^");
         let txt = format!("0|H0STASP0|001|{payload}");
 
         let evs = parse_data_frame(&txt, &None);
         assert_eq!(evs.len(), 1);
         match &evs[0] {
-            FeedEvent::Book { code, ask1, bid1, .. } => {
+            FeedEvent::Book {
+                code,
+                ask1,
+                bid1,
+                ask1_qty,
+                bid1_qty,
+                ..
+            } => {
                 assert_eq!(code, "0193T0");
                 assert_eq!(*ask1, 12810.0);
                 assert_eq!(*bid1, 12790.0);
+                assert_eq!(*ask1_qty, 1200);
+                assert_eq!(*bid1_qty, 900);
             }
             other => panic!("unexpected event: {other:?}"),
         }
@@ -344,12 +426,19 @@ mod tests {
         f[8] = "0193T0";
         f[9] = "83";
         f[10] = "12805";
+        f[11] = "093015";
         f[12] = "0"; // 정상
         f[13] = "2"; // 체결
-        let fill = parse_notice(&f.join("^")).unwrap();
+        let raw = f.join("^");
+        let fill = parse_notice(&raw).unwrap();
+        let same_values_second_fill = parse_notice(&raw).unwrap();
         assert_eq!(fill.qty, 83);
         assert_eq!(fill.price, 12805.0);
         assert!(matches!(fill.side, Side::Buy));
+        assert_ne!(
+            fill.fill_id, same_values_second_fill.fill_id,
+            "동일초·수량·가격의 별도 통보를 합치면 안 됨"
+        );
 
         // 접수(체결 아님)는 무시
         f[13] = "1";
@@ -357,20 +446,45 @@ mod tests {
     }
 
     #[test]
+    fn 체결통보의_방향과_경제값이_깨졌으면_무시한다() {
+        let mut f = vec!["0"; 20];
+        f[2] = "0000012345";
+        f[4] = "02";
+        f[8] = "0193T0";
+        f[9] = "1";
+        f[10] = "12805";
+        f[11] = "093015";
+        f[12] = "0";
+        f[13] = "2";
+
+        f[4] = "00";
+        assert!(parse_notice(&f.join("^")).is_none());
+        f[4] = "02";
+        f[10] = "NaN";
+        assert!(parse_notice(&f.join("^")).is_none());
+        f[10] = "0";
+        assert!(parse_notice(&f.join("^")).is_none());
+    }
+
+    #[test]
     fn pingpong_detected() {
-        assert!(is_pingpong(r#"{"header":{"tr_id":"PINGPONG","datetime":"20260717"}}"#));
+        assert!(is_pingpong(
+            r#"{"header":{"tr_id":"PINGPONG","datetime":"20260717"}}"#
+        ));
         assert!(!is_pingpong(r#"{"header":{"tr_id":"H0STCNT0"}}"#));
     }
 
     #[test]
     fn subscribe_failure_detected() {
-        let fail = r#"{"header":{"tr_id":"H0STCNT0"},"body":{"rt_cd":"9","msg1":"INVALID APPROVAL KEY"}}"#;
+        let fail =
+            r#"{"header":{"tr_id":"H0STCNT0"},"body":{"rt_cd":"9","msg1":"INVALID APPROVAL KEY"}}"#;
         let (tr_id, msg) = subscribe_failure(fail).unwrap();
         assert_eq!(tr_id, "H0STCNT0");
         assert_eq!(msg, "INVALID APPROVAL KEY");
 
         // 성공 응답과 rt_cd 없는 메시지는 실패로 판정하지 않는다
-        let ok = r#"{"header":{"tr_id":"H0STCNT0"},"body":{"rt_cd":"0","msg1":"SUBSCRIBE SUCCESS"}}"#;
+        let ok =
+            r#"{"header":{"tr_id":"H0STCNT0"},"body":{"rt_cd":"0","msg1":"SUBSCRIBE SUCCESS"}}"#;
         assert!(subscribe_failure(ok).is_none());
         assert!(subscribe_failure(r#"{"header":{"tr_id":"PINGPONG"}}"#).is_none());
     }

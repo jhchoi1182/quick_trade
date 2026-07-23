@@ -1,4 +1,13 @@
 use chrono::{Duration, NaiveDate, NaiveDateTime, Utc};
+use std::sync::OnceLock;
+use std::time::{Duration as StdDuration, Instant};
+
+/// 프로세스 전체에서 공유하는 단조 시계. WebSocket 파서가 채널에 넣기 직전 찍은
+/// 시각과 OCO 무장 시각을 같은 원점으로 비교해 큐에 남아 있던 사전 틱을 차단한다.
+pub fn monotonic_now() -> StdDuration {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed()
+}
 
 /// KST 벽시계 시각 (한국은 서머타임이 없으므로 고정 +9h)
 pub fn now_kst() -> NaiveDateTime {
@@ -19,6 +28,13 @@ pub fn kst_str_to_fake_epoch(date: &str, time: &str) -> Option<i64> {
     let d = NaiveDate::parse_from_str(date, "%Y%m%d").ok()?;
     let t = chrono::NaiveTime::parse_from_str(time, "%H%M%S").ok()?;
     Some(naive_to_fake_epoch(d.and_time(t)))
+}
+
+/// KST 가짜 epoch 초에서 KIS 영업일 형식(`YYYYMMDD`)을 복원한다.
+pub fn trading_date_from_fake_epoch(timestamp: i64) -> Result<String, String> {
+    let datetime = chrono::DateTime::<Utc>::from_timestamp(timestamp, 0)
+        .ok_or_else(|| format!("거래 시각을 날짜로 변환할 수 없습니다: {timestamp}"))?;
+    Ok(datetime.format("%Y%m%d").to_string())
 }
 
 /// KRX 호가단위. ETF/ETN은 가격과 무관하게 5원.
@@ -47,6 +63,9 @@ pub const CASH_USE_RATIO: f64 = 0.95;
 /// 강제 손절 기준 수익률(%). 보유 수익률이 이 값 "이하"로 떨어지면 무조건 전량 매도한다.
 /// 사용자 설정으로 바꿀 수 없는 기계적 하한이라 Settings가 아니라 상수로 고정한다.
 pub const STOP_LOSS_PCT: f64 = -0.6;
+
+/// 자동·섀도 포지션 전용 손절선. 수동 포지션의 -0.6%와 분리한다.
+pub const AUTO_STOP_LOSS_PCT: f64 = -0.3;
 
 /// 매수 지정가: 기준 가격 +3%, 호가단위에 맞춰 내림 정렬
 pub fn buy_limit_price(base: u64, etf: bool) -> u64 {
@@ -160,11 +179,11 @@ mod tests {
         // 평단 10,000원 기준 -0.6% = 9,940원. 딱 -0.6%면 발동한다.
         assert!(hits_stop_loss(10_000.0, 9_940.0)); // 정확히 -0.6%
         assert!(hits_stop_loss(10_000.0, 9_900.0)); // -1.0%
-        // -0.6%보다 덜 빠졌으면(-0.59%) 발동하지 않는다
+                                                    // -0.6%보다 덜 빠졌으면(-0.59%) 발동하지 않는다
         assert!(!hits_stop_loss(10_000.0, 9_941.0)); // -0.59%
         assert!(!hits_stop_loss(10_000.0, 10_000.0)); // 0%
         assert!(!hits_stop_loss(10_000.0, 10_500.0)); // +5%
-        // 평단/가격 부재(주문 정보 없음)는 발동 금지
+                                                      // 평단/가격 부재(주문 정보 없음)는 발동 금지
         assert!(!hits_stop_loss(0.0, 9_000.0));
         assert!(!hits_stop_loss(10_000.0, 0.0));
     }

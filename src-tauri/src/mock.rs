@@ -9,7 +9,9 @@ use tokio::task::JoinHandle;
 
 use crate::broker::{Broker, OrderAck};
 use crate::error::{AppError, AppResult};
-use crate::types::{AccountSnapshot, Candle, FeedEvent, FillEvent, Position, Quote, Settings, Side};
+use crate::types::{
+    AccountSnapshot, Candle, FeedEvent, FillEvent, Position, Quote, Settings, Side,
+};
 use crate::util::{naive_to_fake_epoch, now_kst, tick_size};
 
 const INITIAL_CASH: u64 = 10_000_000;
@@ -81,7 +83,18 @@ fn check_resting_fills(m: &mut MockMarket) -> Vec<FillEvent> {
             }
         }
         // 목표 호가 그대로 체결 (슬리피지 없음)
-        fills.push(FillEvent { code, side: Side::Sell, qty: sell_qty, price: limit_price as f64 });
+        fills.push(FillEvent {
+            fill_id: format!("mock:{code}:{sell_qty}:{limit_price}"),
+            order_no: String::new(),
+            original_order_no: String::new(),
+            org_no: String::new(),
+            code,
+            side: Side::Sell,
+            qty: sell_qty,
+            price: limit_price as f64,
+            filled_at: crate::util::now_kst_fake_epoch(),
+            status: "filled".into(),
+        });
     }
     fills
 }
@@ -90,14 +103,23 @@ impl MockMarket {
     fn quote(&self, code: &str, volume: f64, ts: i64) -> Option<Quote> {
         let s = self.syms.get(code)?;
         let tick = tick_size(s.price as u64, s.etf) as f64;
+        let received_at_micros = crate::util::monotonic_now()
+            .as_micros()
+            .try_into()
+            .unwrap_or(u64::MAX);
         Some(Quote {
             code: code.to_string(),
             price: s.price,
             change_rate: (s.price / s.day_open - 1.0) * 100.0,
             ask1: s.price + tick,
             bid1: (s.price - tick).max(tick),
+            ask1_qty: 100_000,
+            bid1_qty: 100_000,
             volume,
-            ts,
+            trade_sequence: received_at_micros,
+            received_at_micros,
+            trade_ts: ts,
+            book_ts: ts,
         })
     }
 }
@@ -110,11 +132,19 @@ pub struct MockBroker {
 impl MockBroker {
     pub fn new(settings: &Settings) -> Self {
         let mut syms = HashMap::new();
-        for s in settings.chart_symbols.iter().chain(settings.trade_symbols.iter()) {
+        for s in settings
+            .chart_symbols
+            .iter()
+            .chain(settings.trade_symbols.iter())
+        {
             let p = base_price(&s.code) as f64;
             syms.insert(
                 s.code.clone(),
-                SymState { price: p, day_open: p, etf: s.etf },
+                SymState {
+                    price: p,
+                    day_open: p,
+                    etf: s.etf,
+                },
             );
         }
         Self {
@@ -183,7 +213,10 @@ impl Broker for MockBroker {
 
         let minutes = session_minutes(HISTORY_DAYS);
         let n = minutes.len();
-        let seed: u64 = code.bytes().map(u64::from).fold(7, |a, b| a.wrapping_mul(31).wrapping_add(b));
+        let seed: u64 = code
+            .bytes()
+            .map(u64::from)
+            .fold(7, |a, b| a.wrapping_mul(31).wrapping_add(b));
         let mut rng = StdRng::seed_from_u64(seed);
 
         // 현재가에서 뒤로 걸어가며 종가 시퀀스를 만든 뒤 앞으로 캔들 구성
@@ -232,11 +265,18 @@ impl Broker for MockBroker {
                     qty: *qty,
                     avg_price: *avg,
                     eval_pnl: pnl,
-                    pnl_rate: if *avg > 0.0 { (cur / avg - 1.0) * 100.0 } else { 0.0 },
+                    pnl_rate: if *avg > 0.0 {
+                        (cur / avg - 1.0) * 100.0
+                    } else {
+                        0.0
+                    },
                 }
             })
             .collect();
-        Ok(AccountSnapshot { cash: m.cash, positions })
+        Ok(AccountSnapshot {
+            cash: m.cash,
+            positions,
+        })
     }
 
     async fn snapshot(&self, code: &str) -> AppResult<Quote> {
@@ -253,7 +293,13 @@ impl Broker for MockBroker {
         Ok(m.cash / limit_price)
     }
 
-    async fn place_buy(&self, code: &str, qty: u64, limit_price: u64, _ioc: bool) -> AppResult<OrderAck> {
+    async fn place_buy(
+        &self,
+        code: &str,
+        qty: u64,
+        limit_price: u64,
+        _ioc: bool,
+    ) -> AppResult<OrderAck> {
         let fill = {
             let mut m = self.market.lock().unwrap();
             let s = m
@@ -279,10 +325,25 @@ impl Broker for MockBroker {
             let total_cost = entry.1 * entry.0 as f64 + fill_price * qty as f64;
             entry.0 += qty;
             entry.1 = total_cost / entry.0 as f64;
-            FillEvent { code: code.to_string(), side: Side::Buy, qty, price: fill_price }
+            FillEvent {
+                code: code.to_string(),
+                side: Side::Buy,
+                qty,
+                price: fill_price,
+                fill_id: format!("DEMO-BUY-{code}"),
+                order_no: "DEMO-BUY".into(),
+                original_order_no: String::new(),
+                org_no: "DEMO-ORG".into(),
+                filled_at: crate::util::now_kst_fake_epoch(),
+                status: "filled".into(),
+            }
         };
         self.send_fill(fill).await;
-        Ok(OrderAck { order_no: "DEMO-BUY".into(), org_no: "DEMO-ORG".into(), message: "데모 체결".into() })
+        Ok(OrderAck {
+            order_no: "DEMO-BUY".into(),
+            org_no: "DEMO-ORG".into(),
+            message: "데모 체결".into(),
+        })
     }
 
     async fn place_sell_market(&self, code: &str, qty: u64) -> AppResult<OrderAck> {
@@ -304,13 +365,33 @@ impl Broker for MockBroker {
             if entry.0 == 0 {
                 m.positions.remove(code);
             }
-            FillEvent { code: code.to_string(), side: Side::Sell, qty, price: fill_price }
+            FillEvent {
+                code: code.to_string(),
+                side: Side::Sell,
+                qty,
+                price: fill_price,
+                fill_id: format!("DEMO-SELL-{code}"),
+                order_no: "DEMO-SELL".into(),
+                original_order_no: String::new(),
+                org_no: "DEMO-ORG".into(),
+                filled_at: crate::util::now_kst_fake_epoch(),
+                status: "filled".into(),
+            }
         };
         self.send_fill(fill).await;
-        Ok(OrderAck { order_no: "DEMO-SELL".into(), org_no: "DEMO-ORG".into(), message: "데모 체결".into() })
+        Ok(OrderAck {
+            order_no: "DEMO-SELL".into(),
+            org_no: "DEMO-ORG".into(),
+            message: "데모 체결".into(),
+        })
     }
 
-    async fn place_sell_limit(&self, code: &str, qty: u64, limit_price: u64) -> AppResult<OrderAck> {
+    async fn place_sell_limit(
+        &self,
+        code: &str,
+        qty: u64,
+        limit_price: u64,
+    ) -> AppResult<OrderAck> {
         let mut m = self.market.lock().unwrap();
         let held = m.positions.get(code).map(|(q, _)| *q).unwrap_or(0);
         if held < qty || qty == 0 {
@@ -320,15 +401,32 @@ impl Broker for MockBroker {
         let order_no = format!("DEMO-RESV-{code}");
         m.resting_sells.insert(
             code.to_string(),
-            RestingSell { qty, limit_price, order_no: order_no.clone() },
+            RestingSell {
+                qty,
+                limit_price,
+                order_no: order_no.clone(),
+            },
         );
-        Ok(OrderAck { order_no, org_no: "DEMO-ORG".into(), message: "데모 예약 접수".into() })
+        Ok(OrderAck {
+            order_no,
+            org_no: "DEMO-ORG".into(),
+            message: "데모 예약 접수".into(),
+        })
     }
 
-    async fn cancel_order(&self, code: &str, _order_no: &str, _org_no: &str) -> AppResult<OrderAck> {
+    async fn cancel_order(
+        &self,
+        code: &str,
+        _order_no: &str,
+        _org_no: &str,
+    ) -> AppResult<OrderAck> {
         let mut m = self.market.lock().unwrap();
         match m.resting_sells.remove(code) {
-            Some(r) => Ok(OrderAck { order_no: r.order_no, org_no: "DEMO-ORG".into(), message: "데모 예약 취소".into() }),
+            Some(r) => Ok(OrderAck {
+                order_no: r.order_no,
+                org_no: "DEMO-ORG".into(),
+                message: "데모 예약 취소".into(),
+            }),
             None => Err(AppError::Order("취소할 예약이 없습니다 (데모)".into())),
         }
     }
@@ -355,7 +453,8 @@ impl Broker for MockBroker {
                             let tick = tick_size(s.price as u64, s.etf) as f64;
                             let step: i32 = rng.gen_range(-2..=2);
                             // 시가에서 멀어질수록 되돌리는 힘을 줘서 데모 시세가 발산하지 않게 한다
-                            let bias = ((s.day_open - s.price) / (s.day_open * 0.02)).clamp(-1.0, 1.0);
+                            let bias =
+                                ((s.day_open - s.price) / (s.day_open * 0.02)).clamp(-1.0, 1.0);
                             let raw = s.price + tick * (step as f64 + bias);
                             // 호가단위에 맞춰 반올림 (소수점 가격 방지)
                             s.price = ((raw / tick).round() * tick).max(tick);
@@ -391,10 +490,22 @@ mod tests {
 
     fn market_with_holding(code: &str, price: f64, qty: u64, avg: f64) -> MockMarket {
         let mut syms = HashMap::new();
-        syms.insert(code.to_string(), SymState { price, day_open: price, etf: true });
+        syms.insert(
+            code.to_string(),
+            SymState {
+                price,
+                day_open: price,
+                etf: true,
+            },
+        );
         let mut positions = HashMap::new();
         positions.insert(code.to_string(), (qty, avg));
-        MockMarket { syms, cash: 0, positions, resting_sells: HashMap::new() }
+        MockMarket {
+            syms,
+            cash: 0,
+            positions,
+            resting_sells: HashMap::new(),
+        }
     }
 
     #[test]
@@ -402,7 +513,11 @@ mod tests {
         let mut m = market_with_holding("0193T0", 10_000.0, 100, 9_800.0);
         m.resting_sells.insert(
             "0193T0".into(),
-            RestingSell { qty: 100, limit_price: 10_050, order_no: "R".into() },
+            RestingSell {
+                qty: 100,
+                limit_price: 10_050,
+                order_no: "R".into(),
+            },
         );
         // 목표가(10,050) 미달 → 체결 없음, 예약 유지
         assert!(check_resting_fills(&mut m).is_empty());
@@ -429,13 +544,21 @@ mod tests {
         assert!(broker.place_sell_limit("0193T0", 10, 13_000).await.is_err());
 
         // 보유를 채운 뒤 예약 → 접수(즉시 체결 아님)
-        broker.market.lock().unwrap().positions.insert("0193T0".into(), (10, 12_800.0));
+        broker
+            .market
+            .lock()
+            .unwrap()
+            .positions
+            .insert("0193T0".into(), (10, 12_800.0));
         let ack = broker.place_sell_limit("0193T0", 10, 13_000).await.unwrap();
         assert!(ack.order_no.contains("RESV"));
         assert_eq!(broker.market.lock().unwrap().resting_sells.len(), 1);
 
         // 취소 → 예약 제거
-        broker.cancel_order("0193T0", &ack.order_no, &ack.org_no).await.unwrap();
+        broker
+            .cancel_order("0193T0", &ack.order_no, &ack.org_no)
+            .await
+            .unwrap();
         assert!(broker.market.lock().unwrap().resting_sells.is_empty());
         // 취소할 예약이 없으면 에러
         assert!(broker.cancel_order("0193T0", "x", "y").await.is_err());

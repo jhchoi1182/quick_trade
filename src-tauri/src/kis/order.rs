@@ -1,7 +1,7 @@
 use crate::broker::OrderAck;
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::kis::rest::KisRest;
-use crate::types::{Side, TradeMode};
+use crate::types::Side;
 
 const PATH_ORDER: &str = "/uapi/domestic-stock/v1/trading/order-cash";
 const PATH_CANCEL: &str = "/uapi/domestic-stock/v1/trading/order-rvsecncl";
@@ -14,21 +14,57 @@ pub const ORD_DVSN_IOC_LIMIT: &str = "11";
 /// 정정취소구분: 01 정정, 02 취소
 const RVSE_CNCL_CANCEL: &str = "02";
 
-fn order_tr(mode: TradeMode, side: Side) -> &'static str {
-    match (mode, side) {
-        (TradeMode::Paper, Side::Buy) => "VTTC0012U",
-        (TradeMode::Paper, Side::Sell) => "VTTC0011U",
-        (_, Side::Buy) => "TTTC0012U",
-        (_, Side::Sell) => "TTTC0011U",
+fn order_tr(side: Side) -> &'static str {
+    match side {
+        Side::Buy => "TTTC0012U",
+        Side::Sell => "TTTC0011U",
     }
 }
 
-/// 정정취소 TR: 실전 TTTC0013U / 모의 VTTC0013U
-fn cancel_tr(mode: TradeMode) -> &'static str {
-    match mode {
-        TradeMode::Paper => "VTTC0013U",
-        _ => "TTTC0013U",
+const CANCEL_TR: &str = "TTTC0013U";
+
+/// HTTP 응답 본문을 정상적으로 받은 뒤 KIS가 `rt_cd != 0`으로 거부한 경우만
+/// 확정 거부로 분류한다. 전송·HTTP·본문 파싱 오류는 주문 접수 여부가 불명확하므로
+/// `KisRest::post`에서 온 오류를 그대로 보존한다.
+fn check_order_rt(v: &serde_json::Value) -> AppResult<()> {
+    if v["rt_cd"].as_str() == Some("0") {
+        Ok(())
+    } else {
+        Err(AppError::Order(
+            v["msg1"]
+                .as_str()
+                .unwrap_or("알 수 없는 KIS 주문 거부")
+                .trim()
+                .to_string(),
+        ))
     }
+}
+
+fn parse_order_ack(v: &serde_json::Value, default_message: &str) -> AppResult<OrderAck> {
+    let order_no = v["output"]["ODNO"]
+        .as_str()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let org_no = v["output"]["KRX_FWDG_ORD_ORGNO"]
+        .as_str()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if order_no.is_empty() || org_no.is_empty() {
+        return Err(AppError::Kis(
+            "KIS 성공 응답에 주문번호 또는 주문조직번호가 없어 접수 여부가 불명확합니다".into(),
+        ));
+    }
+    Ok(OrderAck {
+        order_no,
+        org_no,
+        message: v["msg1"]
+            .as_str()
+            .unwrap_or(default_message)
+            .trim()
+            .to_string(),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -53,13 +89,9 @@ pub async fn order_cash(
         // KRX 고정 또는 SOR(스마트 주문 라우팅: KRX/NXT 중 유리한 호가로)
         "EXCG_ID_DVSN_CD": exchange,
     });
-    let v = rest.post(PATH_ORDER, order_tr(rest.mode, side), &body).await?;
-    KisRest::check_rt(&v)?;
-    Ok(OrderAck {
-        order_no: v["output"]["ODNO"].as_str().unwrap_or_default().to_string(),
-        org_no: v["output"]["KRX_FWDG_ORD_ORGNO"].as_str().unwrap_or_default().to_string(),
-        message: v["msg1"].as_str().unwrap_or("주문 접수").trim().to_string(),
-    })
+    let v = rest.post(PATH_ORDER, order_tr(side), &body).await?;
+    check_order_rt(&v)?;
+    parse_order_ack(&v, "주문 접수")
 }
 
 /// 미체결 주문 취소 (잔량 전부). 이미 체결된 주문은 KIS가 거부한다.
@@ -85,11 +117,42 @@ pub async fn cancel_order(
         "QTY_ALL_ORD_YN": "Y",
         "EXCG_ID_DVSN_CD": exchange,
     });
-    let v = rest.post(PATH_CANCEL, cancel_tr(rest.mode), &body).await?;
-    KisRest::check_rt(&v)?;
-    Ok(OrderAck {
-        order_no: v["output"]["ODNO"].as_str().unwrap_or(order_no).to_string(),
-        org_no: v["output"]["KRX_FWDG_ORD_ORGNO"].as_str().unwrap_or(org_no).to_string(),
-        message: v["msg1"].as_str().unwrap_or("취소 접수").trim().to_string(),
-    })
+    let v = rest.post(PATH_CANCEL, CANCEL_TR, &body).await?;
+    check_order_rt(&v)?;
+    parse_order_ack(&v, "취소 접수")
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn 주문_업무거부만_확정거부로_분류한다() {
+        let error = check_order_rt(&json!({ "rt_cd": "1", "msg1": "주문 불가" }))
+            .expect_err("업무 거부여야 한다");
+        assert!(matches!(error, AppError::Order(_)));
+    }
+
+    #[test]
+    fn 성공_응답의_주문_식별자가_비면_불명확으로_처리한다() {
+        let missing_order = json!({
+            "rt_cd": "0",
+            "msg1": "정상",
+            "output": { "ODNO": "", "KRX_FWDG_ORD_ORGNO": "00950" }
+        });
+        let error = parse_order_ack(&missing_order, "주문 접수")
+            .expect_err("빈 주문번호를 성공으로 처리하면 안 된다");
+        assert!(matches!(error, AppError::Kis(_)));
+
+        let missing_org = json!({
+            "rt_cd": "0",
+            "msg1": "정상",
+            "output": { "ODNO": "0000012345", "KRX_FWDG_ORD_ORGNO": "" }
+        });
+        let error = parse_order_ack(&missing_org, "주문 접수")
+            .expect_err("빈 조직번호를 성공으로 처리하면 안 된다");
+        assert!(matches!(error, AppError::Kis(_)));
+    }
 }

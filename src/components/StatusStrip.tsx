@@ -4,8 +4,14 @@ import { useSettingsStore } from "../stores/settingsStore";
 import { useUiStore } from "../stores/uiStore";
 import { formatCompactKrw, formatRate, rateClass } from "../lib/format";
 import { livePnlRate } from "../lib/pnl";
+import { useAutomationStore } from "../stores/automationStore";
+import type { ControlMode } from "../types";
 
-const MODE_LABEL: Record<string, string> = { real: "실전", paper: "모의", demo: "데모" };
+const MODE_LABEL: Record<ControlMode, string> = {
+  manual: "실전·수동",
+  auto: "실전·자동",
+  shadow: "실전·섀도",
+};
 
 export function StatusStrip() {
   const tradeCode = useUiStore((s) => s.tradeCode);
@@ -14,12 +20,12 @@ export function StatusStrip() {
   const livePrice = useMarketStore((s) => s.quotes[tradeCode]?.price);
   const cash = useAccountStore((s) => s.cash);
   const connected = useAccountStore((s) => s.connected);
-  const mode = useSettingsStore((s) => s.settings?.mode ?? "demo");
+  const mode = useAutomationStore((s) => s.snapshot?.mode ?? "manual");
   const opacity = useSettingsStore((s) => s.settings?.opacity ?? 1);
   const setOpacity = useSettingsStore((s) => s.setOpacity);
 
-  // 실시간 시세로 즉시 재계산, 시세가 없으면 백엔드 스냅샷 값(30초 주기)으로 폴백
-  const pnlRate = position ? (livePnlRate(position.avgPrice, livePrice) ?? position.pnlRate) : 0;
+  // 화면 수익률은 실제 체결평단과 실시간 체결가로만 단순 계산한다.
+  const pnlRate = position ? livePnlRate(position.avgPrice, livePrice) : null;
 
   return (
     <div className="status-strip">
@@ -27,7 +33,11 @@ export function StatusStrip() {
         {position && position.qty > 0 ? (
           <span className="holding">
             보유 {position.qty.toLocaleString("ko-KR")}주{" "}
-            <span className={rateClass(pnlRate)}>{formatRate(pnlRate)}</span>
+            {pnlRate === null ? (
+              <span className="flat">수익률 대기</span>
+            ) : (
+              <span className={rateClass(pnlRate)}>{formatRate(pnlRate)}</span>
+            )}
           </span>
         ) : (
           <span className="holding flat">보유 없음</span>
