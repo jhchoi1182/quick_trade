@@ -1684,7 +1684,7 @@ impl Engine {
                     .map(str::to_owned);
                 automation.shadow_cash = Some(session.cash());
 
-                let forced = session.orders().iter().rev().find(|order| {
+                let forced = session.latest_trade_orders().iter().rev().find(|order| {
                     matches!(order.kind, ShadowOrderKind::ForcedExit(_))
                         && matches!(
                             order.status,
@@ -5616,8 +5616,8 @@ impl Engine {
             let Some(session) = shadow.as_ref() else {
                 return;
             };
-            let sell_orders: Vec<_> = session
-                .orders()
+            let latest_orders = session.latest_trade_orders();
+            let sell_orders: Vec<_> = latest_orders
                 .iter()
                 .filter(|order| order.side == ShadowSide::Sell && order.filled_qty > 0)
                 .collect();
@@ -5630,7 +5630,7 @@ impl Engine {
                 session.position().cloned(),
                 session.cash(),
                 (total_qty > 0).then(|| total_value / total_qty as f64),
-                session.orders().to_vec(),
+                latest_orders.to_vec(),
             )
         };
         if let Some(previous) = previous.as_ref() {
@@ -13739,6 +13739,234 @@ mod tests {
                 "가상 주문 장부 누락: {intent_id}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn shadow_연속거래는_두번째_청산가와_수익률을_현재거래로만_기록한다() {
+        let broker = Arc::new(ShadowPostCountingBroker {
+            post_calls: AtomicUsize::new(0),
+        });
+        let engine = test_engine(Arc::clone(&broker) as Arc<dyn Broker>, Settings::default());
+        engine.account.write().unwrap().cash = 1_000_000;
+        seed_shadow_quotes(&engine, 10, 10);
+
+        engine
+            .execute_shadow_entry(arm_shadow_trigger(&engine))
+            .await;
+        let first_position = engine
+            .automation
+            .lock()
+            .unwrap()
+            .position()
+            .cloned()
+            .expect("첫 번째 섀도 포지션");
+        let first_close = engine
+            .shadow
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .on_trade_tick(ShadowTradeTick {
+                product: ShadowProduct::Leverage,
+                sequence: 1,
+                price: 10_030,
+                volume: 10,
+                at: engine.automation_now() + 1,
+            })
+            .unwrap();
+        assert!(first_close.position_closed);
+        engine.apply_shadow_update(first_close);
+
+        {
+            let now = engine.automation_now();
+            let mut quotes = engine.quotes.write().unwrap();
+            let leverage = quotes.get_mut("0193T0").unwrap();
+            leverage.price = 20_000.0;
+            leverage.ask1 = 20_000.0;
+            leverage.bid1 = 19_995.0;
+            leverage.ask1_qty = 5;
+            leverage.bid1_qty = 5;
+            leverage.trade_ts = now;
+            leverage.book_ts = now;
+        }
+        engine
+            .execute_shadow_entry(arm_shadow_trigger(&engine))
+            .await;
+        let second_position = engine
+            .automation
+            .lock()
+            .unwrap()
+            .position()
+            .cloned()
+            .expect("두 번째 섀도 포지션");
+        assert_ne!(second_position.trade_id, first_position.trade_id);
+        assert_eq!(second_position.entry_qty, 5);
+
+        let bundle = engine
+            .ledger
+            .get_runtime_state::<PersistedAutomationBundle>(AUTOMATION_BUNDLE_STATE_KEY)
+            .unwrap()
+            .unwrap();
+        let persisted = bundle.automation.position.unwrap();
+        assert_eq!(persisted.trade_id, second_position.trade_id);
+        assert_eq!(persisted.exit_qty, 0);
+        assert_eq!(persisted.exit_value, 0.0);
+
+        let second_close = engine
+            .shadow
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .on_trade_tick(ShadowTradeTick {
+                product: ShadowProduct::Leverage,
+                sequence: 1,
+                price: 20_060,
+                volume: 5,
+                at: engine.automation_now() + 2,
+            })
+            .unwrap();
+        assert!(second_close.position_closed);
+        engine.apply_shadow_update(second_close);
+
+        let trades = engine
+            .ledger
+            .list_trades(&crate::ledger::TradeQuery::default(), None, 10)
+            .unwrap();
+        let first = trades
+            .items
+            .iter()
+            .find(|trade| trade.trade_id == first_position.trade_id)
+            .unwrap();
+        assert_eq!(first.exit_qty, 10);
+        assert_eq!(first.exit_avg_price, Some(10_030.0));
+        assert!((first.pnl_rate.unwrap() - 0.3).abs() < 1e-9);
+
+        let second = trades
+            .items
+            .iter()
+            .find(|trade| trade.trade_id == second_position.trade_id)
+            .unwrap();
+        assert_eq!(second.exit_qty, 5);
+        assert_eq!(second.exit_avg_price, Some(20_060.0));
+        assert!((second.pnl_rate.unwrap() - 0.3).abs() < 1e-9);
+
+        let shadow = engine.shadow.lock().unwrap();
+        let session = shadow.as_ref().unwrap();
+        assert_eq!(session.exit_summary(), (5, 100_300.0));
+        assert_eq!(session.orders().len(), 4);
+        assert_eq!(broker.post_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn shadow_과거_강제청산_주문은_다음거래의_intent로_동기화하지_않는다() {
+        let broker = Arc::new(ShadowPostCountingBroker {
+            post_calls: AtomicUsize::new(0),
+        });
+        let engine = test_engine(Arc::clone(&broker) as Arc<dyn Broker>, Settings::default());
+        engine.account.write().unwrap().cash = 1_000_000;
+        seed_shadow_quotes(&engine, 10, 10);
+
+        engine
+            .execute_shadow_entry(arm_shadow_trigger(&engine))
+            .await;
+        let target_partial = engine
+            .shadow
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .on_trade_tick(ShadowTradeTick {
+                product: ShadowProduct::Leverage,
+                sequence: 1,
+                price: 10_030,
+                volume: 2,
+                at: engine.automation_now() + 1,
+            })
+            .unwrap();
+        assert!(!target_partial.position_closed);
+        engine.apply_shadow_update(target_partial);
+
+        let forced_close = engine
+            .shadow
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .request_mode_exit(engine.automation_now() + 2)
+            .unwrap();
+        assert!(forced_close.position_closed);
+        engine.apply_shadow_update(forced_close);
+        let old_forced_order_id = engine
+            .shadow
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .orders()
+            .iter()
+            .find_map(|order| {
+                matches!(order.kind, ShadowOrderKind::ForcedExit(_)).then_some(order.id)
+            })
+            .expect("첫 거래 강제청산 주문");
+
+        {
+            let now = engine.automation_now();
+            let mut quotes = engine.quotes.write().unwrap();
+            let leverage = quotes.get_mut("0193T0").unwrap();
+            leverage.price = 20_000.0;
+            leverage.ask1 = 20_000.0;
+            leverage.bid1 = 19_995.0;
+            leverage.ask1_qty = 5;
+            leverage.bid1_qty = 5;
+            leverage.trade_ts = now;
+            leverage.book_ts = now;
+        }
+        engine
+            .execute_shadow_entry(arm_shadow_trigger(&engine))
+            .await;
+        let second_position = engine
+            .automation
+            .lock()
+            .unwrap()
+            .position()
+            .cloned()
+            .expect("두 번째 섀도 포지션");
+
+        let no_fill = engine
+            .shadow
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .on_trade_tick(ShadowTradeTick {
+                product: ShadowProduct::Leverage,
+                sequence: 1,
+                price: 20_000,
+                volume: 1,
+                at: engine.automation_now() + 3,
+            })
+            .unwrap();
+        assert!(no_fill.fill.is_none());
+        engine.apply_shadow_update(no_fill);
+
+        let wrong_intent = shadow_order_key(
+            &second_position.trade_id,
+            ShadowOrderKind::ForcedExit(ShadowExitReason::ModeExit),
+            old_forced_order_id,
+        );
+        assert!(engine.ledger.get_order(&wrong_intent).unwrap().is_none());
+        let target_intent = second_position.target_intent_id.unwrap();
+        assert_eq!(
+            engine
+                .ledger
+                .get_order(&target_intent)
+                .unwrap()
+                .unwrap()
+                .status,
+            LedgerOrderStatus::Submitted
+        );
+        assert_eq!(broker.post_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

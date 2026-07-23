@@ -408,6 +408,19 @@ impl ShadowSession {
         &self.orders
     }
 
+    /// 가장 최근 진입 주문부터 현재 거래에 속한 주문만 반환한다.
+    ///
+    /// 재시작 복원 세션은 진입 주문 없이 목표 주문부터 만들어지므로, 진입 주문이
+    /// 하나도 없으면 전체 주문을 현재 거래로 취급한다.
+    pub(crate) fn latest_trade_orders(&self) -> &[ShadowOrder] {
+        let start = self
+            .orders
+            .iter()
+            .rposition(|order| order.kind == ShadowOrderKind::EntryIoc)
+            .unwrap_or(0);
+        &self.orders[start..]
+    }
+
     #[cfg(test)]
     pub fn first_fill_time(&self) -> Option<i64> {
         self.position
@@ -426,9 +439,9 @@ impl ShadowSession {
         self.active_exit_reason
     }
 
-    /// 이미 체결된 모든 가상 매도의 수량과 금액을 반환한다.
+    /// 현재 거래에서 이미 체결된 가상 매도의 수량과 금액을 반환한다.
     pub fn exit_summary(&self) -> (u64, f64) {
-        self.orders
+        self.latest_trade_orders()
             .iter()
             .filter(|order| order.side == ShadowSide::Sell && order.filled_qty > 0)
             .fold((0_u64, 0.0_f64), |(qty, value), order| {
@@ -1176,6 +1189,42 @@ mod tests {
 
         assert_eq!(update.exit_reason, Some(ExitReason::MarketClose));
         assert!(update.position_closed);
+    }
+
+    #[test]
+    fn 연속_거래의_청산요약은_가장_최근_진입_이후만_집계한다() {
+        let now = at(10, 0, 0);
+        let mut session = ShadowSession::start(1_000_000);
+
+        enter(&mut session, now, 10_000, 10, 9_995, 10, 0.3);
+        let first = session
+            .on_trade_tick(ShadowTradeTick {
+                product: ShadowProduct::Leverage,
+                sequence: 1,
+                price: 10_030,
+                volume: 10,
+                at: now + 1,
+            })
+            .unwrap();
+        assert!(first.position_closed);
+        assert_eq!(session.exit_summary(), (10, 100_300.0));
+
+        enter(&mut session, now + 2, 20_000, 5, 19_995, 5, 0.3);
+        assert_eq!(session.exit_summary(), (0, 0.0));
+        assert_eq!(session.latest_trade_orders().len(), 2);
+
+        let second = session
+            .on_trade_tick(ShadowTradeTick {
+                product: ShadowProduct::Leverage,
+                sequence: 1,
+                price: 20_060,
+                volume: 5,
+                at: now + 3,
+            })
+            .unwrap();
+        assert!(second.position_closed);
+        assert_eq!(session.exit_summary(), (5, 100_300.0));
+        assert_eq!(session.orders().len(), 4);
     }
 
     #[test]
