@@ -8,7 +8,7 @@
 use std::{
     collections::HashSet,
     fs,
-    path::{Path, PathBuf},
+    path::Path,
     sync::{Mutex, MutexGuard},
     time::Duration,
 };
@@ -507,7 +507,6 @@ pub struct CursorPage<T> {
 /// 내부 `Connection`을 mutex로 감싸 Tauri state에서 안전하게 공유한다.
 pub struct Ledger {
     conn: Mutex<Connection>,
-    path: Option<PathBuf>,
 }
 
 impl Ledger {
@@ -521,25 +520,21 @@ impl Ledger {
         migrate(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
-            path: Some(path),
         })
     }
 
     /// 테스트 또는 휘발성 검증용 장부를 연다.
+    #[cfg(test)]
     pub fn open_in_memory() -> LedgerResult<Self> {
         let mut conn = Connection::open_in_memory()?;
         configure_connection(&mut conn)?;
         migrate(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
-            path: None,
         })
     }
 
-    pub fn path(&self) -> Option<&Path> {
-        self.path.as_deref()
-    }
-
+    #[cfg(test)]
     pub fn schema_version(&self) -> LedgerResult<i64> {
         let conn = self.lock()?;
         Ok(conn.query_row("PRAGMA user_version", [], |row| row.get(0))?)
@@ -984,23 +979,6 @@ impl Ledger {
         Ok(exists != 0)
     }
 
-    /// 이전 엔진 호출부를 위한 임시 호환 API. 신규 코드는 조직번호까지 받는
-    /// [`Ledger::is_auto_broker_order_key`]를 사용해야 한다.
-    #[deprecated(note = "is_auto_broker_order_key로 거래일과 조직번호를 함께 전달하세요")]
-    pub fn is_auto_broker_order(&self, broker_order_id: &str) -> LedgerResult<bool> {
-        let trading_date = trading_date_from_fake_epoch(crate::util::now_kst_fake_epoch())?;
-        let conn = self.lock()?;
-        let exists: i64 = conn.query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM orders
-                WHERE trading_date = ?1 AND broker_order_id = ?2 AND origin = 'auto'
-             )",
-            params![trading_date, broker_order_id],
-            |row| row.get(0),
-        )?;
-        Ok(exists != 0)
-    }
-
     /// 새 체결이면 true, 같은 주문 범위에서 이미 기록된 체결이면 false를 반환한다.
     /// 체결 ID가 없는 알림은 `fill_key`에 체결시각·수량·가격을 포함해야 한다.
     pub fn record_fill_for_broker_order(
@@ -1179,20 +1157,6 @@ impl Ledger {
     /// 이미 반영한 수량만 필요한 이전 호출부를 위한 편의 API.
     pub fn filled_qty_for_broker_order(&self, key: &BrokerOrderKey) -> LedgerResult<u64> {
         self.fill_totals_for_broker_order(key).map(|(qty, _)| qty)
-    }
-
-    /// 이전 엔진 호출부를 위한 임시 호환 API. 오늘 거래일까지만 제한한다.
-    #[deprecated(note = "filled_qty_for_broker_order로 거래일과 조직번호를 함께 전달하세요")]
-    pub fn filled_qty_for_order(&self, broker_order_id: &str) -> LedgerResult<u64> {
-        let trading_date = trading_date_from_fake_epoch(crate::util::now_kst_fake_epoch())?;
-        let conn = self.lock()?;
-        let qty: i64 = conn.query_row(
-            "SELECT COALESCE(SUM(qty), 0) FROM fills
-             WHERE trading_date = ?1 AND broker_order_id = ?2",
-            params![trading_date, broker_order_id],
-            |row| row.get(0),
-        )?;
-        Ok(i64_to_u64(qty, 0)?)
     }
 
     /// 동일 trade_id가 있으면 최신 집계 값으로 갱신한다.
@@ -2405,7 +2369,6 @@ mod tests {
 
         let ledger = Ledger {
             conn: Mutex::new(conn),
-            path: None,
         };
         let key = BrokerOrderKey::new(fill_date, "org-1", "order-1").unwrap();
         assert_eq!(ledger.filled_qty_for_broker_order(&key).unwrap(), 6);

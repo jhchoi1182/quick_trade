@@ -39,10 +39,6 @@ pub fn token_path() -> PathBuf {
     config_dir().join("token.json")
 }
 
-pub fn trading_db_path() -> PathBuf {
-    config_dir().join("trading.db")
-}
-
 /// 설정 로드. 구 real/paper/demo 설정은 실전 전용 설정으로 1회 마이그레이션한다.
 pub fn load() -> Settings {
     let path = config_path();

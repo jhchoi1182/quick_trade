@@ -313,14 +313,6 @@ impl AutomationRuntime {
         true
     }
 
-    pub fn pending_product(&self) -> Option<ProductKind> {
-        self.group
-            .as_ref()
-            .and_then(|group| group.winner())
-            .map(|winner| winner.scenario.product)
-            .or_else(|| self.pending_entry.as_ref().map(|pending| pending.product))
-    }
-
     pub fn pending_matches(&self, triggered: &TriggeredScenario) -> bool {
         self.phase == AutomationPhase::EntryPending
             && self.group.as_ref().is_some_and(|group| {
@@ -763,16 +755,6 @@ impl AutomationRuntime {
 
     pub fn exit_reason(&self) -> Option<&str> {
         self.exit_reason.as_deref()
-    }
-
-    pub fn exit_failed(&mut self, message: impl Into<String>) {
-        self.phase = AutomationPhase::Holding;
-        self.error = Some(message.into());
-        self.exit_reason = None;
-        if let Some(position) = &mut self.position {
-            position.pending_exit_reason = None;
-        }
-        self.revision = self.revision.saturating_add(1);
     }
 
     pub fn exit_waiting(&mut self, message: impl Into<String>) {

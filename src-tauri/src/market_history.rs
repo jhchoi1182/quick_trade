@@ -28,7 +28,7 @@ struct HistoryEntry {
 /// 종목별 1분봉을 최초 한 번 백필한 뒤 실시간 체결로만 갱신한다.
 ///
 /// 60초 TTL을 두지 않는다. 정상 연결 중 반복되는 차트/LLM 조회는 언제나
-/// 메모리 스냅샷을 반환하며, `mark_gap`이 호출된 종목만 다음 조회에서 다시
+/// 메모리 스냅샷을 반환하며, 실제 연결 공백이 확인되면 다음 조회에서 다시
 /// 백필한다. 종목별 잠금으로 동시 조회도 실제 브로커 호출 한 번으로 합친다.
 pub struct MarketHistory {
     entries: Mutex<HashMap<String, HistoryEntry>>,
@@ -99,6 +99,7 @@ impl MarketHistory {
     }
 
     /// 정상 상태의 현재 스냅샷. 초기화 전이나 공백 표시 뒤에는 `None`이다.
+    #[cfg(test)]
     pub async fn cached(&self, code: &str) -> Option<Arc<Vec<Candle>>> {
         self.healthy(code).await
     }
@@ -160,6 +161,7 @@ impl MarketHistory {
     }
 
     /// 실제 WebSocket 연결 공백이 확인된 종목만 다음 조회에서 재백필한다.
+    #[cfg(test)]
     pub async fn mark_gap(&self, code: &str) {
         let mut entries = self.entries.lock().await;
         let entry = entries.entry(code.to_string()).or_default();

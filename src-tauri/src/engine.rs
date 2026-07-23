@@ -649,13 +649,6 @@ fn shadow_product(product: ProductKind) -> ShadowProduct {
     }
 }
 
-fn product_from_shadow(product: ShadowProduct) -> ProductKind {
-    match product {
-        ShadowProduct::Leverage => ProductKind::Leverage,
-        ShadowProduct::Inverse => ProductKind::Inverse,
-    }
-}
-
 fn shadow_exit_reason(reason: ShadowExitReason) -> &'static str {
     match reason {
         ShadowExitReason::TargetReached => "target",
@@ -4537,51 +4530,6 @@ impl Engine {
         {
             tracing::error!("섀도 주문 상태 갱신 실패({intent_id}): {error}");
         }
-    }
-
-    async fn wait_order_fills(
-        &self,
-        order_no: &str,
-        code: &str,
-        side: Side,
-    ) -> Result<Vec<crate::broker::BrokerFill>, String> {
-        let mut by_order = HashMap::<String, crate::broker::BrokerFill>::new();
-        let mut had_success = false;
-        let mut last_error = None;
-        // 첫 부분체결이 보였다고 즉시 반환하지 않는다. IOC 종결 뒤 REST에 나머지
-        // 체결이 늦게 나타나는 경우까지 합쳐 실제 수량과 VWAP을 확정한다.
-        for attempt in 0..8 {
-            if attempt > 0 {
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
-            match self.broker.today_fills().await {
-                Ok(fills) => {
-                    had_success = true;
-                    for fill in fills.into_iter().filter(|fill| {
-                        fill.order_no == order_no && fill.code == code && fill.side == side
-                    }) {
-                        // KIS 일별 주문체결의 수량은 개별 체결이 아니라 주문별
-                        // 누적(tot_ccld_qty)이다. 폴링 사이 누적값이 커져도 이전 행과
-                        // 더하지 않고 같은 주문의 가장 큰 최신값으로 교체한다.
-                        let key = format!("{}:{}", fill.org_no, fill.order_no);
-                        let replace = by_order.get(&key).is_none_or(|current| {
-                            fill.qty > current.qty
-                                || (fill.qty == current.qty && fill.filled_at >= current.filled_at)
-                        });
-                        if replace {
-                            by_order.insert(key, fill);
-                        }
-                    }
-                }
-                Err(error) => last_error = Some(error.to_string()),
-            }
-        }
-        if !had_success {
-            return Err(last_error.unwrap_or_else(|| "당일 체결 조회 실패".into()));
-        }
-        let mut fills: Vec<_> = by_order.into_values().collect();
-        fills.sort_by_key(|fill| fill.filled_at);
-        Ok(fills)
     }
 
     /// Auto IOC 진입 주문의 정확 조회가 저장한 intent와 같은 경제 주문인지 검증한다.

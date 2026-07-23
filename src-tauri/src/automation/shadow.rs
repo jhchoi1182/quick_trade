@@ -391,6 +391,7 @@ impl ShadowSession {
         }
     }
 
+    #[cfg(test)]
     pub fn starting_cash(&self) -> u64 {
         self.starting_cash
     }
@@ -407,12 +408,14 @@ impl ShadowSession {
         &self.orders
     }
 
+    #[cfg(test)]
     pub fn first_fill_time(&self) -> Option<i64> {
         self.position
             .as_ref()
             .map(|position| position.first_fill_time)
     }
 
+    #[cfg(test)]
     pub fn simple_return_pct(&self) -> Option<f64> {
         self.position
             .as_ref()

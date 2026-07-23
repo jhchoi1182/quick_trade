@@ -261,7 +261,6 @@ pub enum TickOutcome {
 pub struct OcoGroup {
     group_id: i64,
     revision: u64,
-    armed_at: Duration,
     expires_at: Duration,
     /// 재연결 직전에 큐에 있던 틱이 확인에 섞이지 않도록 하는 수신 장벽.
     accept_ticks_after: Duration,
@@ -293,7 +292,6 @@ impl OcoGroup {
         Ok(Self {
             group_id,
             revision,
-            armed_at,
             expires_at,
             accept_ticks_after: armed_at,
             scenarios: decision
@@ -313,14 +311,6 @@ impl OcoGroup {
 
     pub fn revision(&self) -> u64 {
         self.revision
-    }
-
-    pub fn armed_at(&self) -> Duration {
-        self.armed_at
-    }
-
-    pub fn expires_at(&self) -> Duration {
-        self.expires_at
     }
 
     pub fn scenarios(&self) -> &[ScenarioState] {
