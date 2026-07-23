@@ -8814,6 +8814,7 @@ mod tests {
             }],
         )
         .unwrap();
+        let applied_trigger = decision.scenarios[0].trigger_price;
         let now = engine.automation_now();
         let start = engine.monotonic_now();
         let mut runtime = engine.automation.lock().unwrap();
@@ -8847,7 +8848,7 @@ mod tests {
                 },
                 &[NewDecisionScenario {
                     product: LedgerProductKind::Leverage,
-                    trigger_price: 185_100,
+                    trigger_price: applied_trigger,
                     target_return_pct: 0.3,
                     status: LedgerScenarioStatus::Armed,
                 }],
@@ -8867,7 +8868,7 @@ mod tests {
         for (sequence, second) in [(1, 1), (2, 2), (3, 4), (4, 5)] {
             triggered = runtime.on_trade_tick(TradeTick {
                 sequence,
-                price: 185_100,
+                price: applied_trigger,
                 volume: 1,
                 at: start + Duration::from_secs(second),
             });
@@ -8892,6 +8893,8 @@ mod tests {
             },
         ];
         let decision = validate_decision(185_000, &scenarios).unwrap();
+        let leverage_trigger = decision.scenarios[0].trigger_price;
+        let inverse_trigger = decision.scenarios[1].trigger_price;
         let now = engine.automation_now();
         let start = engine.monotonic_now();
         let mut runtime = engine.automation.lock().unwrap();
@@ -8901,13 +8904,13 @@ mod tests {
         let rows = [
             NewDecisionScenario {
                 product: LedgerProductKind::Leverage,
-                trigger_price: 185_100,
+                trigger_price: leverage_trigger,
                 target_return_pct: 0.3,
                 status: LedgerScenarioStatus::Armed,
             },
             NewDecisionScenario {
                 product: LedgerProductKind::Inverse,
-                trigger_price: 184_900,
+                trigger_price: inverse_trigger,
                 target_return_pct: 0.2,
                 status: LedgerScenarioStatus::Armed,
             },
@@ -8953,7 +8956,7 @@ mod tests {
         for (sequence, second) in [(1, 1), (2, 2), (3, 3), (4, 4)] {
             if let Some(triggered) = runtime.on_trade_tick(TradeTick {
                 sequence,
-                price: 185_100,
+                price: leverage_trigger,
                 volume: 1,
                 at: start + Duration::from_secs(second),
             }) {

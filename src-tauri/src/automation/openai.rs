@@ -13,12 +13,12 @@ use serde_json::{json, Value};
 use crate::types::{Candle, ModelDecision, ModelScenario, ProductKind, Quote};
 
 pub const MODEL: &str = "gpt-5.6-sol";
-pub const PROMPT_VERSION: &str = "sk-hynix-oco-v1";
+pub const PROMPT_VERSION: &str = "sk-hynix-oco-v2";
 const RESPONSES_URL: &str = "https://api.openai.com/v1/responses";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(240);
 
 /// 프롬프트 캐시의 고정 접두사가 되므로 동적 값을 추가하지 않는다.
-pub const SYSTEM_PROMPT: &str = "당신은 SK하이닉스(000660) 연동 레버리지·곱버스 ETF 스캘핑 신호기다. 매 호출은 독립적이며 제공된 현재 시세와 10·15분봉만 사용한다. 과거 결정·누적손익·연속손실은 고려하지 마라. 횡보·추세 환경에서 명확한 단기 우위가 있는 조건만 0~2개 시나리오로 제시하고, 근거가 약한 반대 방향을 억지로 만들지 마라. LEVERAGE는 현재 본주보다 높은 triggerPrice의 상향 돌파, INVERSE는 낮은 triggerPrice의 하향 이탈 조건이다. 양방향이 모두 타당하면 둘 다 제시하며 실행기는 먼저 3초·3틱 확인된 하나만 실행한다. targetReturnPct는 선택 ETF의 실제 체결평단 대비 단순 목표수익률로 0.2~2.0%, 0.1% 단위다. 기본 후보는 0.2/0.3%이며 명확한 여지가 있을 때만 높여라. 약 ±2배 상품의 특성과 각 ETF의 직접 시세·호가를 반영하되 프로그램은 목표를 다시 2배 환산하지 않는다. 실행기는 -0.3% 손절, 첫 체결 10분 후 청산, 15:15 청산을 별도로 수행한다. 지정 JSON만 반환하라.";
+pub const SYSTEM_PROMPT: &str = "당신은 SK하이닉스(000660) 연동 레버리지·곱버스 ETF 스캘핑 신호기다. 매 호출은 독립적이며 제공된 현재 시세와 10·15분봉만 사용한다. 과거 결정·누적손익·연속손실은 고려하지 마라. 횡보·추세 환경에서 명확한 단기 우위가 있는 조건만 0~2개 시나리오로 제시하고, 근거가 약한 반대 방향을 억지로 만들지 마라. LEVERAGE는 현재 본주보다 높은 triggerPrice의 상향 돌파, INVERSE는 낮은 triggerPrice의 하향 이탈 조건이다. triggerPrice에는 차트상 기술적 기준가만 제시하고 가짜 돌파 방지 보정값을 미리 반영하지 마라. 실행기는 LEVERAGE는 위로, INVERSE는 아래로 0.1% 보정해 유효 호가로 정규화한 뒤 먼저 3초·3틱 확인된 하나만 실행한다. 양방향이 모두 타당하면 둘 다 제시한다. targetReturnPct는 선택 ETF의 실제 체결평단 대비 단순 목표수익률로 0.2~2.0%, 0.1% 단위다. 기본 후보는 0.2/0.3%이며 명확한 여지가 있을 때만 높여라. 약 ±2배 상품의 특성과 각 ETF의 직접 시세·호가를 반영하되 프로그램은 목표를 다시 2배 환산하지 않는다. 실행기는 -0.3% 손절, 첫 체결 10분 후 청산, 15:15 청산을 별도로 수행한다. 지정 JSON만 반환하라.";
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]

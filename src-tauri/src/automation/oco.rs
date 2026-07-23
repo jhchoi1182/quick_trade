@@ -15,6 +15,9 @@ pub const REQUIRED_CONFIRMING_TICKS: u8 = 3;
 pub const MIN_TARGET_RETURN_PCT: f64 = 0.2;
 pub const MAX_TARGET_RETURN_PCT: f64 = 2.0;
 pub const TARGET_RETURN_STEP_PCT: f64 = 0.1;
+/// LLM이 제시한 기술적 기준가 바깥으로 추가하는 가짜 돌파 방지 보정률(10bp = 0.1%).
+pub const BREAKOUT_BUFFER_BPS: u64 = 10;
+const BASIS_POINTS_DENOMINATOR: u64 = 10_000;
 const TARGET_STEP_SCALE: f64 = 1.0 / TARGET_RETURN_STEP_PCT;
 const FLOAT_EPSILON: f64 = 1e-8;
 
@@ -41,7 +44,7 @@ pub enum ScenarioInvalidReason {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValidatedScenario {
     pub product: ProductKind,
-    /// 본주 호가단위로 보수적으로 정규화한 가격.
+    /// 0.1% 돌파 보정 후 본주 호가단위로 보수적으로 정규화한 실제 발동가.
     pub trigger_price: u64,
     /// 선택 ETF의 실제 체결평단에 직접 적용할 목표수익률.
     pub target_return_pct: f64,
@@ -64,7 +67,7 @@ pub struct ValidatedDecision {
     pub rejected: Vec<RejectedScenario>,
 }
 
-/// 모델 결정을 의미 검증하고 본주 호가단위에 맞춘다.
+/// 모델 결정을 의미 검증하고 0.1% 돌파 보정 후 본주 호가단위에 맞춘다.
 ///
 /// 중복 상품과 3개 이상 출력은 전체 오류다. 방향·목표수익률이 잘못된 개별
 /// 시나리오는 제외하고, 나머지가 있으면 그대로 사용할 수 있다.
@@ -107,7 +110,7 @@ pub fn validate_decision(
             continue;
         }
 
-        let Some(trigger_price) = normalize_trigger_price(scenario.trigger_price, scenario.product)
+        let Some(trigger_price) = buffered_trigger_price(scenario.trigger_price, scenario.product)
         else {
             result.rejected.push(rejected(
                 scenario,
@@ -152,6 +155,23 @@ fn is_valid_target_return(target: f64) -> bool {
     }
     let scaled = target * TARGET_STEP_SCALE;
     (scaled - scaled.round()).abs() <= FLOAT_EPSILON
+}
+
+/// 비율 계산에서 1원 미만도 버리지 않도록 올림한 뒤 돌파 방향 바깥쪽에 적용한다.
+fn buffered_trigger_price(price: u64, product: ProductKind) -> Option<u64> {
+    let whole = (price / BASIS_POINTS_DENOMINATOR) * BREAKOUT_BUFFER_BPS;
+    let scaled_remainder = (price % BASIS_POINTS_DENOMINATOR) * BREAKOUT_BUFFER_BPS;
+    let buffer = whole
+        + scaled_remainder / BASIS_POINTS_DENOMINATOR
+        + u64::from(scaled_remainder % BASIS_POINTS_DENOMINATOR != 0);
+    let buffered = match product {
+        ProductKind::Leverage => price.checked_add(buffer)?,
+        ProductKind::Inverse => price.checked_sub(buffer)?,
+    };
+    if buffered == 0 {
+        return None;
+    }
+    normalize_trigger_price(buffered, product)
 }
 
 /// 현재 KRX 본주 가격대별 호가단위.
@@ -487,6 +507,9 @@ impl OcoGroup {
 mod tests {
     use super::*;
 
+    const UP_TRIGGER: u64 = 185_300;
+    const DOWN_TRIGGER: u64 = 184_700;
+
     fn model(product: ProductKind, trigger_price: u64, target: f64) -> ModelScenario {
         ModelScenario {
             product,
@@ -534,16 +557,17 @@ mod tests {
     }
 
     #[test]
-    fn 두_방향을_본주_호가단위로_보수적으로_정규화한다() {
+    fn 두_방향에_영점일퍼센트_보정후_호가단위로_정규화한다() {
         let decision = valid_two_way_decision();
         assert_eq!(decision.scenarios.len(), 2);
-        assert_eq!(decision.scenarios[0].trigger_price, 185_100);
-        assert_eq!(decision.scenarios[1].trigger_price, 184_900);
+        assert_eq!(decision.scenarios[0].trigger_price, UP_TRIGGER);
+        assert_eq!(decision.scenarios[1].trigger_price, DOWN_TRIGGER);
         assert_eq!(decision.scenarios[0].target_return_pct, 0.3);
+        assert_eq!(BREAKOUT_BUFFER_BPS, 10);
     }
 
     #[test]
-    fn 가격대_경계에서도_정규화가_안전하다() {
+    fn 보정값이_가격대_경계를_넘어도_새_호가단위로_정규화한다() {
         let decision = validate_decision(
             19_900,
             &[
@@ -552,9 +576,26 @@ mod tests {
             ],
         )
         .unwrap();
-        assert_eq!(decision.scenarios[0].trigger_price, 20_000);
-        assert_eq!(decision.scenarios[1].trigger_price, 19_890);
+        assert_eq!(decision.scenarios[0].trigger_price, 20_050);
+        assert_eq!(decision.scenarios[1].trigger_price, 19_870);
         assert_eq!(underlying_tick_size(20_000), 50);
+    }
+
+    #[test]
+    fn 보정중_오버플로나_가격이_0이_되면_개별_시나리오를_제외한다() {
+        let upper = validate_decision(1, &[model(ProductKind::Leverage, u64::MAX, 0.2)]).unwrap();
+        assert!(upper.scenarios.is_empty());
+        assert_eq!(
+            upper.rejected[0].reason,
+            ScenarioInvalidReason::InvalidTriggerPrice
+        );
+
+        let lower = validate_decision(2, &[model(ProductKind::Inverse, 1, 0.2)]).unwrap();
+        assert!(lower.scenarios.is_empty());
+        assert_eq!(
+            lower.rejected[0].reason,
+            ScenarioInvalidReason::InvalidTriggerPrice
+        );
     }
 
     #[test]
@@ -653,15 +694,15 @@ mod tests {
     fn arm_이전_틱과_호가성_틱은_확인에_포함하지_않는다() {
         let mut group = group();
         assert_eq!(
-            group.on_trade_tick(tick(1, 9, 185_100)),
+            group.on_trade_tick(tick(1, 9, UP_TRIGGER)),
             TickOutcome::Ignored
         );
         assert_eq!(
-            group.on_trade_tick(tick(2, 10, 185_100)),
+            group.on_trade_tick(tick(2, 10, UP_TRIGGER)),
             TickOutcome::Ignored
         );
 
-        let mut no_volume = tick(3, 11, 185_100);
+        let mut no_volume = tick(3, 11, UP_TRIGGER);
         no_volume.volume = 0;
         assert_eq!(group.on_trade_tick(no_volume), TickOutcome::Ignored);
         assert_eq!(
@@ -674,16 +715,16 @@ mod tests {
     fn 세_틱과_삼초를_충족한_뒤_다음_틱에서만_확정한다() {
         let mut group = group();
         assert_eq!(
-            group.on_trade_tick(tick(1, 11, 185_100)),
+            group.on_trade_tick(tick(1, 11, UP_TRIGGER)),
             TickOutcome::Updated
         );
         assert_eq!(
-            group.on_trade_tick(tick(2, 12, 185_200)),
+            group.on_trade_tick(tick(2, 12, UP_TRIGGER + 100)),
             TickOutcome::Updated
         );
         // 이 시점에 3개째 틱과 3초를 함께 충족해도 아직 진입하지 않는다.
         assert_eq!(
-            group.on_trade_tick(tick(3, 14, 185_300)),
+            group.on_trade_tick(tick(3, 14, UP_TRIGGER + 200)),
             TickOutcome::Updated
         );
         assert!(group.winner().is_none());
@@ -695,7 +736,7 @@ mod tests {
             3
         );
 
-        let outcome = group.on_trade_tick(tick(4, 15, 185_100));
+        let outcome = group.on_trade_tick(tick(4, 15, UP_TRIGGER));
         let TickOutcome::Triggered(triggered) = outcome else {
             panic!("네 번째 유효 틱에서 확정돼야 한다");
         };
@@ -716,45 +757,45 @@ mod tests {
     fn 틱수와_시간_중_하나라도_모자라면_확정하지_않는다() {
         let mut fast_ticks_group = group();
         assert_eq!(
-            fast_ticks_group.on_trade_tick(tick(1, 11, 185_100)),
+            fast_ticks_group.on_trade_tick(tick(1, 11, UP_TRIGGER)),
             TickOutcome::Updated
         );
         assert_eq!(
-            fast_ticks_group.on_trade_tick(tick(2, 11, 185_100)),
+            fast_ticks_group.on_trade_tick(tick(2, 11, UP_TRIGGER)),
             TickOutcome::Updated
         );
         assert_eq!(
-            fast_ticks_group.on_trade_tick(tick(3, 11, 185_100)),
+            fast_ticks_group.on_trade_tick(tick(3, 11, UP_TRIGGER)),
             TickOutcome::Updated
         );
         // 이미 3틱이지만 3초 전이다.
         assert_eq!(
-            fast_ticks_group.on_trade_tick(tick(4, 13, 185_100)),
+            fast_ticks_group.on_trade_tick(tick(4, 13, UP_TRIGGER)),
             TickOutcome::Updated
         );
         assert!(fast_ticks_group.winner().is_none());
         assert!(matches!(
-            fast_ticks_group.on_trade_tick(tick(5, 14, 185_100)),
+            fast_ticks_group.on_trade_tick(tick(5, 14, UP_TRIGGER)),
             TickOutcome::Triggered(_)
         ));
 
         let mut second_group = group();
         assert_eq!(
-            second_group.on_trade_tick(tick(1, 11, 185_100)),
+            second_group.on_trade_tick(tick(1, 11, UP_TRIGGER)),
             TickOutcome::Updated
         );
         assert_eq!(
-            second_group.on_trade_tick(tick(2, 20, 185_100)),
+            second_group.on_trade_tick(tick(2, 20, UP_TRIGGER)),
             TickOutcome::Updated
         );
         // 3초는 넘었지만 확정 전에 누적된 틱은 아직 2개다.
         assert_eq!(
-            second_group.on_trade_tick(tick(3, 21, 185_100)),
+            second_group.on_trade_tick(tick(3, 21, UP_TRIGGER)),
             TickOutcome::Updated
         );
         // 앞선 세 틱과 3초가 모두 갖춰진 뒤 들어온 네 번째 틱에서 확정한다.
         assert!(matches!(
-            second_group.on_trade_tick(tick(4, 22, 185_100)),
+            second_group.on_trade_tick(tick(4, 22, UP_TRIGGER)),
             TickOutcome::Triggered(_)
         ));
     }
@@ -762,10 +803,10 @@ mod tests {
     #[test]
     fn 기준_안쪽으로_되돌아오면_시간과_틱수를_초기화한다() {
         let mut group = group();
-        group.on_trade_tick(tick(1, 11, 185_100));
-        group.on_trade_tick(tick(2, 12, 185_200));
+        group.on_trade_tick(tick(1, 11, UP_TRIGGER));
+        group.on_trade_tick(tick(2, 12, UP_TRIGGER + 100));
         assert_eq!(
-            group.on_trade_tick(tick(3, 13, 185_099)),
+            group.on_trade_tick(tick(3, 13, UP_TRIGGER - 1)),
             TickOutcome::Updated
         );
 
@@ -775,11 +816,11 @@ mod tests {
         assert_eq!(state.confirming_since, None);
 
         // 이전 확인 시간이 길었어도 새 구간에서 다시 세어야 한다.
-        group.on_trade_tick(tick(4, 20, 185_100));
-        group.on_trade_tick(tick(5, 21, 185_100));
-        group.on_trade_tick(tick(6, 22, 185_100));
+        group.on_trade_tick(tick(4, 20, UP_TRIGGER));
+        group.on_trade_tick(tick(5, 21, UP_TRIGGER));
+        group.on_trade_tick(tick(6, 22, UP_TRIGGER));
         assert_eq!(
-            group.on_trade_tick(tick(7, 22, 185_100)),
+            group.on_trade_tick(tick(7, 22, UP_TRIGGER)),
             TickOutcome::Updated
         );
         assert!(group.winner().is_none());
@@ -788,8 +829,8 @@ mod tests {
     #[test]
     fn 재연결은_확인을_초기화하고_큐에_남은_옛_틱을_무시한다() {
         let mut group = group();
-        group.on_trade_tick(tick(10, 11, 185_100));
-        group.on_trade_tick(tick(11, 12, 185_100));
+        group.on_trade_tick(tick(10, 11, UP_TRIGGER));
+        group.on_trade_tick(tick(11, 12, UP_TRIGGER));
 
         assert_eq!(group.reset_for_reconnect(Duration::from_secs(13)), 1);
         let state = group.scenario(ProductKind::Leverage).unwrap();
@@ -798,11 +839,11 @@ mod tests {
 
         // 순번 기준은 재설정됐지만 reset_at 이하의 큐 잔여 틱은 받지 않는다.
         assert_eq!(
-            group.on_trade_tick(tick(1, 13, 185_100)),
+            group.on_trade_tick(tick(1, 13, UP_TRIGGER)),
             TickOutcome::Ignored
         );
         assert_eq!(
-            group.on_trade_tick(tick(1, 14, 185_100)),
+            group.on_trade_tick(tick(1, 14, UP_TRIGGER)),
             TickOutcome::Updated
         );
         assert_eq!(
@@ -817,13 +858,13 @@ mod tests {
     #[test]
     fn 중복되거나_역행한_체결_순번은_한번만_센다() {
         let mut group = group();
-        group.on_trade_tick(tick(5, 11, 185_100));
+        group.on_trade_tick(tick(5, 11, UP_TRIGGER));
         assert_eq!(
-            group.on_trade_tick(tick(5, 12, 185_100)),
+            group.on_trade_tick(tick(5, 12, UP_TRIGGER)),
             TickOutcome::Ignored
         );
         assert_eq!(
-            group.on_trade_tick(tick(4, 13, 185_100)),
+            group.on_trade_tick(tick(4, 13, UP_TRIGGER)),
             TickOutcome::Ignored
         );
         assert_eq!(
@@ -838,10 +879,10 @@ mod tests {
     #[test]
     fn 곱버스가_먼저_확정되면_레버리지는_oco_취소된다() {
         let mut group = group();
-        group.on_trade_tick(tick(1, 11, 184_900));
-        group.on_trade_tick(tick(2, 12, 184_800));
-        group.on_trade_tick(tick(3, 13, 184_700));
-        let outcome = group.on_trade_tick(tick(4, 14, 184_900));
+        group.on_trade_tick(tick(1, 11, DOWN_TRIGGER));
+        group.on_trade_tick(tick(2, 12, DOWN_TRIGGER - 100));
+        group.on_trade_tick(tick(3, 13, DOWN_TRIGGER - 200));
+        let outcome = group.on_trade_tick(tick(4, 14, DOWN_TRIGGER));
         assert!(matches!(
             outcome,
             TickOutcome::Triggered(TriggeredScenario {
@@ -859,7 +900,7 @@ mod tests {
 
         // 승자 확정 뒤 반대 방향 틱이 와도 두 번째 승자는 생기지 않는다.
         assert_eq!(
-            group.on_trade_tick(tick(5, 20, 185_100)),
+            group.on_trade_tick(tick(5, 20, UP_TRIGGER)),
             TickOutcome::Ignored
         );
         assert_eq!(
@@ -871,7 +912,7 @@ mod tests {
     #[test]
     fn 교체는_모든_진행상태를_replaced로_종결한다() {
         let mut group = group();
-        group.on_trade_tick(tick(1, 11, 185_100));
+        group.on_trade_tick(tick(1, 11, UP_TRIGGER));
         assert!(group.replace());
         assert!(group.scenarios().iter().all(|state| {
             state.status == ScenarioStatus::Replaced
@@ -879,7 +920,7 @@ mod tests {
                 && state.confirming_ticks == 0
         }));
         assert_eq!(
-            group.on_trade_tick(tick(2, 12, 185_100)),
+            group.on_trade_tick(tick(2, 12, UP_TRIGGER)),
             TickOutcome::Ignored
         );
     }
@@ -887,12 +928,12 @@ mod tests {
     #[test]
     fn 만료_경계의_틱은_진입시키지_않는다() {
         let mut group = group();
-        group.on_trade_tick(tick(1, 300, 185_100));
-        group.on_trade_tick(tick(2, 306, 185_100));
-        group.on_trade_tick(tick(3, 307, 185_100));
+        group.on_trade_tick(tick(1, 300, UP_TRIGGER));
+        group.on_trade_tick(tick(2, 306, UP_TRIGGER));
+        group.on_trade_tick(tick(3, 307, UP_TRIGGER));
 
         assert_eq!(
-            group.on_trade_tick(tick(4, 310, 185_100)),
+            group.on_trade_tick(tick(4, 310, UP_TRIGGER)),
             TickOutcome::Expired
         );
         assert!(group
@@ -906,7 +947,7 @@ mod tests {
     #[test]
     fn 확인_표시시간은_삼초에서_고정한다() {
         let mut group = group();
-        group.on_trade_tick(tick(1, 11, 185_100));
+        group.on_trade_tick(tick(1, 11, UP_TRIGGER));
         assert_eq!(
             group.confirming_elapsed(ProductKind::Leverage, Duration::from_millis(12_500)),
             Duration::from_millis(1_500)
