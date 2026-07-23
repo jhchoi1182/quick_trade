@@ -14866,7 +14866,10 @@ mod tests {
             market_error: AtomicBool::new(false),
         });
         let engine = test_engine(Arc::clone(&broker) as Arc<dyn Broker>, Settings::default());
-        let now = engine.automation_now();
+        // 오늘이 금요일이면 단순 +1일은 주말이 되어 복구 경로가 아니라 주말 단락을
+        // 타므로, 연속된 평일인 목요일과 금요일로 테스트 시각을 고정한다.
+        let now = crate::util::kst_str_to_fake_epoch("20260723", "100000").unwrap();
+        engine.automation_now_override.store(now, Ordering::SeqCst);
         let date = market_date_info(now).unwrap().0;
         engine.automation.lock().unwrap().set_mode_after_cleanup(
             ControlMode::Auto,
