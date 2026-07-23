@@ -160,7 +160,7 @@ export interface AutomationScenario {
   rationaleKo?: string;
   status: ScenarioStatus;
   referenceObservedAt?: number | null;
-  terminalReason?: string | null;
+  terminalReason: string | null;
   confirmingElapsedMs?: number;
   confirmingTicks?: number;
 }

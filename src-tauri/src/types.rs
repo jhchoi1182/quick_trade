@@ -381,6 +381,7 @@ pub struct AutomationScenarioInfo {
     pub rationale_ko: String,
     pub reference_observed_at: Option<i64>,
     pub status: ScenarioStatus,
+    pub terminal_reason: Option<String>,
     pub confirming_ticks: u32,
     pub confirming_elapsed_ms: u64,
 }

@@ -4,7 +4,7 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 use crate::config;
-use crate::error::{AppError, AppResult};
+use crate::error::{AppError, AppResult, OrderRejection};
 use crate::kis::auth::TokenManager;
 use crate::types::Settings;
 
@@ -219,9 +219,12 @@ impl KisRest {
     /// 남기지 않되, POST 자체를 이 함수 안에서 다시 보내지는 않는다.
     fn classify_post_result(result: AppResult<Value>) -> AppResult<Value> {
         match result {
-            Err(AppError::Kis(message)) if is_rate_limit_error(&message) => Err(AppError::Order(
-                format!("KIS 게이트웨이 유량 제한으로 요청이 접수되지 않았습니다: {message}"),
-            )),
+            Err(AppError::Kis(message)) if is_rate_limit_error(&message) => {
+                Err(AppError::Order(OrderRejection::kis(
+                    Some("EGW00201".into()),
+                    format!("KIS 게이트웨이 유량 제한으로 요청이 접수되지 않았습니다: {message}"),
+                )))
+            }
             result => result,
         }
     }
@@ -289,7 +292,11 @@ mod tests {
             "HTTP 500 Internal Server Error: 초당 거래건수를 초과하였습니다.".into(),
         )))
         .unwrap_err();
-        assert!(matches!(rate_limited, AppError::Order(_)));
+        let rejection = rate_limited
+            .order_rejection()
+            .expect("유량 제한은 확정 미접수여야 한다");
+        assert_eq!(rejection.code(), Some("EGW00201"));
+        assert!(!rejection.is_buying_power_shortfall());
 
         let unknown = KisRest::classify_post_result(Err(AppError::Kis(
             "KIS 성공 응답에 주문번호가 없습니다".into(),

@@ -305,7 +305,7 @@ impl Broker for MockBroker {
             let s = m
                 .syms
                 .get(code)
-                .ok_or_else(|| AppError::Order(format!("데모에 없는 종목: {code}")))?;
+                .ok_or_else(|| AppError::Order(format!("데모에 없는 종목: {code}").into()))?;
             let tick = tick_size(s.price as u64, s.etf) as f64;
             let ask1 = s.price + tick;
             if (limit_price as f64) < ask1 {
@@ -352,7 +352,7 @@ impl Broker for MockBroker {
             let s = m
                 .syms
                 .get(code)
-                .ok_or_else(|| AppError::Order(format!("데모에 없는 종목: {code}")))?;
+                .ok_or_else(|| AppError::Order(format!("데모에 없는 종목: {code}").into()))?;
             let tick = tick_size(s.price as u64, s.etf) as f64;
             let fill_price = (s.price - tick).max(tick);
             let held = m.positions.get(code).map(|(q, _)| *q).unwrap_or(0);

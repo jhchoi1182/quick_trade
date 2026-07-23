@@ -7,9 +7,14 @@ interface AutomationState {
   loading: boolean;
   changing: boolean;
   hydrate: () => Promise<void>;
+  startPolling: () => void;
+  stopPolling: () => void;
   applySnapshot: (snapshot: AutomationSnapshot) => void;
   changeMode: (mode: ControlMode) => Promise<void>;
 }
+
+const AUTOMATION_POLL_INTERVAL_MS = 5_000;
+let automationPollTimer: ReturnType<typeof setInterval> | undefined;
 
 function keepNewest(current: AutomationSnapshot | null, next: AutomationSnapshot): AutomationSnapshot {
   if (!current) return next;
@@ -35,6 +40,20 @@ export const useAutomationStore = create<AutomationState>((set, get) => ({
     } finally {
       set({ loading: false });
     }
+  },
+  startPolling: () => {
+    if (automationPollTimer !== undefined) return;
+    automationPollTimer = setInterval(() => {
+      void get().hydrate().catch(() => {
+        // 이벤트가 기본 경로다. 일시 조회 실패는 마지막 snapshot을 유지하고
+        // 다음 폴링에서 다시 동기화한다.
+      });
+    }, AUTOMATION_POLL_INTERVAL_MS);
+  },
+  stopPolling: () => {
+    if (automationPollTimer === undefined) return;
+    clearInterval(automationPollTimer);
+    automationPollTimer = undefined;
   },
   applySnapshot: (snapshot) => {
     set((state) => ({ snapshot: keepNewest(state.snapshot, snapshot) }));

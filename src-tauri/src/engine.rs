@@ -19,7 +19,8 @@ use crate::automation::openai::{
     PROMPT_VERSION,
 };
 use crate::automation::runtime::{
-    AutomationRuntime, OwnedPosition, PendingAutoEntry, PersistedAutomation,
+    scenario_terminal_reason_ko, AutomationRuntime, OwnedPosition, PendingAutoEntry,
+    PersistedAutomation,
 };
 use crate::automation::schedule;
 use crate::automation::shadow::{
@@ -1043,20 +1044,6 @@ fn scenario_invalid_reason_ko(reason: ScenarioInvalidReason) -> &'static str {
         ScenarioInvalidReason::WrongPriceOrder => "셋업별 S·R·C·I 가격 순서 불일치",
         ScenarioInvalidReason::ConfirmationTooClose => "기준가와 확인가 사이 10bp 미만",
         ScenarioInvalidReason::InvalidTargetReturn => "목표수익률 범위 또는 0.1% 단위 불일치",
-    }
-}
-
-fn scenario_terminal_reason(status: crate::types::ScenarioStatus) -> Option<&'static str> {
-    match status {
-        crate::types::ScenarioStatus::Missed => {
-            Some("응답 적용 시 확인가를 이미 지나 추격 진입하지 않음")
-        }
-        crate::types::ScenarioStatus::Invalidated => Some("무효화가 침범"),
-        crate::types::ScenarioStatus::Expired => Some("다음 판단 슬롯 만료"),
-        crate::types::ScenarioStatus::Replaced => Some("새 LLM 판단으로 교체"),
-        crate::types::ScenarioStatus::CancelledByOco => Some("반대 시나리오 진입 확정"),
-        crate::types::ScenarioStatus::Invalid => Some("의미 검증 실패"),
-        _ => None,
     }
 }
 
@@ -4048,7 +4035,7 @@ impl Engine {
                     .then(|| now.saturating_sub((scenario.confirming_elapsed_ms / 1_000) as i64)),
                 confirmation_tick_count: scenario.confirming_ticks,
                 updated_at: now,
-                terminal_reason: scenario_terminal_reason(scenario.status),
+                terminal_reason: scenario_terminal_reason_ko(scenario.status),
                 reference_observed_at: scenario.reference_observed_at,
             })
             .collect();
@@ -4108,7 +4095,7 @@ impl Engine {
                     confirmation_started_at: None,
                     confirmation_tick_count: 0,
                     updated_at: now,
-                    terminal_reason: scenario_terminal_reason(seed.status).or(Some(reason)),
+                    terminal_reason: scenario_terminal_reason_ko(seed.status).or(Some(reason)),
                     reference_observed_at: seed.reference_observed_at,
                 }
             })
@@ -4192,6 +4179,108 @@ impl Engine {
                 "status": LedgerDecisionStatus::Replaced.as_str(),
             }),
         );
+        Ok(())
+    }
+
+    /// 모드 전환이 주문 actor를 선점한 시점의 OCO를 장부와 메모리에서 함께 종결한다.
+    ///
+    /// 트리거 전이면 활성 시나리오를 Replaced로 바꾸고, 트리거 직후이지만 주문
+    /// 복구 표식이 생기기 전이면 Triggered 사실은 보존하면서 미주문 사유를 남긴다.
+    /// 장부 갱신이 실패하면 메모리 그룹과 revision을 건드리지 않는다.
+    fn close_current_group_for_mode_transition(&self) -> Result<(), String> {
+        const ACTIVE_REASON: &str = "제어 모드 전환으로 폐기";
+        const TRIGGERED_REASON: &str = "제어 모드 전환으로 주문 전 진입 폐기";
+
+        let market_day = self.effective_market_day_state();
+        let settings = self.settings.read().unwrap();
+        let mut runtime = self.automation.lock().unwrap();
+        let snapshot = runtime.snapshot(
+            &self.runtime_id,
+            self.runtime_generation,
+            &settings.auto_symbols,
+            self.monotonic_now(),
+            market_day.status,
+            market_day.message,
+        );
+        if snapshot.scenarios.is_empty() {
+            return Ok(());
+        }
+        let decision_key = runtime
+            .decision_key()
+            .map(str::to_owned)
+            .ok_or_else(|| "모드 전환으로 종결할 OCO 판단 식별자가 없습니다".to_string())?;
+        let pre_dispatch_trigger = runtime.phase() == crate::types::AutomationPhase::EntryPending
+            && runtime.pending_entry().is_none()
+            && runtime.position().is_none();
+        let now = now_kst_fake_epoch();
+        let (decision_status, updates): (Option<LedgerDecisionStatus>, Vec<_>) =
+            if pre_dispatch_trigger {
+                (
+                    Some(LedgerDecisionStatus::Triggered),
+                    snapshot
+                        .scenarios
+                        .iter()
+                        .map(|scenario| ScenarioStatusUpdate {
+                            product: ledger_product(scenario.product),
+                            status: ledger_scenario_status(scenario.status),
+                            confirmation_started_at: None,
+                            confirmation_tick_count: 0,
+                            updated_at: now,
+                            terminal_reason: if scenario.status
+                                == crate::types::ScenarioStatus::Triggered
+                            {
+                                Some(TRIGGERED_REASON)
+                            } else {
+                                scenario_terminal_reason_ko(scenario.status)
+                            },
+                            reference_observed_at: scenario.reference_observed_at,
+                        })
+                        .collect(),
+                )
+            } else {
+                let updates: Vec<_> = snapshot
+                    .scenarios
+                    .iter()
+                    .filter(|scenario| {
+                        matches!(
+                            scenario.status,
+                            crate::types::ScenarioStatus::Armed
+                                | crate::types::ScenarioStatus::Confirming
+                        )
+                    })
+                    .map(|scenario| ScenarioStatusUpdate {
+                        product: ledger_product(scenario.product),
+                        status: LedgerScenarioStatus::Replaced,
+                        confirmation_started_at: None,
+                        confirmation_tick_count: 0,
+                        updated_at: now,
+                        terminal_reason: Some(ACTIVE_REASON),
+                        reference_observed_at: scenario.reference_observed_at,
+                    })
+                    .collect();
+                (
+                    (!updates.is_empty()).then_some(LedgerDecisionStatus::Replaced),
+                    updates,
+                )
+            };
+
+        if let Some(decision_status) = decision_status {
+            self.ledger
+                .update_decision_and_scenarios(&decision_key, Some(decision_status), None, &updates)
+                .map_err(|error| format!("모드 전환 OCO 장부 종결 실패: {error}"))?;
+        }
+        runtime.clear_group_for_mode_transition();
+        drop(runtime);
+        drop(settings);
+        if let Some(decision_status) = decision_status {
+            self.emit(
+                "llm-decision-recorded",
+                &serde_json::json!({
+                    "decisionId": decision_key,
+                    "status": decision_status.as_str(),
+                }),
+            );
+        }
         Ok(())
     }
 
@@ -4817,7 +4906,7 @@ impl Engine {
                     LedgerScenarioStatus::Replaced
                 };
                 let terminal_reason = if current_matches {
-                    scenario_terminal_reason(seed.status).map(str::to_owned)
+                    scenario_terminal_reason_ko(seed.status).map(str::to_owned)
                 } else {
                     discard_reason.clone()
                 };
@@ -5050,7 +5139,7 @@ impl Engine {
                 confirmation_started_at: None,
                 confirmation_tick_count: 0,
                 updated_at: final_accepted_at_epoch,
-                terminal_reason: scenario_terminal_reason(seed.status),
+                terminal_reason: scenario_terminal_reason_ko(seed.status),
                 reference_observed_at: seed.reference_observed_at,
             })
             .collect();
@@ -5207,11 +5296,18 @@ impl Engine {
             ControlMode::Auto => self.execute_real_entry(triggered).await,
             ControlMode::Shadow => self.execute_shadow_entry(triggered).await,
             ControlMode::Manual => {
-                self.automation
-                    .lock()
-                    .unwrap()
-                    .entry_failed("수동 모드로 전환되어 진입을 폐기했습니다");
-                self.emit_automation_state();
+                let changed = {
+                    let mut runtime = self.automation.lock().unwrap();
+                    if runtime.pending_matches(&triggered) {
+                        runtime.entry_failed("수동 모드로 전환되어 진입을 폐기했습니다");
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if changed {
+                    self.emit_automation_state();
+                }
             }
         }
     }
@@ -6409,7 +6505,7 @@ impl Engine {
                 }
                 (ack.order_no, ack.org_no)
             }
-            Err(error @ AppError::Order(_)) => {
+            Err(error) if error.is_confirmed_order_rejection() => {
                 // check_order_rt가 반환한 업무거부는 POST 결과가 확정됐으므로 같은
                 // 주문의 지연 체결 가능성이 없다. 이 경우에만 pending을 해제한다.
                 if let Err(ledger_error) = self.ledger.record_order_ack(
@@ -6920,7 +7016,7 @@ impl Engine {
                 (Some(ack.order_no), Some(ack.org_no), None)
             }
             Err(error) => {
-                if matches!(&error, AppError::Order(_)) {
+                if error.is_confirmed_order_rejection() {
                     let _ = self.ledger.record_order_ack(
                         &target_intent_id,
                         &OrderAcknowledgement {
@@ -7652,7 +7748,7 @@ impl Engine {
                 Err(error) => self.record_broker_error(
                     &cancel_intent,
                     &error.to_string(),
-                    !matches!(&error, AppError::Order(_)),
+                    !error.is_confirmed_order_rejection(),
                 ),
             }
             self.automation
@@ -7802,7 +7898,7 @@ impl Engine {
         let ack = match ack {
             Ok(ack) => ack,
             Err(error) => {
-                let confirmed_rejection = matches!(&error, AppError::Order(_));
+                let confirmed_rejection = error.is_confirmed_order_rejection();
                 let _ = self.ledger.record_order_ack(
                     &intent_id,
                     &OrderAcknowledgement {
@@ -8540,7 +8636,7 @@ impl Engine {
                     self.record_broker_error(
                         &intent_id,
                         &error.to_string(),
-                        !matches!(&error, AppError::Order(_)),
+                        !error.is_confirmed_order_rejection(),
                     );
                     tracing::warn!("{reason}: {} 취소 응답 오류: {error}", order.order_no);
                 }
@@ -8602,6 +8698,9 @@ impl Engine {
         self: &Arc<Self>,
         mode: ControlMode,
     ) -> Result<AutomationSnapshot, String> {
+        // 진행 중인 주문 actor가 종결된 뒤 현재 모드·OCO·주문 복구 표식을 다시 읽는다.
+        // 전환이 actor를 먼저 얻으면 아래 장부 종결과 revision 증가가 늦은 진입을 막는다.
+        let _actor = self.order_actor.lock().await;
         let current = self.automation.lock().unwrap().mode();
         let durable_handoff = self.pending_auto_handoff()?;
         if let Some(handoff) = durable_handoff.as_ref() {
@@ -8633,13 +8732,12 @@ impl Engine {
         {
             return Err("OpenAI API 키를 먼저 설정하세요".into());
         }
-        self.mark_current_group_replaced().map_err(|error| {
-            format!("기존 자동 시나리오 종결 실패로 모드를 유지합니다: {error}")
-        })?;
 
-        // 진행 중인 주문 actor가 종결된 뒤에만 모드를 바꿔 주문 소유권이 섞이지 않게 한다.
-        let _actor = self.order_actor.lock().await;
         if current == ControlMode::Shadow {
+            self.close_current_group_for_mode_transition()
+                .map_err(|error| {
+                    format!("기존 섀도 시나리오 종결 실패로 모드를 유지합니다: {error}")
+                })?;
             let update = self
                 .shadow
                 .lock()
@@ -8691,25 +8789,43 @@ impl Engine {
                 );
             }
 
-            match durable_handoff {
-                Some(ref handoff) if handoff.target_mode != mode => {
+            let created_handoff_marker = match durable_handoff.as_ref() {
+                Some(handoff) if handoff.target_mode != mode => {
                     return Err(format!(
                         "이미 {:?} 모드로 Auto 인계를 복구 중입니다",
                         handoff.target_mode
                     ));
                 }
-                Some(_) => {}
-                None => self
-                    .ledger
-                    .set_runtime_state(
-                        AUTO_HANDOFF_STATE_KEY,
-                        &PendingAutoHandoff {
-                            target_mode: mode,
-                            requested_at: now_kst_fake_epoch(),
-                        },
-                        now_kst_fake_epoch(),
+                Some(_) => false,
+                None => {
+                    self.ledger
+                        .set_runtime_state(
+                            AUTO_HANDOFF_STATE_KEY,
+                            &PendingAutoHandoff {
+                                target_mode: mode,
+                                requested_at: now_kst_fake_epoch(),
+                            },
+                            now_kst_fake_epoch(),
+                        )
+                        .map_err(|error| format!("Auto 인계 복구 표식 저장 실패: {error}"))?;
+                    true
+                }
+            };
+            if let Err(error) = self.close_current_group_for_mode_transition() {
+                let marker_cleanup_error = created_handoff_marker
+                    .then(|| {
+                        self.ledger
+                            .delete_runtime_state(AUTO_HANDOFF_STATE_KEY)
+                            .err()
+                    })
+                    .flatten();
+                return Err(if let Some(cleanup_error) = marker_cleanup_error {
+                    format!(
+                        "기존 Auto 시나리오 종결 실패로 모드를 유지하고, 인계 표식 삭제도 실패했습니다: {error}; {cleanup_error}"
                     )
-                    .map_err(|error| format!("Auto 인계 복구 표식 저장 실패: {error}"))?,
+                } else {
+                    format!("기존 Auto 시나리오 종결 실패로 모드를 유지합니다: {error}")
+                });
             }
             self.automation.lock().unwrap().mark_handoff();
             if let Err(error) = self.persist_automation_required() {
@@ -8778,7 +8894,7 @@ impl Engine {
                         Err(error) => self.record_broker_error(
                             &cancel_intent,
                             &error.to_string(),
-                            !matches!(&error, AppError::Order(_)),
+                            !error.is_confirmed_order_rejection(),
                         ),
                     }
                     // 미체결 목록 부재가 아니라 거래일·조직번호·주문 형태까지 일치하는
@@ -9359,7 +9475,7 @@ impl Engine {
                 }
             }
             Err(e) => {
-                let confirmed_rejection = matches!(&e, AppError::Order(_));
+                let confirmed_rejection = e.is_confirmed_order_rejection();
                 self.record_broker_error(&intent_id, &e.to_string(), !confirmed_rejection);
                 if !confirmed_rejection {
                     self.schedule_account_refresh();
@@ -9367,9 +9483,13 @@ impl Engine {
                         "주문 응답 불명확 — 재주문하지 않고 장부에 확인 대기로 기록했습니다: {e}"
                     ));
                 }
-                if is_rate_limit_error(&e.to_string()) {
-                    // 명시적 게이트웨이 미접수지만 금액 부족 거부는 아니므로
-                    // KIS 가능수량 조회나 두 번째 매수 POST로 이어가지 않는다.
+                if !e
+                    .order_rejection()
+                    .is_some_and(|rejection| rejection.is_buying_power_shortfall())
+                {
+                    // 매수가능수량 재조회·재주문은 KIS가 주문가능금액 부족/초과를
+                    // 명시한 경우에만 허용한다. 매매정지·가격 오류·유량 제한 같은
+                    // 다른 확정 거부는 원문을 그대로 노출하고 두 번째 POST를 막는다.
                     self.schedule_account_refresh();
                     return fail(e.to_string());
                 }
@@ -9382,8 +9502,8 @@ impl Engine {
         }
     }
 
-    /// 매수 거부 시 KIS 매수가능수량(미수없는매수수량)으로 1회 재주문.
-    /// 수량이 줄지 않으면 금액 부족이 원인이 아니므로 None을 돌려 원래 에러를 노출한다.
+    /// 주문가능금액 부족/초과 거부 시 KIS 매수가능수량(미수없는매수수량)으로 1회 재주문.
+    /// 수량이 줄지 않으면 None을 돌려 원래 에러를 노출한다.
     async fn retry_buy_with_psbl(
         &self,
         code: &str,
@@ -9447,7 +9567,7 @@ impl Engine {
                 self.record_broker_error(
                     &intent_id,
                     &e.to_string(),
-                    !matches!(&e, AppError::Order(_)),
+                    !e.is_confirmed_order_rejection(),
                 );
                 Some(fail(e.to_string()))
             }
@@ -9543,7 +9663,7 @@ impl Engine {
                 self.record_broker_error(
                     &intent_id,
                     &e.to_string(),
-                    !matches!(&e, AppError::Order(_)),
+                    !e.is_confirmed_order_rejection(),
                 );
                 self.schedule_account_refresh();
                 fail(e.to_string())
@@ -9723,7 +9843,7 @@ impl Engine {
                 self.record_broker_error(
                     &intent_id,
                     &e.to_string(),
-                    !matches!(&e, AppError::Order(_)),
+                    !e.is_confirmed_order_rejection(),
                 );
                 self.schedule_account_refresh();
                 let mut result = fail(e.to_string());
@@ -9806,7 +9926,7 @@ impl Engine {
                 self.record_broker_error(
                     &intent_id,
                     &e.to_string(),
-                    !matches!(&e, AppError::Order(_)),
+                    !e.is_confirmed_order_rejection(),
                 );
                 OrderResult {
                     ok: false,
@@ -9854,7 +9974,7 @@ impl Engine {
                 self.record_broker_error(
                     &intent_id,
                     &error.to_string(),
-                    !matches!(&error, AppError::Order(_)),
+                    !error.is_confirmed_order_rejection(),
                 );
                 Err(error.to_string())
             }
@@ -14107,6 +14227,134 @@ mod tests {
         drop(runtime);
         assert!(engine.shadow.lock().unwrap().is_none());
         assert_eq!(broker.post_calls.load(Ordering::SeqCst), 0);
+        let decisions = engine
+            .ledger
+            .list_decisions(&crate::ledger::DecisionQuery::default(), None, 10)
+            .unwrap();
+        let scenario = &decisions.items[0].scenarios[0];
+        assert_eq!(decisions.items[0].status, LedgerDecisionStatus::Triggered);
+        assert_eq!(scenario.status, LedgerScenarioStatus::Triggered);
+        assert_eq!(
+            scenario.terminal_reason.as_deref(),
+            Some("제어 모드 전환으로 주문 전 진입 폐기")
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_transition_wins_auto_trigger_race_before_broker_post() {
+        let broker = Arc::new(ShadowPostCountingBroker {
+            post_calls: AtomicUsize::new(0),
+        });
+        let engine = test_engine(Arc::clone(&broker) as Arc<dyn Broker>, Settings::default());
+        engine.account.write().unwrap().cash = 1_000_000;
+        seed_shadow_quotes(&engine, 10, 10);
+        let triggered = arm_auto_dual_trigger(&engine);
+
+        let actor = engine.order_actor.lock().await;
+        let transition_engine = Arc::clone(&engine);
+        let transition = tokio::spawn(async move {
+            transition_engine
+                .set_control_mode(ControlMode::Manual)
+                .await
+        });
+        tokio::task::yield_now().await;
+        let entry_engine = Arc::clone(&engine);
+        let entry = tokio::spawn(async move { entry_engine.execute_real_entry(triggered).await });
+        tokio::task::yield_now().await;
+        drop(actor);
+
+        transition.await.unwrap().unwrap();
+        entry.await.unwrap();
+        let runtime = engine.automation.lock().unwrap();
+        assert_eq!(runtime.mode(), ControlMode::Manual);
+        assert!(runtime.position().is_none());
+        assert!(runtime.pending_entry().is_none());
+        drop(runtime);
+        assert_eq!(broker.post_calls.load(Ordering::SeqCst), 0);
+
+        let decisions = engine
+            .ledger
+            .list_decisions(&crate::ledger::DecisionQuery::default(), None, 10)
+            .unwrap();
+        let decision = &decisions.items[0];
+        let winner = decision
+            .scenarios
+            .iter()
+            .find(|scenario| scenario.product == LedgerProductKind::Leverage)
+            .unwrap();
+        let loser = decision
+            .scenarios
+            .iter()
+            .find(|scenario| scenario.product == LedgerProductKind::Inverse)
+            .unwrap();
+        assert_eq!(decision.status, LedgerDecisionStatus::Triggered);
+        assert_eq!(winner.status, LedgerScenarioStatus::Triggered);
+        assert_eq!(
+            winner.terminal_reason.as_deref(),
+            Some("제어 모드 전환으로 주문 전 진입 폐기")
+        );
+        assert_eq!(loser.status, LedgerScenarioStatus::CancelledByOco);
+        assert_eq!(
+            loser.terminal_reason.as_deref(),
+            Some("반대 시나리오 진입 확정")
+        );
+    }
+
+    #[tokio::test]
+    async fn mode_transition_replaces_armed_scenario_with_audit_reason() {
+        let settings = Settings::default();
+        let engine = test_engine(Arc::new(MockBroker::new(&settings)), settings);
+        prepare_shadow_scenario(&engine);
+
+        engine.set_control_mode(ControlMode::Manual).await.unwrap();
+
+        let decisions = engine
+            .ledger
+            .list_decisions(&crate::ledger::DecisionQuery::default(), None, 10)
+            .unwrap();
+        let decision = &decisions.items[0];
+        assert_eq!(decision.status, LedgerDecisionStatus::Replaced);
+        assert_eq!(decision.scenarios[0].status, LedgerScenarioStatus::Replaced);
+        assert_eq!(
+            decision.scenarios[0].terminal_reason.as_deref(),
+            Some("제어 모드 전환으로 폐기")
+        );
+        let snapshot = engine.automation_snapshot();
+        assert_eq!(snapshot.mode, ControlMode::Manual);
+        assert_eq!(snapshot.phase, crate::types::AutomationPhase::Idle);
+        assert!(snapshot.scenarios.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_auto_entry_still_blocks_mode_transition() {
+        let broker = Arc::new(ShadowPostCountingBroker {
+            post_calls: AtomicUsize::new(0),
+        });
+        let engine = test_engine(Arc::clone(&broker) as Arc<dyn Broker>, Settings::default());
+        arm_auto_dual_trigger(&engine);
+        assert!(engine
+            .automation
+            .lock()
+            .unwrap()
+            .set_pending_entry(pending_entry("pending-intent", "pending-trade")));
+        let revision = engine.automation.lock().unwrap().revision();
+
+        let error = engine
+            .set_control_mode(ControlMode::Manual)
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("자동 진입 주문을 조정 중"));
+        let snapshot = engine.automation_snapshot();
+        assert_eq!(snapshot.mode, ControlMode::Auto);
+        assert_eq!(snapshot.phase, crate::types::AutomationPhase::EntryPending);
+        assert_eq!(snapshot.revision, revision);
+        assert!(snapshot
+            .scenarios
+            .iter()
+            .any(|scenario| scenario.status == crate::types::ScenarioStatus::Triggered));
+        assert!(engine.automation.lock().unwrap().pending_entry().is_some());
+        assert_eq!(broker.post_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -14995,6 +15243,7 @@ mod tests {
         psbl_qty: u64,
         reject_message: &'static str,
         buy_calls: AtomicUsize,
+        psbl_calls: AtomicUsize,
         last_order: Mutex<Option<(u64, u64)>>, // (qty, price)
     }
 
@@ -15008,6 +15257,7 @@ mod tests {
                 psbl_qty,
                 reject_message,
                 buy_calls: AtomicUsize::new(0),
+                psbl_calls: AtomicUsize::new(0),
                 last_order: Mutex::new(None),
             })
         }
@@ -15030,6 +15280,7 @@ mod tests {
             Err(AppError::Config("테스트에서 미사용".into()))
         }
         async fn max_buy_qty(&self, _code: &str, _limit_price: u64) -> AppResult<u64> {
+            self.psbl_calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.psbl_qty)
         }
         async fn place_buy(&self, _c: &str, qty: u64, price: u64, _i: bool) -> AppResult<OrderAck> {
@@ -15075,6 +15326,7 @@ mod tests {
         assert_eq!(result.qty, 90, "KIS가 계산한 수량으로 재주문해야 한다");
         assert_eq!(result.price, 10_400);
         assert_eq!(broker.buy_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(broker.psbl_calls.load(Ordering::SeqCst), 1);
         assert_eq!(*broker.last_order.lock().unwrap(), Some((90, 10_400)));
     }
 
@@ -15099,12 +15351,13 @@ mod tests {
             1,
             "재주문하면 안 된다"
         );
+        assert_eq!(broker.psbl_calls.load(Ordering::SeqCst), 1);
     }
 
-    /// 금액 부족이 원인이 아니면(수량이 줄지 않으면) 원래 에러를 그대로 노출한다
+    /// 자금 부족 거부여도 KIS 가능수량이 줄지 않으면 원래 거부를 그대로 노출한다
     #[tokio::test]
-    async fn rejected_buy_for_other_reason_keeps_original_error() {
-        let broker = RejectFirstBuyBroker::new(1_000); // 허용 수량이 주문 수량보다 크다
+    async fn rejected_buy_without_reduced_psbl_keeps_original_error() {
+        let broker = RejectFirstBuyBroker::new(1_000);
         let engine = test_engine(Arc::clone(&broker) as Arc<dyn Broker>, Settings::default());
         engine.refresh_account().await;
         seed_quote(&engine, 10_100.0);
@@ -15113,10 +15366,32 @@ mod tests {
 
         assert!(!result.ok);
         assert!(result.message.contains(REJECT_MSG), "{}", result.message);
+        assert_eq!(broker.buy_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(broker.psbl_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// 자금과 무관한 업무거부는 가능수량이 줄어도 조회·재주문하지 않는다
+    #[tokio::test]
+    async fn rejected_buy_for_other_reason_keeps_original_error() {
+        const HALT_MESSAGE: &str = "매매정지 종목입니다";
+        let broker = RejectFirstBuyBroker::with_message(90, HALT_MESSAGE);
+        let engine = test_engine(Arc::clone(&broker) as Arc<dyn Broker>, Settings::default());
+        engine.refresh_account().await;
+        seed_quote(&engine, 10_100.0);
+
+        let result = engine.buy_max("0193T0").await;
+
+        assert!(!result.ok);
+        assert!(result.message.contains(HALT_MESSAGE), "{}", result.message);
         assert_eq!(
             broker.buy_calls.load(Ordering::SeqCst),
             1,
             "재주문하면 안 된다"
+        );
+        assert_eq!(
+            broker.psbl_calls.load(Ordering::SeqCst),
+            0,
+            "자금 부족 거부가 아니면 KIS 가능수량도 조회하면 안 된다"
         );
     }
 
@@ -15138,6 +15413,11 @@ mod tests {
             broker.buy_calls.load(Ordering::SeqCst),
             1,
             "유량 제한 뒤 매수 POST를 다시 보내면 안 된다"
+        );
+        assert_eq!(
+            broker.psbl_calls.load(Ordering::SeqCst),
+            0,
+            "유량 제한 뒤 매수가능수량을 조회하면 안 된다"
         );
     }
 

@@ -70,6 +70,14 @@ export default function App() {
     ]);
   }, [hydrateAutomation, settingsReady]);
 
+  // automation-state 이벤트가 기본 갱신 경로이며, 5초 조회는 이벤트 누락을 복구한다.
+  useEffect(() => {
+    if (!settingsReady) return;
+    const automation = useAutomationStore.getState();
+    automation.startPolling();
+    return () => automation.stopPolling();
+  }, [settingsReady]);
+
   if (!settingsReady) {
     return <div className="app loading">불러오는 중…</div>;
   }

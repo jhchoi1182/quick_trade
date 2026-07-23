@@ -107,6 +107,18 @@ fn decision_status_for_group(group: &OcoGroup) -> AutomationDecisionStatus {
     AutomationDecisionStatus::Replaced
 }
 
+pub(crate) fn scenario_terminal_reason_ko(status: ScenarioStatus) -> Option<&'static str> {
+    match status {
+        ScenarioStatus::Missed => Some("응답 적용 시 확인가를 이미 지나 추격 진입하지 않음"),
+        ScenarioStatus::Invalidated => Some("무효화가 침범"),
+        ScenarioStatus::Expired => Some("다음 판단 슬롯 만료"),
+        ScenarioStatus::Replaced => Some("새 LLM 판단으로 교체"),
+        ScenarioStatus::CancelledByOco => Some("반대 시나리오 진입 확정"),
+        ScenarioStatus::Invalid => Some("의미 검증 실패"),
+        _ => None,
+    }
+}
+
 /// 실전 Auto 진입 POST 전부터 목표 주문의 소유권이 확정될 때까지 유지하는 복구 표식.
 /// 주문 세부값은 장부의 `orders`가 소스 오브 트루스이며, 여기에는 계좌 수량 귀속과
 /// 목표 주문 재구성에 꼭 필요한 값만 중복 저장한다.
@@ -526,6 +538,24 @@ impl AutomationRuntime {
         self.replace_group();
         self.phase = AutomationPhase::Handoff;
         self.revision = self.revision.saturating_add(1);
+    }
+
+    /// 제어 모드 전환이 주문 actor를 선점한 뒤 OCO 실행권을 폐기한다.
+    ///
+    /// 호출자는 먼저 같은 그룹의 장부 종결을 성공시켜야 한다. 그룹 제거와 revision
+    /// 증가는 늦게 깨어난 트리거 태스크가 새 모드에서 진입을 커밋하지 못하게 한다.
+    pub fn clear_group_for_mode_transition(&mut self) -> bool {
+        if self.group.is_none() {
+            return false;
+        }
+        self.replace_group();
+        self.phase = if self.position.is_some() {
+            AutomationPhase::Holding
+        } else {
+            AutomationPhase::Idle
+        };
+        self.revision = self.revision.saturating_add(1);
+        true
     }
 
     /// 수동 인계가 중간에 실패하면 Auto 소유권을 유지한다. 포지션이 남아 있으면
@@ -956,6 +986,8 @@ impl AutomationRuntime {
                         rationale_ko: state.scenario.rationale_ko.clone(),
                         reference_observed_at: state.reference_observed_at,
                         status: state.status,
+                        terminal_reason: scenario_terminal_reason_ko(state.status)
+                            .map(str::to_owned),
                         confirming_ticks: u32::from(state.confirming_ticks),
                         confirming_elapsed_ms: group
                             .confirming_elapsed(state.scenario.product, now)
@@ -1246,6 +1278,40 @@ mod tests {
         assert_eq!(scenario.invalidation_price, 185_400);
         assert_eq!(scenario.reference_observed_at, Some(999));
         assert_eq!(scenario.rationale_ko, "반복 저항 시험과 거래량 감소");
+        assert_eq!(
+            scenario.terminal_reason.as_deref(),
+            Some("응답 적용 시 확인가를 이미 지나 추격 진입하지 않음")
+        );
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(
+            json["scenarios"][0]["terminalReason"],
+            "응답 적용 시 확인가를 이미 지나 추격 진입하지 않음"
+        );
+    }
+
+    #[test]
+    fn 시나리오_종료사유는_실시간과_장부가_공통_문구를_사용한다() {
+        let cases = [
+            (
+                ScenarioStatus::Missed,
+                "응답 적용 시 확인가를 이미 지나 추격 진입하지 않음",
+            ),
+            (ScenarioStatus::Invalidated, "무효화가 침범"),
+            (ScenarioStatus::Expired, "다음 판단 슬롯 만료"),
+            (ScenarioStatus::Replaced, "새 LLM 판단으로 교체"),
+            (ScenarioStatus::CancelledByOco, "반대 시나리오 진입 확정"),
+            (ScenarioStatus::Invalid, "의미 검증 실패"),
+        ];
+        for (status, expected) in cases {
+            assert_eq!(scenario_terminal_reason_ko(status), Some(expected));
+        }
+        for status in [
+            ScenarioStatus::Armed,
+            ScenarioStatus::Confirming,
+            ScenarioStatus::Triggered,
+        ] {
+            assert_eq!(scenario_terminal_reason_ko(status), None);
+        }
     }
 
     #[test]

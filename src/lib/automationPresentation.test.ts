@@ -27,6 +27,7 @@ describe("전문 스캘퍼 판단 표시", () => {
       triggerPrice: 184_900,
       targetReturnPct: 0.3,
       status: "armed" as const,
+      terminalReason: null,
     };
     expect(formatLiveScenarioProgress(base)).toBe("기준선 시험 대기");
     expect(formatLiveScenarioProgress({ ...base, referenceObservedAt: 1_000 }))

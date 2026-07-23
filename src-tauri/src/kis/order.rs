@@ -1,5 +1,5 @@
 use crate::broker::OrderAck;
-use crate::error::{AppError, AppResult};
+use crate::error::{AppError, AppResult, OrderRejection};
 use crate::kis::rest::KisRest;
 use crate::types::Side;
 
@@ -30,13 +30,17 @@ fn check_order_rt(v: &serde_json::Value) -> AppResult<()> {
     if v["rt_cd"].as_str() == Some("0") {
         Ok(())
     } else {
-        Err(AppError::Order(
-            v["msg1"]
-                .as_str()
-                .unwrap_or("알 수 없는 KIS 주문 거부")
-                .trim()
-                .to_string(),
-        ))
+        let code = v["msg_cd"]
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        let message = v["msg1"]
+            .as_str()
+            .unwrap_or("알 수 없는 KIS 주문 거부")
+            .trim()
+            .to_string();
+        Err(AppError::Order(OrderRejection::kis(code, message)))
     }
 }
 
@@ -130,9 +134,17 @@ mod tests {
 
     #[test]
     fn 주문_업무거부만_확정거부로_분류한다() {
-        let error = check_order_rt(&json!({ "rt_cd": "1", "msg1": "주문 불가" }))
-            .expect_err("업무 거부여야 한다");
-        assert!(matches!(error, AppError::Order(_)));
+        let error = check_order_rt(&json!({
+            "rt_cd": "1",
+            "msg_cd": "APBK1234",
+            "msg1": "주문 불가"
+        }))
+        .expect_err("업무 거부여야 한다");
+        let rejection = error
+            .order_rejection()
+            .expect("구조화된 주문 거부여야 한다");
+        assert_eq!(rejection.code(), Some("APBK1234"));
+        assert_eq!(rejection.message(), "주문 불가");
     }
 
     #[test]
