@@ -1,6 +1,14 @@
 import { useEffect } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { AccountSnapshot, AutomationSnapshot, ConnEvent, FillEvent, Quote, Reservation } from "../types";
+import type {
+  AccountSnapshot,
+  AutomationSnapshot,
+  ConnEvent,
+  FillEvent,
+  Quote,
+  Reservation,
+  RuntimeResyncResult,
+} from "../types";
 import { useMarketStore } from "../stores/marketStore";
 import { useAccountStore } from "../stores/accountStore";
 import { useUiStore } from "../stores/uiStore";
@@ -40,6 +48,15 @@ export function useTauriEvents(): void {
       }),
       listen<AutomationSnapshot>("automation-state", (e) => {
         useAutomationStore.getState().applySnapshot(e.payload);
+      }),
+      listen<RuntimeResyncResult>("runtime-reset", (e) => {
+        // 새 엔진 세대의 계좌·자동 상태를 한 번에 설치하고, 이전 피드에서 남은
+        // 시세/차트/예약 캐시는 폐기한다. 설정과 UI 선택값은 그대로 유지한다.
+        useMarketStore.getState().resetRuntimeCache();
+        useAccountStore.getState().applySnapshot(e.payload.account);
+        useReservationStore.getState().hydrate([]);
+        useAutomationStore.getState().applySnapshot(e.payload.automation);
+        useUiStore.getState().bumpHistoryRevision();
       }),
       listen<unknown>("trade-recorded", () => {
         useUiStore.getState().bumpHistoryRevision();

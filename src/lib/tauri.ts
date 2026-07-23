@@ -9,6 +9,7 @@ import type {
   LlmDecisionRecord,
   OrderResult,
   Reservation,
+  RuntimeResyncResult,
   Settings,
   TradeRecord,
   TradeRecordKind,
@@ -56,6 +57,10 @@ export function getAutomationStatus(): Promise<AutomationSnapshot> {
 
 export function setControlMode(mode: ControlMode): Promise<AutomationSnapshot> {
   return invoke<AutomationSnapshot>("set_control_mode", { mode });
+}
+
+export function resetRuntimeAndResync(): Promise<RuntimeResyncResult> {
+  return invoke<RuntimeResyncResult>("reset_runtime_and_resync");
 }
 
 function normalizePage<T>(value: CursorPage<T> | T[]): CursorPage<T> {

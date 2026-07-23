@@ -1,6 +1,7 @@
 use std::sync::Arc;
+use std::time::Duration;
 
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, State};
 
 use crate::config;
 use crate::engine::{self, Engine};
@@ -10,7 +11,7 @@ use crate::ledger::{
 use crate::state::AppState;
 use crate::types::{
     AccountSnapshot, AutoSymbols, AutomationSnapshot, Candle, ControlMode, OrderResult,
-    ReservationInfo, Settings, SymbolConfig,
+    ReservationInfo, RuntimeResyncResult, Settings, SymbolConfig,
 };
 
 /// 브로커 연결·구독에 영향을 주는 필드가 바뀐 경우에만 엔진을 재시작한다.
@@ -151,6 +152,48 @@ pub async fn set_control_mode(
 ) -> Result<AutomationSnapshot, String> {
     let engine = engine_of(&state).await?;
     engine.set_control_mode(mode).await
+}
+
+/// 과거 런타임 소유권을 폐기하고 KIS 현재 계좌를 원장으로 새 수동 엔진을 만든다.
+///
+/// 설정·토큰·거래/주문 기록은 보존한다. 실제 미체결이 있으면 엔진 유무와 관계없이
+/// 초기화 전에 거부하므로, 주문을 고아로 만든 채 수동 모드가 되는 경로는 없다.
+#[tauri::command]
+pub async fn reset_runtime_and_resync(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<RuntimeResyncResult, String> {
+    let settings = state.settings.read().unwrap().clone();
+    let mut guard = state.engine.lock().await;
+    if let Some(handle) = guard.as_ref() {
+        handle.engine.reset_runtime_for_resync().await?;
+    } else {
+        // 저장된 Auto 인계 복구 실패로 엔진 시작 자체가 안 된 경우에도 설정에서
+        // 읽기 전용 KIS 검증을 거쳐 복구할 수 있어야 한다.
+        engine::reset_runtime_without_engine(&settings, &state.ledger).await?;
+    }
+
+    // 기존 피드·스케줄러를 먼저 중단한다. 인스턴스별 REST 리미터가 교체되는
+    // 경계에서도 KIS 호출 간격이 붙지 않도록 한 칸 여유를 둔다.
+    guard.take();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    match engine::start(app.clone(), settings, Arc::clone(&state.ledger)).await {
+        Ok(handle) => {
+            let result = RuntimeResyncResult {
+                account: handle.engine.account_snapshot(),
+                automation: handle.engine.automation_snapshot(),
+            };
+            *guard = Some(handle);
+            if let Err(error) = app.emit("runtime-reset", &result) {
+                tracing::warn!("런타임 초기화 이벤트 전송 실패: {error}");
+            }
+            Ok(result)
+        }
+        Err(error) => Err(format!(
+            "런타임 상태는 수동으로 초기화했지만 엔진 재시작에 실패했습니다. 설정을 확인한 뒤 다시 시도하거나 앱을 재시작하세요: {error}"
+        )),
+    }
 }
 
 #[tauri::command]

@@ -65,6 +65,7 @@ pub fn run() {
             commands::get_reservations,
             commands::get_automation_status,
             commands::set_control_mode,
+            commands::reset_runtime_and_resync,
             commands::list_trade_records,
             commands::list_llm_decisions,
         ])

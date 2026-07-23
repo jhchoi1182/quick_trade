@@ -284,6 +284,77 @@ impl Drop for EngineHandle {
     }
 }
 
+fn active_open_order_summary(orders: &[crate::broker::BrokerOpenOrder]) -> Option<String> {
+    let active: Vec<_> = orders
+        .iter()
+        .filter(|order| order.cancelable_qty > 0 || order.filled_qty < order.ordered_qty)
+        .collect();
+    if active.is_empty() {
+        return None;
+    }
+    let examples = active
+        .iter()
+        .take(3)
+        .map(|order| {
+            let remaining = order
+                .cancelable_qty
+                .max(order.ordered_qty.saturating_sub(order.filled_qty));
+            format!(
+                "{} {}/{} {}주",
+                order.code, order.org_no, order.order_no, remaining
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "KIS 미체결 주문 {}건이 남아 있어 초기화하지 않았습니다. 먼저 주문을 취소·체결한 뒤 다시 시도하세요: {examples}",
+        active.len()
+    ))
+}
+
+/// 강제 재동기화는 과거 장부의 비종결 표식 대신 현재 KIS 계좌를 원장으로 삼는다.
+/// 그 전에 잔고·미체결을 두 번 연속 조회해 실제로 체결 가능한 주문이 남아 있지
+/// 않은지 확인한다. 조회 실패나 미체결 존재는 모두 초기화 거부로 처리한다.
+async fn verify_runtime_resync_safe(broker: &dyn Broker) -> Result<AccountSnapshot, String> {
+    let _ = broker
+        .account()
+        .await
+        .map_err(|error| format!("초기화 전 KIS 잔고 조회 실패: {error}"))?;
+    let first_orders = broker
+        .open_orders()
+        .await
+        .map_err(|error| format!("초기화 전 KIS 미체결 조회 실패: {error}"))?;
+    if let Some(message) = active_open_order_summary(&first_orders) {
+        return Err(message);
+    }
+
+    let account = broker
+        .account()
+        .await
+        .map_err(|error| format!("초기화 직전 KIS 최종 잔고 조회 실패: {error}"))?;
+    let final_orders = broker
+        .open_orders()
+        .await
+        .map_err(|error| format!("초기화 직전 KIS 최종 미체결 조회 실패: {error}"))?;
+    if let Some(message) = active_open_order_summary(&final_orders) {
+        return Err(message);
+    }
+    Ok(account)
+}
+
+/// 저장된 자동 인계 상태 때문에 엔진 시작 자체가 실패한 경우의 복구 경로.
+/// 임시 브로커는 읽기 조회만 수행하며 주문 POST를 노출하지 않는다.
+pub async fn reset_runtime_without_engine(
+    settings: &Settings,
+    ledger: &Ledger,
+) -> Result<(), String> {
+    let broker = KisBroker::new(settings).map_err(|error| error.to_string())?;
+    verify_runtime_resync_safe(&broker).await?;
+    ledger
+        .reset_runtime_state_to_manual(now_kst_fake_epoch())
+        .map_err(|error| format!("런타임 상태 초기화 실패: {error}"))
+}
+
 pub async fn start(
     app: AppHandle,
     settings: Settings,
@@ -7802,6 +7873,42 @@ impl Engine {
         Ok(self.automation_snapshot())
     }
 
+    /// KIS의 현재 잔고를 기준으로 자동매매 소유권·인계 표식·메모리 캐시를 버리고
+    /// 수동 Idle로 되돌린다. 거래·주문 기록과 설정, KIS 토큰 파일은 보존한다.
+    ///
+    /// 실제 미체결 주문이 있으면 소유권을 버릴 수 없으므로 아무 상태도 바꾸지 않고
+    /// 거부한다. 호출자는 성공 직후 이 엔진을 내려 새 피드로 다시 시작해야 한다.
+    pub async fn reset_runtime_for_resync(&self) -> Result<(), String> {
+        // 진행 중인 주문 actor가 끝난 뒤 검증부터 초기화까지 독점해, 조회와 상태
+        // 폐기 사이에 이 앱이 새 주문을 제출하는 경계를 없앤다.
+        let _actor = self.order_actor.lock().await;
+        let account = verify_runtime_resync_safe(self.broker.as_ref()).await?;
+        self.ledger
+            .reset_runtime_state_to_manual(now_kst_fake_epoch())
+            .map_err(|error| format!("런타임 상태 초기화 실패: {error}"))?;
+
+        *self.automation.lock().unwrap() =
+            AutomationRuntime::new(PersistedAutomation::default(), None);
+        *self.shadow.lock().unwrap() = None;
+        self.quotes.write().unwrap().clear();
+        self.reservations.write().unwrap().clear();
+        self.stop_loss_lock.lock().unwrap().clear();
+        self.fill_reconcile_pending.lock().unwrap().clear();
+        self.auto_flatten_pending.store(false, Ordering::SeqCst);
+        self.entry_reconcile_pending.store(false, Ordering::SeqCst);
+        self.exit_reconcile_pending.store(false, Ordering::SeqCst);
+        self.refresh_pending.store(false, Ordering::SeqCst);
+        self.connected.store(false, Ordering::SeqCst);
+        *self.account.write().unwrap() = account.clone();
+        self.account_gen.fetch_add(1, Ordering::SeqCst);
+        self.account_refreshed_gen
+            .store(self.account_gen.load(Ordering::SeqCst), Ordering::SeqCst);
+        self.market_history.mark_all_gapped().await;
+        self.emit("account", &account);
+        self.emit_automation_state();
+        Ok(())
+    }
+
     /// 브로커 재시작이 필요 없는 설정 변경(테마·차트 주기 등)을 반영
     pub fn update_settings(&self, new: Settings) {
         *self.settings.write().unwrap() = new;
@@ -8771,6 +8878,82 @@ mod tests {
             .expect("OpenAI 태스크 시작 전 저장된 런타임");
         assert_eq!(saved.automation.last_decision_slot, Some(slot));
         assert_eq!(saved.automation.next_decision_at, next);
+    }
+
+    #[tokio::test]
+    async fn 런타임_재동기화는_수동_idle과_빈_캐시로_되돌린다() {
+        let settings = Settings::default();
+        let engine = test_engine(Arc::new(MockBroker::new(&settings)), settings);
+        let now = test_automation_now();
+        engine.automation.lock().unwrap().set_mode_after_cleanup(
+            ControlMode::Auto,
+            Some(now),
+            None,
+        );
+        engine.persist_automation_required().unwrap();
+        engine
+            .ledger
+            .set_runtime_state(
+                AUTO_HANDOFF_STATE_KEY,
+                &PendingAutoHandoff {
+                    target_mode: ControlMode::Manual,
+                    requested_at: now,
+                },
+                now,
+            )
+            .unwrap();
+        engine
+            .ledger
+            .set_runtime_state(
+                "manual_trade:0193T0",
+                &serde_json::json!({ "stale": true }),
+                now,
+            )
+            .unwrap();
+        seed_quote(&engine, 10_005.0);
+
+        engine.reset_runtime_for_resync().await.unwrap();
+
+        let runtime = engine.automation.lock().unwrap();
+        assert_eq!(runtime.mode(), ControlMode::Manual);
+        assert_eq!(runtime.phase(), crate::types::AutomationPhase::Idle);
+        assert!(runtime.position().is_none());
+        drop(runtime);
+        assert!(engine.quotes.read().unwrap().is_empty());
+        assert_eq!(
+            engine.ledger.get_control_mode().unwrap(),
+            Some(LedgerControlMode::Manual)
+        );
+        assert!(engine
+            .ledger
+            .get_runtime_state::<PendingAutoHandoff>(AUTO_HANDOFF_STATE_KEY)
+            .unwrap()
+            .is_none());
+        assert!(engine
+            .ledger
+            .get_runtime_state::<serde_json::Value>("manual_trade:0193T0")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn 런타임_재동기화는_실제_미체결_주문을_표시하고_거부한다() {
+        let message = active_open_order_summary(&[BrokerOpenOrder {
+            order_no: "0014024200".into(),
+            original_order_no: String::new(),
+            org_no: "12345".into(),
+            code: "0193T0".into(),
+            side: Side::Sell,
+            ordered_qty: 10,
+            filled_qty: 0,
+            cancelable_qty: 10,
+            price: 10_500.0,
+            ordered_at: test_automation_now(),
+        }])
+        .expect("미체결 주문 안내");
+
+        assert!(message.contains("미체결 주문 1건"));
+        assert!(message.contains("0193T0 12345/0014024200 10주"));
     }
 
     fn seed_shadow_quotes(engine: &Engine, entry_ask_qty: u64, exit_bid_qty: u64) {

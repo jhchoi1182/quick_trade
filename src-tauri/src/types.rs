@@ -372,6 +372,14 @@ pub struct AutomationSnapshot {
     pub market_day_message: Option<String>,
 }
 
+/// 런타임 초기화 뒤 새 엔진이 KIS에서 다시 읽은 기준 상태.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeResyncResult {
+    pub account: AccountSnapshot,
+    pub automation: AutomationSnapshot,
+}
+
 /// 예약 매도 상태 — 프론트로 emit("reservation") + get_reservations 반환에 사용.
 /// (원주문번호 등 내부 식별자는 엔진 메모리에만 두고 프론트로 보내지 않는다)
 #[derive(Debug, Clone, Serialize)]

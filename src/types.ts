@@ -174,6 +174,12 @@ export interface AutomationSnapshot {
   marketDayMessage?: string | null;
 }
 
+/** 런타임 초기화 뒤 새 엔진이 KIS에서 다시 읽은 기준 상태 */
+export interface RuntimeResyncResult {
+  account: AccountSnapshot;
+  automation: AutomationSnapshot;
+}
+
 export type TradeRecordKind = "real" | "shadow";
 export type TradeOrigin = "manual" | "auto" | "auto_handoff" | "shadow" | "external";
 

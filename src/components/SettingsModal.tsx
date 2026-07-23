@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import type { Settings, SymbolConfig, ThemeName } from "../types";
+import { resetRuntimeAndResync } from "../lib/tauri";
 import { useSettingsStore } from "../stores/settingsStore";
 import { useUiStore } from "../stores/uiStore";
 
@@ -60,9 +61,14 @@ export function SettingsModal() {
 
   const [draft, setDraft] = useState<Settings | null>(null);
   const [saving, setSaving] = useState(false);
+  const [resetConfirm, setResetConfirm] = useState(false);
+  const [resetting, setResetting] = useState(false);
 
   useEffect(() => {
-    if (open && settings) setDraft(structuredClone(settings));
+    if (open && settings) {
+      setDraft(structuredClone(settings));
+      setResetConfirm(false);
+    }
   }, [open, settings]);
 
   if (!open || !draft) return null;
@@ -105,6 +111,19 @@ export function SettingsModal() {
       pushToast("error", String(e));
     } finally {
       setSaving(false);
+    }
+  };
+
+  const onResetRuntime = async () => {
+    setResetting(true);
+    try {
+      await resetRuntimeAndResync();
+      setResetConfirm(false);
+      pushToast("success", "런타임 초기화 및 KIS 재동기화 완료");
+    } catch (e) {
+      pushToast("error", `재동기화 실패: ${String(e)}`);
+    } finally {
+      setResetting(false);
     }
   };
 
@@ -231,12 +250,47 @@ export function SettingsModal() {
             </div>
             <div className="form-hint">SOR: KRX/NXT 중 유리한 호가로 자동 라우팅</div>
           </div>
+
+          <div className="form-section recovery-section">
+            <div className="form-section-title">상태 복구</div>
+            <div className="form-hint">
+              자동매매·수동 인계·시세·잔고·차트 캐시를 버리고 KIS 현재 계좌 기준의 수동 모드로 다시 시작합니다.
+              설정, KIS 토큰, 거래·주문 기록은 보존됩니다.
+            </div>
+            {resetConfirm ? (
+              <div className="recovery-confirm">
+                <div>
+                  실제 미체결 주문이 있으면 실행이 거부됩니다. 이전 자동매매 소유권은 복구할 수 없게 폐기됩니다.
+                </div>
+                <div className="recovery-actions">
+                  <button disabled={resetting} onClick={() => setResetConfirm(false)}>
+                    돌아가기
+                  </button>
+                  <button
+                    className="btn-danger"
+                    disabled={resetting}
+                    onClick={() => void onResetRuntime()}
+                  >
+                    {resetting ? "재동기화 중…" : "초기화 실행"}
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <button
+                className="btn-danger-outline"
+                disabled={saving || resetting}
+                onClick={() => setResetConfirm(true)}
+              >
+                런타임 초기화 및 재동기화
+              </button>
+            )}
+          </div>
         </div>
         <div className="modal-actions">
-          <button className="btn-cancel" onClick={() => setOpen(false)}>
+          <button className="btn-cancel" disabled={resetting} onClick={() => setOpen(false)}>
             취소
           </button>
-          <button className="btn-save" disabled={saving} onClick={() => void onSave()}>
+          <button className="btn-save" disabled={saving || resetting} onClick={() => void onSave()}>
             저장
           </button>
         </div>

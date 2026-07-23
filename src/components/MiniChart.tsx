@@ -51,6 +51,7 @@ export function MiniChart() {
   const interval = useSettingsStore((s) => s.settings?.chartInterval ?? 10);
   const setChartInterval = useSettingsStore((s) => s.setChartInterval);
   const theme = useSettingsStore((s) => s.settings?.theme ?? "default");
+  const cacheGeneration = useMarketStore((s) => s.cacheGeneration);
   const palette = chartColors(theme);
   // 캐시가 전혀 없는 종목을 로드하는 동안 표시 (첫 백필은 수 초 걸릴 수 있음)
   const [loading, setLoading] = useState(false);
@@ -68,6 +69,17 @@ export function MiniChart() {
       prev = state.connected;
     });
   }, []);
+
+  // 설정의 강제 재동기화는 새 엔진 세대의 백필을 받아야 하므로 연결 상태와
+  // 무관하게 화면 데이터와 종목별 1분봉 캐시를 모두 비운다.
+  useEffect(() => {
+    oneMinCacheRef.current = new Map();
+    barsRef.current = [];
+    renderedCodeRef.current = null;
+    candleSeriesRef.current?.setData([]);
+    volumeSeriesRef.current?.setData([]);
+    for (const series of maSeriesRef.current.values()) series.setData([]);
+  }, [cacheGeneration]);
 
   useEffect(() => {
     const el = containerRef.current;
@@ -224,7 +236,7 @@ export function MiniChart() {
     return () => {
       cancelled = true;
     };
-  }, [chartCode, interval, reloadKey]);
+  }, [cacheGeneration, chartCode, interval, reloadKey]);
 
   // 실시간 체결 틱 → 마지막 봉/이동평균 갱신
   useEffect(() => {

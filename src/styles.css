@@ -712,6 +712,63 @@ body {
 
 .row-add:hover { color: var(--text); border-color: var(--text-dim); }
 
+.recovery-section {
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.btn-danger-outline {
+  border: 1px solid var(--up);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--up);
+  padding: 6px 8px;
+  font-size: 10px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.recovery-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 7px;
+  border: 1px solid var(--up);
+  border-radius: 5px;
+  color: var(--up);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.recovery-actions {
+  display: flex;
+  gap: 5px;
+}
+
+.recovery-actions button {
+  flex: 1;
+  padding: 5px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: #3d4455;
+  color: var(--text);
+  font-size: 10px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.recovery-actions .btn-danger {
+  border-color: var(--up);
+  background: var(--up);
+  color: #fff;
+}
+
+.btn-danger-outline:disabled,
+.recovery-actions button:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
 .modal-actions {
   display: flex;
   gap: 6px;

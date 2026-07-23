@@ -589,6 +589,51 @@ impl Ledger {
         Ok(())
     }
 
+    /// 거래·주문 기록은 보존하면서 복구 불가능한 실행 상태만 수동 모드로 초기화한다.
+    ///
+    /// 활성 자동/섀도 세션과 그 세션의 열린 거래는 중단으로 표시해 기록 화면에서
+    /// 정상 종료처럼 보이지 않게 한다. 런타임 캐시 삭제와 수동 모드 저장은 한
+    /// 트랜잭션으로 묶어 앱이 중간에 종료돼도 Auto 상태가 되살아나지 않는다.
+    pub fn reset_runtime_state_to_manual(&self, reset_at: i64) -> LedgerResult<()> {
+        let mode_json = serde_json::to_string(&LedgerControlMode::Manual)?;
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE trades
+                SET status = ?1,
+                    exit_reason = COALESCE(exit_reason, 'runtime_reset'),
+                    updated_at = ?2
+              WHERE status = ?3
+                AND session_id IN (
+                    SELECT session_id FROM sessions WHERE status = ?4
+                )",
+            params![
+                LedgerTradeStatus::Interrupted,
+                reset_at,
+                LedgerTradeStatus::Open,
+                LedgerSessionStatus::Active,
+            ],
+        )?;
+        tx.execute(
+            "UPDATE sessions
+                SET status = ?1, ended_at = ?2
+              WHERE status = ?3",
+            params![
+                LedgerSessionStatus::Interrupted,
+                reset_at,
+                LedgerSessionStatus::Active,
+            ],
+        )?;
+        tx.execute("DELETE FROM runtime_state", [])?;
+        tx.execute(
+            "INSERT INTO runtime_state(key, value_json, updated_at)
+             VALUES (?1, ?2, ?3)",
+            params![CONTROL_MODE_KEY, mode_json, reset_at],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn set_control_mode(&self, mode: LedgerControlMode, updated_at: i64) -> LedgerResult<()> {
         self.set_runtime_state(CONTROL_MODE_KEY, &mode, updated_at)
     }
@@ -1940,6 +1985,61 @@ mod tests {
         assert_eq!(
             ledger.control_mode().unwrap(),
             Some(LedgerControlMode::Shadow)
+        );
+    }
+
+    #[test]
+    fn 런타임_초기화는_기록을_보존하고_활성_세션을_중단한다() {
+        let ledger = Ledger::open_in_memory().unwrap();
+        ledger.start_session(&session()).unwrap();
+        ledger
+            .upsert_trade(&NewTrade {
+                trade_id: "reset-trade".into(),
+                session_id: Some("session-1".into()),
+                execution_kind: LedgerExecutionKind::Real,
+                origin: LedgerOrigin::Auto,
+                code: "0193T0".into(),
+                entry_qty: 10,
+                exit_qty: 0,
+                entry_avg_price: 10_000.0,
+                exit_avg_price: None,
+                pnl_rate: None,
+                entered_at: 1_100,
+                exited_at: None,
+                status: LedgerTradeStatus::Open,
+                exit_reason: None,
+                updated_at: 1_100,
+            })
+            .unwrap();
+        ledger
+            .set_runtime_state(
+                "automation_runtime_v1",
+                &serde_json::json!({ "stale": true }),
+                1_200,
+            )
+            .unwrap();
+        ledger
+            .set_control_mode(LedgerControlMode::Auto, 1_200)
+            .unwrap();
+
+        ledger.reset_runtime_state_to_manual(1_300).unwrap();
+
+        assert_eq!(
+            ledger.control_mode().unwrap(),
+            Some(LedgerControlMode::Manual)
+        );
+        assert!(ledger
+            .get_runtime_state::<serde_json::Value>("automation_runtime_v1")
+            .unwrap()
+            .is_none());
+        let trades = ledger
+            .list_trades(&TradeQuery::default(), None, 10)
+            .unwrap();
+        assert_eq!(trades.items.len(), 1);
+        assert_eq!(trades.items[0].status, LedgerTradeStatus::Interrupted);
+        assert_eq!(
+            trades.items[0].exit_reason.as_deref(),
+            Some("runtime_reset")
         );
     }
 
