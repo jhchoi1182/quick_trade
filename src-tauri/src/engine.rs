@@ -3028,8 +3028,14 @@ impl Engine {
         let settings = self.settings.read().unwrap().clone();
 
         // 실제 체결로 식별되는 틱만 수익 보호의 무장·발동에 사용한다.
-        let valid_trade_tick =
-            quote.volume > 0.0 && quote.trade_sequence > 0 && quote.received_at_micros > 0;
+        // 가격은 유한·양수까지 확인한다. 프레임 필드가 비거나 깨져 0이 되면 손절
+        // 판정이 -100%로 뒤집히고, "inf"로 파싱되면(f64::parse는 이를 받는다)
+        // 호가 반올림이 포화해 목표가 계산까지 오염된다.
+        let valid_trade_tick = quote.volume > 0.0
+            && quote.price.is_finite()
+            && quote.price > 0.0
+            && quote.trade_sequence > 0
+            && quote.received_at_micros > 0;
         let owned = valid_trade_tick
             .then(|| {
                 let mut runtime = self.automation.lock().unwrap();
@@ -3081,12 +3087,9 @@ impl Engine {
             }
         }
 
-        if quote.code != settings.auto_symbols.underlying || quote.volume <= 0.0 {
-            return;
-        }
-        if quote.trade_sequence == 0 || quote.received_at_micros == 0 {
-            // 거래소 누적거래량과 수신시각이 없는 스냅샷/불완전 프레임은 서로 다른
-            // 실시간 체결임을 증명할 수 없으므로 OCO 확인 틱으로 사용하지 않는다.
+        if quote.code != settings.auto_symbols.underlying || !valid_trade_tick {
+            // 포지션 수익률과 같은 기준을 OCO에도 적용한다. 가격이 0·음수·NaN·무한대인
+            // 틱은 확인 횟수나 무효화 판정을 바꾸지 않는다.
             return;
         }
         // 휴장 전 장부 종결이 일시 실패하면 runtime 그룹은 다음 tick의 재시도를
@@ -4314,15 +4317,17 @@ impl Engine {
                     if runtime.phase() != crate::types::AutomationPhase::Holding {
                         return None;
                     }
-                    let rate = if position.avg_price > 0.0 && position.last_price > 0.0 {
-                        (position.last_price / position.avg_price - 1.0) * 100.0
-                    } else {
-                        0.0
-                    };
-                    if rate <= crate::util::AUTO_STOP_LOSS_PCT {
+                    // 수익률을 계산할 수 없으면 0%로 대체하지 않는다. 무장된 수익
+                    // 보호선에서 0%는 "되밀렸다"로 읽혀 근거 없는 청산이 나간다.
+                    // 가격에 의존하지 않는 최대보유 청산만 그대로 유지한다.
+                    let rate = (position.avg_price > 0.0
+                        && position.last_price.is_finite()
+                        && position.last_price > 0.0)
+                        .then(|| (position.last_price / position.avg_price - 1.0) * 100.0);
+                    if rate.is_some_and(|rate| rate <= crate::util::AUTO_STOP_LOSS_PCT) {
                         Some("stop_loss")
                     } else if position.profit_guard_armed
-                        && rate <= crate::util::AUTO_PROFIT_GUARD_PCT
+                        && rate.is_some_and(|rate| rate <= crate::util::AUTO_PROFIT_GUARD_PCT)
                     {
                         Some("profit_guard")
                     } else if now >= position.exit_deadline {
@@ -10633,7 +10638,7 @@ mod tests {
         assert!(!engine.auto_quotes_fresh(test_automation_now()));
     }
 
-    fn arm_shadow_trigger(engine: &Engine) -> TriggeredScenario {
+    fn prepare_shadow_scenario(engine: &Engine) -> (u64, i64, Duration) {
         let decision = validate_decision(
             185_000,
             &crate::types::ModelDecision {
@@ -10715,6 +10720,12 @@ mod tests {
             start + Duration::from_secs(300),
             now + 300,
         ));
+        (applied_trigger, now, start)
+    }
+
+    fn arm_shadow_trigger(engine: &Engine) -> TriggeredScenario {
+        let (applied_trigger, now, start) = prepare_shadow_scenario(engine);
+        let mut runtime = engine.automation.lock().unwrap();
         let mut triggered = None;
         for (sequence, second) in [(1, 1), (2, 2), (3, 4), (4, 5)] {
             triggered = runtime.on_trade_tick(TradeTick {
@@ -11959,6 +11970,100 @@ mod tests {
             shadow: false,
             profit_guard_armed: false,
         }
+    }
+
+    #[test]
+    fn 깨진_본주_가격_틱은_oco_확인과_revision을_변경하지_않는다() {
+        let settings = Settings::default();
+        let engine = test_engine(Arc::new(MockBroker::new(&settings)), settings);
+        seed_shadow_quotes(&engine, 10, 10);
+        let (_, now, start) = prepare_shadow_scenario(&engine);
+        let revision = engine.automation.lock().unwrap().revision();
+
+        for (index, price) in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY]
+            .into_iter()
+            .enumerate()
+        {
+            engine.handle_automation_quote(&Quote {
+                code: "000660".into(),
+                price,
+                change_rate: 0.0,
+                ask1: 185_100.0,
+                bid1: 185_000.0,
+                ask1_qty: 1_000,
+                bid1_qty: 1_000,
+                volume: 1.0,
+                trade_sequence: index as u64 + 1,
+                received_at_micros: start.as_micros() as u64 + index as u64 + 1,
+                trade_ts: now + index as i64,
+                book_ts: now + index as i64,
+            });
+        }
+
+        let runtime = engine.automation.lock().unwrap();
+        assert_eq!(runtime.revision(), revision);
+        assert!(runtime.pending_entry().is_none());
+        drop(runtime);
+        let snapshot = engine.automation_snapshot();
+        assert_eq!(snapshot.scenarios.len(), 1);
+        assert_eq!(snapshot.scenarios[0].confirming_ticks, 0);
+        assert_eq!(snapshot.scenarios[0].confirming_elapsed_ms, 0);
+    }
+
+    #[tokio::test]
+    async fn 깨진_가격_틱은_auto_손절을_발동시키지_않는다() {
+        let settings = Settings::default();
+        let engine = test_engine(Arc::new(MockBroker::new(&settings)), settings);
+        // 첫 체결일을 다음 날로 두어 실행 시각과 무관하게 15:15·최대보유가 먼저
+        // 걸리지 않게 한다. 이 테스트가 보는 것은 가격 기반 청산 판정뿐이다.
+        let mut position = recovered_position("broken-price", None);
+        position.first_fill_at = now_kst_fake_epoch() + 86_400;
+        position.exit_deadline = position.first_fill_at + AUTO_MAX_HOLD_SECS;
+        {
+            let mut runtime = engine.automation.lock().unwrap();
+            runtime.mark_holding(position.clone());
+            runtime.set_mode_after_cleanup(ControlMode::Auto, None, None);
+        }
+
+        let tick = |price: f64| Quote {
+            code: "0193T0".into(),
+            price,
+            change_rate: 0.0,
+            ask1: 10_000.0,
+            bid1: 9_995.0,
+            ask1_qty: 100,
+            bid1_qty: 100,
+            volume: 10.0,
+            trade_sequence: 100,
+            // 단조시계를 쓰면 이 테스트가 프로세스 첫 호출일 때 0µs가 나와 틱이
+            // 가격과 무관하게 걸러진다. 고정 양수로 그 경로를 배제한다.
+            received_at_micros: 1_000_000,
+            trade_ts: now_kst_fake_epoch(),
+            book_ts: now_kst_fake_epoch(),
+        };
+
+        // 0·음수·NaN·무한대는 -100% 손절로 읽히면 안 되고 평단 기준가도 못 덮는다.
+        for price in [0.0, -5.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            engine.handle_automation_quote(&tick(price));
+            let runtime = engine.automation.lock().unwrap();
+            assert_eq!(
+                runtime.phase(),
+                crate::types::AutomationPhase::Holding,
+                "가격 {price} 틱이 자동 청산을 시작했다"
+            );
+            assert_eq!(
+                runtime.position().unwrap().last_price,
+                position.avg_price,
+                "가격 {price} 틱이 마지막 체결가를 덮어썼다"
+            );
+        }
+
+        // 대조군: 실제로 손절선을 깬 가격은 그대로 청산으로 이어져야 한다.
+        engine.handle_automation_quote(&tick(position.avg_price * 0.99));
+        assert_eq!(
+            engine.automation.lock().unwrap().phase(),
+            crate::types::AutomationPhase::ExitPending
+        );
     }
 
     #[tokio::test]

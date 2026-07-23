@@ -899,7 +899,13 @@ impl AutomationRuntime {
             .is_some_and(|position| !position.shadow && position.code == code)
     }
 
+    /// 유효하지 않은 가격은 `last_price`도 갱신하지 않고 `None`을 반환한다.
+    /// 호출자가 `None`을 "판정 근거 없음"으로 다루므로, 0이나 무한대가 손절·수익
+    /// 보호를 발동시키는 경로를 피드 검사와 별개로 여기서도 차단한다.
     pub fn update_position_price(&mut self, code: &str, price: f64) -> Option<PositionPriceUpdate> {
+        if !price.is_finite() || price <= 0.0 {
+            return None;
+        }
         let position = self.position.as_mut()?;
         if position.code != code || position.avg_price <= 0.0 {
             return None;
@@ -1096,6 +1102,36 @@ mod tests {
             .unwrap();
         assert!(!update.guard_armed_changed);
         assert!(!update.profit_guard_triggered);
+    }
+
+    #[test]
+    fn 유효하지_않은_가격은_수익률_판정에도_보유가_갱신에도_쓰이지_않는다() {
+        let mut runtime = AutomationRuntime::new(PersistedAutomation::default(), None);
+        runtime.mark_holding(position(0.4));
+        // 수익 보호선을 무장시켜 되밀림 판정이 실제로 가능한 상태로 만든다.
+        assert!(
+            runtime
+                .update_position_price("0193T0", 10_035.0)
+                .unwrap()
+                .guard_armed_changed
+        );
+
+        // 0·음수·NaN·무한대는 손절(-100%)이나 수익보호(0%)로 읽히면 안 된다.
+        for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(
+                runtime.update_position_price("0193T0", invalid).is_none(),
+                "가격 {invalid}가 수익률 판정에 사용됐다"
+            );
+            assert_eq!(
+                runtime.position().unwrap().last_price,
+                10_035.0,
+                "가격 {invalid}가 마지막 체결가를 덮어썼다"
+            );
+        }
+
+        // 유효한 가격은 그대로 판정된다.
+        let retraced = runtime.update_position_price("0193T0", 10_030.0).unwrap();
+        assert!(retraced.profit_guard_triggered);
     }
 
     #[test]
