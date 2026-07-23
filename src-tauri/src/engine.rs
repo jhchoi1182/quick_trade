@@ -25,6 +25,7 @@ use crate::automation::shadow::{
 use crate::broker::{Broker, BrokerShadowCashSource};
 use crate::chart_image;
 use crate::error::{AppError, AppResult};
+use crate::kis::rest::is_rate_limit_error;
 use crate::kis::KisBroker;
 use crate::ledger::{
     BrokerOrderKey, Ledger, LedgerControlMode, LedgerDecisionStatus, LedgerExecutionKind,
@@ -56,6 +57,9 @@ const LATE_AUTO_ENTRY_WATCH_KEY: &str = "late_auto_entry_watch_v1";
 const MARKET_DAY_STATE_KEY: &str = "market_day_state_v1";
 const MARKET_DAY_RETRY_SECS: i64 = 30 * 60;
 const AUTO_MAX_HOLD_SECS: i64 = 600;
+/// 구버전이 EGW00201을 Unknown으로 저장한 주문은 조회 반영 여유를 둔 뒤에만
+/// 잔고·체결·미체결 무변화를 함께 확인해 미접수로 마이그레이션한다.
+const LEGACY_RATE_LIMIT_RECONCILE_SECS: i64 = 10;
 /// REST 누적체결이 같은 값으로 유지돼야 WebSocket 통보 조정을 끝내는 최소 시간.
 const FILL_RECONCILE_SETTLE_SECS: u64 = 2;
 /// 식별 불명확/REST 장애 때 단일 작업이 무한 폴링하지 않도록 제한한다.
@@ -1316,6 +1320,33 @@ impl Engine {
 
         if self.automation.lock().unwrap().position().is_none() {
             let Some(order_no) = candidate.as_deref() else {
+                let legacy_rate_limit = entry_order.status == LedgerOrderStatus::Unknown
+                    && entry_order.broker_order_id.is_none()
+                    && entry_order
+                        .message
+                        .as_deref()
+                        .is_some_and(is_rate_limit_error)
+                    && self
+                        .automation_now()
+                        .saturating_sub(entry_order.requested_at)
+                        >= LEGACY_RATE_LIMIT_RECONCILE_SECS;
+                if legacy_rate_limit && actual_qty == pending.baseline_qty {
+                    self.ledger
+                        .update_order_status(
+                            &pending.intent_id,
+                            LedgerOrderStatus::Rejected,
+                            Some(
+                                "구버전 KIS 유량 제한 응답과 잔고·체결·미체결 무변화로 미접수 확인",
+                            ),
+                            now_kst_fake_epoch(),
+                        )
+                        .map_err(|error| error.to_string())?;
+                    self.automation
+                        .lock()
+                        .unwrap()
+                        .entry_failed("KIS 유량 제한으로 자동 진입 주문이 접수되지 않았습니다");
+                    return Ok(());
+                }
                 return Err(
                     "제출 중이던 진입 주문을 체결·미체결에서 찾지 못해 재주문을 금지합니다".into(),
                 );
@@ -8066,6 +8097,12 @@ impl Engine {
                         "주문 응답 불명확 — 재주문하지 않고 장부에 확인 대기로 기록했습니다: {e}"
                     ));
                 }
+                if is_rate_limit_error(&e.to_string()) {
+                    // 명시적 게이트웨이 미접수지만 금액 부족 거부는 아니므로
+                    // KIS 가능수량 조회나 두 번째 매수 POST로 이어가지 않는다.
+                    self.schedule_account_refresh();
+                    return fail(e.to_string());
+                }
                 // 캐시 예수금이 실제 주문가능금액보다 부풀려졌을 수 있다(미정산 매도대금 등).
                 // KIS가 계산한 매수가능수량으로 1회만 재주문 — 첫 주문은 확정 거부라 이중 주문 위험 없음.
                 let retried = self.retry_buy_with_psbl(code, qty, limit, ioc).await;
@@ -9742,6 +9779,122 @@ mod tests {
         assert!(runtime.position().is_none());
         assert_eq!(runtime.phase(), crate::types::AutomationPhase::Suspended);
         runtime.entry_failed("테스트 조정 종료");
+    }
+
+    #[test]
+    fn 구버전_유량제한_unknown은_조회유예와_무노출확인뒤_rejected로_복구한다() {
+        let settings = Settings::default();
+        let engine = test_engine(Arc::new(MockBroker::new(&settings)), settings);
+        let requested_at = test_automation_now();
+        let intent_id = "legacy-rate-limited-entry";
+        let trade_id = "legacy-rate-limited-trade";
+        engine
+            .ledger
+            .record_order_intent(&NewOrderIntent {
+                intent_id: intent_id.into(),
+                session_id: None,
+                trade_id: Some(trade_id.into()),
+                decision_id: None,
+                scenario_product: Some(LedgerProductKind::Leverage),
+                execution_kind: LedgerExecutionKind::Real,
+                origin: LedgerOrigin::Auto,
+                code: "0193T0".into(),
+                side: LedgerSide::Buy,
+                order_type: LedgerOrderType::IocLimit,
+                qty: 95,
+                price: Some(10_300),
+                requested_at,
+            })
+            .unwrap();
+        assert!(engine
+            .ledger
+            .begin_order_dispatch(intent_id, requested_at)
+            .unwrap());
+        engine
+            .ledger
+            .record_order_ack(
+                intent_id,
+                &OrderAcknowledgement {
+                    broker_order_id: None,
+                    broker_org_no: None,
+                    original_order_id: None,
+                    status: LedgerOrderStatus::Unknown,
+                    message: Some(
+                        "KIS API 오류: HTTP 500 Internal Server Error: 초당 거래건수를 초과하였습니다."
+                            .into(),
+                    ),
+                    acknowledged_at: requested_at,
+                },
+            )
+            .unwrap();
+        *engine.automation.lock().unwrap() = AutomationRuntime::new(
+            PersistedAutomation {
+                mode: ControlMode::Auto,
+                session_id: None,
+                position: None,
+                pending_entry: Some(pending_entry(intent_id, trade_id)),
+                shadow_cash: None,
+                next_decision_at: None,
+                last_decision_slot: None,
+            },
+            None,
+        );
+
+        // 조회 반영 유예 전에는 빈 조회만으로 미접수를 확정하지 않는다.
+        assert!(engine
+            .reconcile_pending_auto_entry_startup(
+                &AccountSnapshot {
+                    cash: 1_000_000,
+                    positions: Vec::new(),
+                },
+                &[],
+                &[],
+            )
+            .is_err());
+        assert!(engine.automation.lock().unwrap().pending_entry().is_some());
+
+        engine.automation_now_override.store(
+            requested_at + LEGACY_RATE_LIMIT_RECONCILE_SECS,
+            Ordering::SeqCst,
+        );
+        // 유예 뒤에도 기준수량과 다른 보유가 있으면 절대 자동 해제하지 않는다.
+        assert!(engine
+            .reconcile_pending_auto_entry_startup(
+                &AccountSnapshot {
+                    cash: 1_000_000,
+                    positions: vec![crate::types::Position {
+                        code: "0193T0".into(),
+                        qty: 1,
+                        avg_price: 10_000.0,
+                        eval_pnl: 0.0,
+                        pnl_rate: 0.0,
+                    }],
+                },
+                &[],
+                &[],
+            )
+            .is_err());
+        assert!(engine.automation.lock().unwrap().pending_entry().is_some());
+
+        engine
+            .reconcile_pending_auto_entry_startup(
+                &AccountSnapshot {
+                    cash: 1_000_000,
+                    positions: Vec::new(),
+                },
+                &[],
+                &[],
+            )
+            .unwrap();
+
+        let runtime = engine.automation.lock().unwrap();
+        assert!(runtime.pending_entry().is_none());
+        assert_eq!(runtime.phase(), crate::types::AutomationPhase::Idle);
+        drop(runtime);
+        assert_eq!(
+            engine.ledger.get_order(intent_id).unwrap().unwrap().status,
+            LedgerOrderStatus::Rejected
+        );
     }
 
     #[tokio::test]
@@ -12611,14 +12764,20 @@ mod tests {
     /// 첫 매수는 거부하고 두 번째부터 접수하는 브로커 (거부 시 재주문 검증용)
     struct RejectFirstBuyBroker {
         psbl_qty: u64,
+        reject_message: &'static str,
         buy_calls: AtomicUsize,
         last_order: Mutex<Option<(u64, u64)>>, // (qty, price)
     }
 
     impl RejectFirstBuyBroker {
         fn new(psbl_qty: u64) -> Arc<Self> {
+            Self::with_message(psbl_qty, REJECT_MSG)
+        }
+
+        fn with_message(psbl_qty: u64, reject_message: &'static str) -> Arc<Self> {
             Arc::new(Self {
                 psbl_qty,
+                reject_message,
                 buy_calls: AtomicUsize::new(0),
                 last_order: Mutex::new(None),
             })
@@ -12646,7 +12805,7 @@ mod tests {
         }
         async fn place_buy(&self, _c: &str, qty: u64, price: u64, _i: bool) -> AppResult<OrderAck> {
             if self.buy_calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                return Err(AppError::Order(REJECT_MSG.into()));
+                return Err(AppError::Order(self.reject_message.into()));
             }
             *self.last_order.lock().unwrap() = Some((qty, price));
             Ok(OrderAck {
@@ -12729,6 +12888,27 @@ mod tests {
             broker.buy_calls.load(Ordering::SeqCst),
             1,
             "재주문하면 안 된다"
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limited_buy_does_not_retry_with_kis_psbl_qty() {
+        let broker = RejectFirstBuyBroker::with_message(
+            90,
+            "KIS 게이트웨이 유량 제한으로 요청이 접수되지 않았습니다: EGW00201",
+        );
+        let engine = test_engine(Arc::clone(&broker) as Arc<dyn Broker>, Settings::default());
+        engine.refresh_account().await;
+        seed_quote(&engine, 10_100.0);
+
+        let result = engine.buy_max("0193T0").await;
+
+        assert!(!result.ok);
+        assert!(result.message.contains("EGW00201"), "{}", result.message);
+        assert_eq!(
+            broker.buy_calls.load(Ordering::SeqCst),
+            1,
+            "유량 제한 뒤 매수 POST를 다시 보내면 안 된다"
         );
     }
 

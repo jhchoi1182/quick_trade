@@ -20,7 +20,7 @@ const PATH_DAILY_MIN: &str = "/uapi/domestic-stock/v1/quotations/inquire-time-da
 const MIN_BARS: usize = 15 * 120 + 120;
 /// 과거로 최대 며칠까지 스캔할지 (휴장일 포함 달력일)
 const MAX_SCAN_DAYS: usize = 15;
-/// 백필 페이지 사이 추가 지연. 리미터(90ms)와 합쳐 페이지당 ~130ms —
+/// 백필 페이지 사이 추가 지연. 리미터(120ms)와 합쳐 페이지당 ~160ms —
 /// 주문·계좌 호출 여유는 지키면서 첫 로드가 수십 초씩 걸리지 않게 한다
 const BACKFILL_PAGE_DELAY: std::time::Duration = std::time::Duration::from_millis(40);
 

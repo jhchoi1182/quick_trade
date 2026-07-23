@@ -23,9 +23,9 @@ fn order_tr(side: Side) -> &'static str {
 
 const CANCEL_TR: &str = "TTTC0013U";
 
-/// HTTP 응답 본문을 정상적으로 받은 뒤 KIS가 `rt_cd != 0`으로 거부한 경우만
-/// 확정 거부로 분류한다. 전송·HTTP·본문 파싱 오류는 주문 접수 여부가 불명확하므로
-/// `KisRest::post`에서 온 오류를 그대로 보존한다.
+/// HTTP 응답 본문을 정상적으로 받은 뒤 KIS가 `rt_cd != 0`으로 거부한 경우를
+/// 확정 거부로 분류한다. 게이트웨이의 명시적 EGW00201 미접수도 `KisRest::post`가
+/// 확정 거부로 바꾸며, 그 외 전송·HTTP·본문 파싱 오류는 불명확 상태를 보존한다.
 fn check_order_rt(v: &serde_json::Value) -> AppResult<()> {
     if v["rt_cd"].as_str() == Some("0") {
         Ok(())

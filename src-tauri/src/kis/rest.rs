@@ -11,6 +11,13 @@ use crate::types::Settings;
 pub const REAL_BASE: &str = "https://openapi.koreainvestment.com:9443";
 pub const REAL_WS: &str = "ws://ops.koreainvestment.com:21000";
 
+/// 실전 REST 호출 사이 최소 간격. 120ms면 어떤 1초 구간에도 최대 9건만
+/// 시작하므로 다른 KIS 클라이언트나 서버 집계 오차가 있어도 여유를 둔다.
+const REAL_MIN_GAP: Duration = Duration::from_millis(120);
+/// POST는 자동 재시도할 수 없지만 유량 초과를 받은 뒤 이어지는 조회도 같은
+/// 게이트웨이를 다시 압박하지 않도록 전체 REST 호출을 잠시 멈춘다.
+const POST_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(1);
+
 pub struct RestPage {
     pub body: Value,
     pub tr_cont: String,
@@ -20,27 +27,53 @@ pub struct RestPage {
 /// 슬라이딩 윈도우 방식은 초 경계에서 버스트가 생겨 EGW00201(초당 거래건수 초과)을 유발한다.
 /// 호출 사이 최소 간격을 강제해 버스트를 원천 차단한다.
 struct RateLimiter {
-    /// 다음 호출이 허용되는 시각. 대기자는 자기 슬롯을 선점한 뒤 그 시각까지 잔다.
-    next_slot: Mutex<Instant>,
+    schedule: Mutex<RateLimitSchedule>,
     min_gap: Duration,
+}
+
+struct RateLimitSchedule {
+    /// 다음 호출이 허용되는 시각. 실제 허가 시점에만 갱신해, 런타임 지연 뒤
+    /// 여러 대기자가 동시에 깨어나도 호출 시작 시각이 겹치지 않게 한다.
+    next_slot: Instant,
+    /// 한 요청이 유량 초과를 받으면 모든 대기 요청이 이 시각까지 기다린다.
+    /// 호출별 sleep만 쓰면 그 사이 다른 GET/POST가 나간다.
+    blocked_until: Instant,
 }
 
 impl RateLimiter {
     fn new(min_gap: Duration) -> Self {
+        let now = Instant::now();
         Self {
-            next_slot: Mutex::new(Instant::now()),
+            schedule: Mutex::new(RateLimitSchedule {
+                next_slot: now,
+                blocked_until: now,
+            }),
             min_gap,
         }
     }
 
     async fn acquire(&self) {
-        let due = {
-            let mut slot = self.next_slot.lock().await;
-            let due = (*slot).max(Instant::now());
-            *slot = due + self.min_gap;
-            due
-        };
-        tokio::time::sleep_until(due.into()).await;
+        loop {
+            let wait_until = {
+                let mut schedule = self.schedule.lock().await;
+                let now = Instant::now();
+                let due = schedule.next_slot.max(schedule.blocked_until).max(now);
+                if due <= now {
+                    // 예약 시각이 아니라 실제 반환 시각을 기준으로 다음 슬롯을 잡는다.
+                    schedule.next_slot = now + self.min_gap;
+                    return;
+                }
+                due
+            };
+            // 여러 대기자가 같은 시각에 깨어나도 위 잠금에서 한 요청만 허가되고
+            // 나머지는 갱신된 다음 슬롯을 다시 확인한다.
+            tokio::time::sleep_until(wait_until.into()).await;
+        }
+    }
+
+    async fn defer_for(&self, duration: Duration) {
+        let mut schedule = self.schedule.lock().await;
+        schedule.blocked_until = schedule.blocked_until.max(Instant::now() + duration);
     }
 }
 
@@ -68,9 +101,8 @@ impl KisRest {
                 "APP KEY/SECRET이 설정되지 않았습니다".into(),
             ));
         }
-        // 실전 한도에 안전 마진을 둔 균일 간격. 기존 유량 방어값을 유지한다.
+        // 실전 한도에 안전 마진을 둔 균일 간격.
         let base = REAL_BASE;
-        let gap_ms = 90;
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(7))
             .build()?;
@@ -87,7 +119,7 @@ impl KisRest {
             app_key: settings.app_key.clone(),
             app_secret: settings.app_secret.clone(),
             token,
-            limiter: RateLimiter::new(Duration::from_millis(gap_ms)),
+            limiter: RateLimiter::new(REAL_MIN_GAP),
         })
     }
 
@@ -142,13 +174,14 @@ impl KisRest {
             });
             match &result {
                 Err(AppError::Kis(msg)) if is_rate_limit_error(msg) && attempt < 4 => {
-                    // 지수 백오프: 0.5s → 1s → 2s → 4s (읽기 전용이라 재시도 안전)
+                    // 지수 백오프: 0.5s → 1s → 2s → 4s (읽기 전용이라 재시도 안전).
+                    // 개별 태스크가 아니라 공유 리미터를 미뤄 다른 POST도 보호한다.
                     let delay = Duration::from_millis(500u64 << attempt);
                     attempt += 1;
+                    self.limiter.defer_for(delay).await;
                     tracing::warn!(
                         "KIS 유량 초과({tr_id}) — {attempt}번째 재시도 ({delay:?} 대기)"
                     );
-                    tokio::time::sleep(delay).await;
                 }
                 _ => return result,
             }
@@ -169,7 +202,28 @@ impl KisRest {
             .header("custtype", "P")
             .send()
             .await?;
-        Self::into_json(resp).await
+        let result = Self::into_json(resp).await;
+        if matches!(&result, Err(AppError::Kis(message)) if is_rate_limit_error(message)) {
+            // 주문 POST는 이중 주문 위험 때문에 다시 보내지 않는다. 다만 뒤따르는
+            // 체결·미체결 조정까지 연달아 유량 초과가 나지 않게 전역 쿨다운한다.
+            self.limiter.defer_for(POST_RATE_LIMIT_COOLDOWN).await;
+            tracing::warn!(
+                "KIS 주문 유량 초과({tr_id}) — POST는 재시도하지 않고 전체 REST를 {POST_RATE_LIMIT_COOLDOWN:?} 대기"
+            );
+        }
+        Self::classify_post_result(result)
+    }
+
+    /// HTTP 응답을 실제로 받은 EGW00201은 게이트웨이가 요청을 제한한 명시적
+    /// 미접수다. 전송 타임아웃·응답 파싱 실패와 달리 주문번호 없는 Unknown으로
+    /// 남기지 않되, POST 자체를 이 함수 안에서 다시 보내지는 않는다.
+    fn classify_post_result(result: AppResult<Value>) -> AppResult<Value> {
+        match result {
+            Err(AppError::Kis(message)) if is_rate_limit_error(&message) => Err(AppError::Order(
+                format!("KIS 게이트웨이 유량 제한으로 요청이 접수되지 않았습니다: {message}"),
+            )),
+            result => result,
+        }
     }
 
     async fn into_json(resp: reqwest::Response) -> AppResult<Value> {
@@ -229,6 +283,21 @@ mod tests {
         assert!(!is_rate_limit_error("모의투자 장종료"));
     }
 
+    #[test]
+    fn post_rate_limit_is_classified_as_definite_rejection() {
+        let rate_limited = KisRest::classify_post_result(Err(AppError::Kis(
+            "HTTP 500 Internal Server Error: 초당 거래건수를 초과하였습니다.".into(),
+        )))
+        .unwrap_err();
+        assert!(matches!(rate_limited, AppError::Order(_)));
+
+        let unknown = KisRest::classify_post_result(Err(AppError::Kis(
+            "KIS 성공 응답에 주문번호가 없습니다".into(),
+        )))
+        .unwrap_err();
+        assert!(matches!(unknown, AppError::Kis(_)));
+    }
+
     #[tokio::test]
     async fn limiter_enforces_min_gap() {
         let limiter = RateLimiter::new(Duration::from_millis(50));
@@ -237,5 +306,51 @@ mod tests {
         limiter.acquire().await; // +50ms
         limiter.acquire().await; // +100ms
         assert!(start.elapsed() >= Duration::from_millis(100));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn limiter_does_not_burst_after_runtime_delay() {
+        let limiter = std::sync::Arc::new(RateLimiter::new(Duration::from_millis(30)));
+        limiter.acquire().await;
+        let mut waiting = Vec::new();
+        for _ in 0..3 {
+            let limiter = std::sync::Arc::clone(&limiter);
+            waiting.push(tokio::spawn(async move {
+                limiter.acquire().await;
+                Instant::now()
+            }));
+        }
+
+        // 대기 태스크가 잠든 뒤 런타임을 막아 예약 시각을 모두 지나게 한다.
+        // 실제 허가 시각으로 재계산하지 않으면 세 호출이 한꺼번에 반환한다.
+        tokio::task::yield_now().await;
+        std::thread::sleep(Duration::from_millis(110));
+
+        let mut granted_at = Vec::new();
+        for task in waiting {
+            granted_at.push(task.await.unwrap());
+        }
+        granted_at.sort_unstable();
+        assert!(granted_at
+            .windows(2)
+            .all(|pair| pair[1].duration_since(pair[0]) >= Duration::from_millis(25)));
+    }
+
+    #[tokio::test]
+    async fn limiter_global_cooldown_delays_waiting_call() {
+        let limiter = std::sync::Arc::new(RateLimiter::new(Duration::from_millis(40)));
+        limiter.acquire().await;
+
+        // 두 번째 호출이 +40ms 슬롯을 기다리는 동안 더 긴 전역 쿨다운을 건다.
+        let waiting = {
+            let limiter = std::sync::Arc::clone(&limiter);
+            tokio::spawn(async move { limiter.acquire().await })
+        };
+        tokio::task::yield_now().await;
+        let cooldown_started = Instant::now();
+        limiter.defer_for(Duration::from_millis(120)).await;
+
+        waiting.await.unwrap();
+        assert!(cooldown_started.elapsed() >= Duration::from_millis(110));
     }
 }
