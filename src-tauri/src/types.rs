@@ -46,6 +46,15 @@ pub enum ControlMode {
     Shadow,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MarketDayStatus {
+    Open,
+    Closed,
+    #[default]
+    Unknown,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ProductKind {
@@ -341,6 +350,7 @@ pub struct AutomationPositionInfo {
     pub target_price: u64,
     pub exit_deadline: i64,
     pub shadow: bool,
+    pub profit_guard_armed: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -358,6 +368,8 @@ pub struct AutomationSnapshot {
     pub position: Option<AutomationPositionInfo>,
     pub shadow_cash: Option<u64>,
     pub error: Option<String>,
+    pub market_day_status: MarketDayStatus,
+    pub market_day_message: Option<String>,
 }
 
 /// 예약 매도 상태 — 프론트로 emit("reservation") + get_reservations 반환에 사용.

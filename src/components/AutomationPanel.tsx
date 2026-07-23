@@ -94,13 +94,20 @@ export function AutomationPanel() {
   const position = useAutomationStore((s) => s.snapshot?.position ?? null);
   const shadowCash = useAutomationStore((s) => s.snapshot?.shadowCash ?? null);
   const error = useAutomationStore((s) => s.snapshot?.error ?? null);
+  const marketDayStatus = useAutomationStore((s) => s.snapshot?.marketDayStatus ?? "unknown");
+  const marketDayMessage = useAutomationStore((s) => s.snapshot?.marketDayMessage ?? null);
   const remainingSeconds = useDeadlineSeconds(position?.exitDeadline);
+  const phaseLabel = marketDayStatus === "closed"
+    ? "휴장일 · 자동 일시정지"
+    : marketDayStatus === "unknown"
+      ? "개장일 확인 대기 · 신규 진입 중지"
+      : PHASE_LABEL[phase];
 
   return (
     <section className={`automation-panel ${mode === "shadow" ? "shadow" : "auto"}`} aria-live="polite">
       <div className="automation-head">
         <span className="automation-kind">{mode === "shadow" ? "SHADOW" : "AUTO"}</span>
-        <span className="automation-phase">{PHASE_LABEL[phase]}</span>
+        <span className="automation-phase">{phaseLabel}</span>
         <span className="automation-next">다음 {formatClock(nextDecisionAt)}</span>
       </div>
 
@@ -110,6 +117,11 @@ export function AutomationPanel() {
           <span>{position.qty.toLocaleString("ko-KR")}주</span>
           <span className={rateClass(position.pnlRate)}>{formatRate(position.pnlRate)}</span>
           <span>목표 +{position.targetReturnPct.toFixed(1)}%</span>
+          {position.targetReturnPct > 0.3 ? (
+            <span className="position-profit-guard">
+              {position.profitGuardArmed ? "+0.3% 보호 무장" : "수익 보호 대기"}
+            </span>
+          ) : null}
           {remainingSeconds !== undefined ? (
             <span className="position-timer">{remainingSeconds}초</span>
           ) : null}
@@ -132,6 +144,9 @@ export function AutomationPanel() {
         <div className="shadow-cash">가상 주문가능금액 {formatCompactKrw(shadowCash)}</div>
       ) : null}
       {error ? <div className="automation-error">{error}</div> : null}
+      {marketDayStatus !== "open" && marketDayMessage ? (
+        <div className="automation-market-message">{marketDayMessage}</div>
+      ) : null}
     </section>
   );
 }

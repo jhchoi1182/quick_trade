@@ -1,5 +1,6 @@
 pub mod account;
 pub mod auth;
+pub mod calendar;
 pub mod crypto;
 pub mod inquiry;
 pub mod order;
@@ -12,7 +13,9 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::broker::{Broker, BrokerFill, BrokerOpenOrder, BrokerOrderStatus, OrderAck};
+use crate::broker::{
+    Broker, BrokerFill, BrokerMarketDay, BrokerOpenOrder, BrokerOrderStatus, OrderAck,
+};
 use crate::error::{AppError, AppResult};
 use crate::types::{AccountSnapshot, Candle, FeedEvent, Quote, Settings, Side};
 
@@ -47,6 +50,10 @@ impl KisBroker {
 
 #[async_trait::async_trait]
 impl Broker for KisBroker {
+    async fn market_days(&self, basis_date: &str) -> AppResult<Vec<BrokerMarketDay>> {
+        calendar::market_days(&self.rest, basis_date).await
+    }
+
     async fn candles_1m(&self, code: &str) -> AppResult<Vec<Candle>> {
         quote::candles_1m(&self.rest, code).await
     }

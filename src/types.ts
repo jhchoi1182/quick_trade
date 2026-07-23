@@ -6,6 +6,7 @@ export interface SymbolConfig {
 }
 
 export type ControlMode = "manual" | "auto" | "shadow";
+export type MarketDayStatus = "open" | "closed" | "unknown";
 
 export interface AutoSymbols {
   underlying: string;
@@ -151,6 +152,7 @@ export interface AutomationPosition {
   targetPrice?: number;
   exitDeadline?: number;
   shadow?: boolean;
+  profitGuardArmed: boolean;
 }
 
 /** 백엔드가 emit("automation-state") 및 조회 명령으로 전달하는 전체 스냅샷 */
@@ -168,6 +170,8 @@ export interface AutomationSnapshot {
   position?: AutomationPosition | null;
   shadowCash?: number | null;
   error?: string | null;
+  marketDayStatus: MarketDayStatus;
+  marketDayMessage?: string | null;
 }
 
 export type TradeRecordKind = "real" | "shadow";

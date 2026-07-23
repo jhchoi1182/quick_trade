@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 
+use chrono::{Datelike, Weekday};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -33,8 +34,8 @@ use crate::ledger::{
 };
 use crate::market_history::MarketHistory;
 use crate::types::{
-    AccountSnapshot, AutomationSnapshot, Candle, ControlMode, FeedEvent, OrderResult, ProductKind,
-    Quote, ReservationInfo, Settings, Side,
+    AccountSnapshot, AutomationSnapshot, Candle, ControlMode, FeedEvent, MarketDayStatus,
+    OrderResult, ProductKind, Quote, ReservationInfo, Settings, Side,
 };
 use crate::util::{buy_limit_price, max_buy_qty, now_kst_fake_epoch, sell_target_price};
 
@@ -52,6 +53,8 @@ const AUTOMATION_STATE_KEY: &str = "automation_runtime_v1";
 const AUTOMATION_BUNDLE_STATE_KEY: &str = "automation_runtime_bundle_v2";
 const AUTO_HANDOFF_STATE_KEY: &str = "auto_handoff_v1";
 const LATE_AUTO_ENTRY_WATCH_KEY: &str = "late_auto_entry_watch_v1";
+const MARKET_DAY_STATE_KEY: &str = "market_day_state_v1";
+const MARKET_DAY_RETRY_SECS: i64 = 30 * 60;
 const AUTO_MAX_HOLD_SECS: i64 = 600;
 /// REST 누적체결이 같은 값으로 유지돼야 WebSocket 통보 조정을 끝내는 최소 시간.
 const FILL_RECONCILE_SETTLE_SECS: u64 = 2;
@@ -65,6 +68,48 @@ static ENGINE_GENERATION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 struct PersistedAutomationBundle {
     automation: PersistedAutomation,
     shadow: Option<ShadowSession>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedMarketDayState {
+    date: String,
+    status: MarketDayStatus,
+    message: Option<String>,
+    last_attempt_at: i64,
+}
+
+fn market_date_info(now_fake_epoch: i64) -> Option<(String, bool)> {
+    let now = chrono::DateTime::from_timestamp(now_fake_epoch, 0)?.naive_utc();
+    let weekend = matches!(now.weekday(), Weekday::Sat | Weekday::Sun);
+    Some((now.format("%Y%m%d").to_string(), weekend))
+}
+
+fn initial_market_day_state(
+    ledger: &Ledger,
+    now: i64,
+) -> Result<PersistedMarketDayState, AppError> {
+    let (date, weekend) = market_date_info(now)
+        .ok_or_else(|| AppError::Config("현재 KST 날짜를 계산할 수 없습니다".into()))?;
+    if weekend {
+        return Ok(PersistedMarketDayState {
+            date,
+            status: MarketDayStatus::Closed,
+            message: Some("주말 휴장일입니다".into()),
+            last_attempt_at: 0,
+        });
+    }
+    let cached = ledger
+        .get_runtime_state::<PersistedMarketDayState>(MARKET_DAY_STATE_KEY)
+        .map_err(|error| AppError::Config(error.to_string()))?;
+    Ok(cached
+        .filter(|state| state.date == date)
+        .unwrap_or(PersistedMarketDayState {
+            date,
+            status: MarketDayStatus::Unknown,
+            message: Some("개장일 여부를 확인하고 있습니다".into()),
+            last_attempt_at: 0,
+        }))
 }
 
 /// Auto 소유 포지션을 Manual/Shadow로 넘기는 작업의 내구성 있는 복구 표식.
@@ -188,6 +233,8 @@ pub struct Engine {
     market_history: MarketHistory,
     /// 모드·OCO·포지션 소유권은 한 잠금 안에서만 전환한다.
     automation: Mutex<AutomationRuntime>,
+    market_day: RwLock<PersistedMarketDayState>,
+    market_day_refresh_pending: AtomicBool,
     shadow: Mutex<Option<ShadowSession>>,
     ledger: Arc<Ledger>,
     /// 수동·자동 주문 POST를 하나의 actor 임계구역으로 직렬화한다.
@@ -243,6 +290,7 @@ pub async fn start(
         ShadowEntryExecutor::new(Arc::new(BrokerShadowCashSource::new(Arc::clone(&broker))));
 
     let now = now_kst_fake_epoch();
+    let market_day = initial_market_day_state(&ledger, now)?;
     let bundle = ledger
         .get_runtime_state::<PersistedAutomationBundle>(AUTOMATION_BUNDLE_STATE_KEY)
         .map_err(|e| crate::error::AppError::Config(e.to_string()))?;
@@ -272,11 +320,15 @@ pub async fn start(
     } else {
         saved_shadow = None;
     }
-    let restored_decision_slot = schedule::recover_persisted_decision_slot(
-        saved.next_decision_at,
-        saved.last_decision_slot,
-        now,
-    );
+    let restored_decision_slot = (market_day.status == MarketDayStatus::Open)
+        .then(|| {
+            schedule::recover_persisted_decision_slot(
+                saved.next_decision_at,
+                saved.last_decision_slot,
+                now,
+            )
+        })
+        .flatten();
     let runtime = AutomationRuntime::new(saved, restored_decision_slot);
 
     let engine = Arc::new_cyclic(|weak| Engine {
@@ -294,6 +346,8 @@ pub async fn start(
         stop_loss_lock: Mutex::new(HashMap::new()),
         market_history: MarketHistory::new(),
         automation: Mutex::new(runtime),
+        market_day: RwLock::new(market_day),
+        market_day_refresh_pending: AtomicBool::new(false),
         shadow: Mutex::new(saved_shadow),
         ledger: Arc::clone(&ledger),
         order_actor: tokio::sync::Mutex::new(()),
@@ -342,6 +396,7 @@ pub async fn start(
                 let reason = match position.pending_exit_reason.as_deref() {
                     Some("market_close") => "market_close",
                     Some("stop_loss") => "stop_loss",
+                    Some("profit_guard") => "profit_guard",
                     Some("max_holding") => "max_holding",
                     Some("target_order_failed") => "target_order_failed",
                     _ => "startup_reconcile",
@@ -371,6 +426,7 @@ pub async fn start(
     tasks.push(tokio::spawn(consume_feed(Arc::clone(&engine), rx)));
     tasks.push(tokio::spawn(periodic_refresh(Arc::clone(&engine))));
     tasks.push(tokio::spawn(automation_scheduler(Arc::clone(&engine))));
+    tasks.push(tokio::spawn(market_day_scheduler(Arc::clone(&engine))));
 
     // 차트 종목을 순차로 미리 백필해 셀렉터 전환이 즉시 되게 한다.
     // 프론트가 같은 종목을 요청하면 단일 비행으로 합쳐지므로 중복 호출은 없다.
@@ -554,6 +610,15 @@ async fn automation_scheduler(engine: Arc<Engine>) {
     }
 }
 
+async fn market_day_scheduler(engine: Arc<Engine>) {
+    let mut timer = tokio::time::interval(Duration::from_secs(60));
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        timer.tick().await;
+        engine.refresh_market_day_if_needed().await;
+    }
+}
+
 fn ledger_control_mode(mode: ControlMode) -> LedgerControlMode {
     match mode {
         ControlMode::Manual => LedgerControlMode::Manual,
@@ -596,8 +661,21 @@ fn shadow_exit_reason(reason: ShadowExitReason) -> &'static str {
         ShadowExitReason::TargetReached => "target",
         ShadowExitReason::ModeExit => "mode_exit",
         ShadowExitReason::MaxHolding => "max_holding",
+        ShadowExitReason::ProfitGuard => "profit_guard",
         ShadowExitReason::StopLoss => "stop_loss",
         ShadowExitReason::MarketClose => "market_close",
+    }
+}
+
+fn auto_exit_reason(reason: &str) -> Option<&'static str> {
+    match reason {
+        "market_close" => Some("market_close"),
+        "stop_loss" => Some("stop_loss"),
+        "profit_guard" => Some("profit_guard"),
+        "max_holding" => Some("max_holding"),
+        "target_order_failed" => Some("target_order_failed"),
+        "startup_reconcile" => Some("startup_reconcile"),
+        _ => None,
     }
 }
 
@@ -664,6 +742,236 @@ impl Engine {
         now_kst_fake_epoch()
     }
 
+    fn effective_market_day_state(&self) -> PersistedMarketDayState {
+        let now = self.automation_now();
+        let Some((date, weekend)) = market_date_info(now) else {
+            return PersistedMarketDayState {
+                date: String::new(),
+                status: MarketDayStatus::Unknown,
+                message: Some("현재 KST 날짜를 계산할 수 없습니다".into()),
+                last_attempt_at: 0,
+            };
+        };
+        if weekend {
+            return PersistedMarketDayState {
+                date,
+                status: MarketDayStatus::Closed,
+                message: Some("주말 휴장일입니다".into()),
+                last_attempt_at: 0,
+            };
+        }
+        let cached = self.market_day.read().unwrap().clone();
+        if cached.date == date {
+            cached
+        } else {
+            PersistedMarketDayState {
+                date,
+                status: MarketDayStatus::Unknown,
+                message: Some("오늘의 개장일 여부를 확인하고 있습니다".into()),
+                last_attempt_at: 0,
+            }
+        }
+    }
+
+    fn market_is_open(&self) -> bool {
+        self.effective_market_day_state().status == MarketDayStatus::Open
+    }
+
+    fn next_automation_slot(&self, after: i64) -> Option<i64> {
+        self.market_is_open()
+            .then(|| schedule::next_decision_slot(after))
+            .flatten()
+    }
+
+    fn persist_market_day_state(&self, state: &PersistedMarketDayState) {
+        if let Err(error) =
+            self.ledger
+                .set_runtime_state(MARKET_DAY_STATE_KEY, state, now_kst_fake_epoch())
+        {
+            tracing::error!("개장일 상태 저장 실패: {error}");
+        }
+    }
+
+    fn market_allows_auto_exit(&self) -> bool {
+        match self.effective_market_day_state().status {
+            MarketDayStatus::Open => true,
+            MarketDayStatus::Closed => false,
+            MarketDayStatus::Unknown => {
+                if !self.connected.load(Ordering::SeqCst) {
+                    return false;
+                }
+                let code = self
+                    .automation
+                    .lock()
+                    .unwrap()
+                    .position()
+                    .filter(|position| !position.shadow)
+                    .map(|position| position.code.clone());
+                let Some(code) = code else { return false };
+                let now = self.automation_now();
+                self.quotes.read().unwrap().get(&code).is_some_and(|quote| {
+                    quote.trade_sequence > 0
+                        && quote.trade_ts <= now
+                        && now.saturating_sub(quote.trade_ts) <= QUOTE_FRESH_SECS
+                })
+            }
+        }
+    }
+
+    fn defer_auto_exit_for_market_day(&self) -> bool {
+        if self.market_allows_auto_exit() {
+            return false;
+        }
+        let market_day = self.effective_market_day_state();
+        self.automation
+            .lock()
+            .unwrap()
+            .exit_waiting(match market_day.status {
+                MarketDayStatus::Closed => {
+                    "휴장일에는 새 청산 주문을 보내지 않고 다음 개장일까지 대기합니다".to_string()
+                }
+                MarketDayStatus::Unknown => {
+                    "개장일 확인 전에는 신선한 실시간 체결이 없어 청산 주문을 보류합니다"
+                        .to_string()
+                }
+                MarketDayStatus::Open => "청산 주문 가능 상태를 다시 확인합니다".to_string(),
+            });
+        self.persist_automation();
+        self.emit_automation_state();
+        true
+    }
+
+    fn install_market_day_state(self: &Arc<Self>, state: PersistedMarketDayState) {
+        let previous = self.effective_market_day_state();
+        let stored = self.market_day.read().unwrap().clone();
+        let storage_changed = stored.date != state.date
+            || stored.status != state.status
+            || stored.message != state.message
+            || stored.last_attempt_at != state.last_attempt_at;
+        let changed = previous.date != state.date
+            || previous.status != state.status
+            || previous.message != state.message;
+        *self.market_day.write().unwrap() = state.clone();
+        if storage_changed {
+            self.persist_market_day_state(&state);
+        }
+        if !changed {
+            return;
+        }
+
+        if state.status != MarketDayStatus::Open {
+            self.mark_current_group_replaced();
+            if self.automation.lock().unwrap().pause_for_market_day() {
+                self.persist_automation();
+            }
+        } else {
+            let now = self.automation_now();
+            let mut runtime = self.automation.lock().unwrap();
+            if matches!(runtime.mode(), ControlMode::Auto | ControlMode::Shadow)
+                && runtime.position().is_none()
+            {
+                let recovered = schedule::recover_persisted_decision_slot(
+                    runtime.next_decision_at(),
+                    runtime.last_decision_slot(),
+                    now,
+                );
+                runtime.set_next_decision_at(recovered);
+            }
+            drop(runtime);
+            self.persist_automation();
+        }
+        self.emit_automation_state();
+
+        if state.status == MarketDayStatus::Open {
+            let deferred_exit = {
+                let runtime = self.automation.lock().unwrap();
+                (runtime.mode() == ControlMode::Auto
+                    && runtime.phase() == crate::types::AutomationPhase::ExitPending)
+                    .then(|| runtime.exit_reason().map(str::to_owned))
+                    .flatten()
+            };
+            if let Some(reason) = deferred_exit.as_deref().and_then(auto_exit_reason) {
+                let engine = Arc::clone(self);
+                tokio::spawn(async move { engine.execute_auto_exit(reason).await });
+            }
+        }
+    }
+
+    async fn refresh_market_day_if_needed(self: &Arc<Self>) {
+        if self.market_day_refresh_pending.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let now = self.automation_now();
+        let Some((date, weekend)) = market_date_info(now) else {
+            self.market_day_refresh_pending
+                .store(false, Ordering::SeqCst);
+            return;
+        };
+        if weekend {
+            self.install_market_day_state(PersistedMarketDayState {
+                date,
+                status: MarketDayStatus::Closed,
+                message: Some("주말 휴장일입니다".into()),
+                last_attempt_at: 0,
+            });
+            self.market_day_refresh_pending
+                .store(false, Ordering::SeqCst);
+            return;
+        }
+
+        let current = self.market_day.read().unwrap().clone();
+        if current.date == date
+            && (matches!(
+                current.status,
+                MarketDayStatus::Open | MarketDayStatus::Closed
+            ) || now.saturating_sub(current.last_attempt_at) < MARKET_DAY_RETRY_SECS)
+        {
+            self.market_day_refresh_pending
+                .store(false, Ordering::SeqCst);
+            return;
+        }
+
+        let checking = PersistedMarketDayState {
+            date: date.clone(),
+            status: MarketDayStatus::Unknown,
+            message: Some("개장일 여부를 확인하고 있습니다".into()),
+            last_attempt_at: now,
+        };
+        self.install_market_day_state(checking);
+        let resolved = match self.broker.market_days(&date).await {
+            Ok(days) => days
+                .into_iter()
+                .find(|day| day.date == date)
+                .map(|day| PersistedMarketDayState {
+                    date: date.clone(),
+                    status: if day.is_open {
+                        MarketDayStatus::Open
+                    } else {
+                        MarketDayStatus::Closed
+                    },
+                    message: (!day.is_open).then(|| "KRX 휴장일입니다".into()),
+                    last_attempt_at: now,
+                })
+                .unwrap_or(PersistedMarketDayState {
+                    date: date.clone(),
+                    status: MarketDayStatus::Unknown,
+                    message: Some("KIS 응답에 오늘 날짜가 없어 신규 진입을 중지합니다".into()),
+                    last_attempt_at: now,
+                }),
+            Err(error) => PersistedMarketDayState {
+                date,
+                status: MarketDayStatus::Unknown,
+                message: Some(format!(
+                    "개장일 확인 실패로 신규 진입을 중지합니다: {error}"
+                )),
+                last_attempt_at: now,
+            },
+        };
+        self.install_market_day_state(resolved);
+        self.market_day_refresh_pending
+            .store(false, Ordering::SeqCst);
+    }
+
     /// 불명확 Auto 진입은 실제 첫 체결시각을 아직 모를 수 있으므로, POST 전에
     /// 내구화한 주문 의도 시각을 장마감 기준일로 사용한다. 런타임 잠금은 장부
     /// 조회 전에 해제해 다른 조정 경로와 잠금 순서가 엇갈리지 않게 한다.
@@ -698,12 +1006,15 @@ impl Engine {
         triggered: &TriggeredScenario,
     ) -> bool {
         let now = self.automation_now();
+        let market_open = self.market_is_open();
         let rejection = {
             let mut runtime = self.automation.lock().unwrap();
             if runtime.mode() != mode || !runtime.pending_matches(triggered) {
                 return false;
             }
-            let rejection = if schedule::is_at_or_after_flatten(now) {
+            let rejection = if !market_open {
+                Some("오늘은 KRX 개장일이 아니어서 자동 진입을 폐기했습니다")
+            } else if schedule::is_at_or_after_flatten(now) {
                 Some("15:15 장 마감 정리가 시작되어 진입을 폐기했습니다")
             } else if !runtime.pending_matches_at(triggered, now) {
                 Some("OCO 시나리오 슬롯이 만료되어 진입을 폐기했습니다")
@@ -725,11 +1036,14 @@ impl Engine {
 
     pub fn automation_snapshot(&self) -> AutomationSnapshot {
         let settings = self.settings.read().unwrap();
+        let market_day = self.effective_market_day_state();
         self.automation.lock().unwrap().snapshot(
             &self.runtime_id,
             self.runtime_generation,
             &settings.auto_symbols,
             self.monotonic_now(),
+            market_day.status,
+            market_day.message,
         )
     }
 
@@ -763,6 +1077,7 @@ impl Engine {
                 position.qty = current.qty;
                 position.avg_price = current.entry_vwap;
                 position.last_price = current.last_price as f64;
+                position.profit_guard_armed = current.profit_guard_armed;
                 let (exit_qty, exit_value) = session.exit_summary();
                 position.exit_qty = exit_qty;
                 position.exit_value = exit_value;
@@ -1049,6 +1364,7 @@ impl Engine {
                 exit_value: 0.0,
                 trade_id: pending.trade_id.clone(),
                 shadow: false,
+                profit_guard_armed: false,
             };
             if !self
                 .automation
@@ -1261,6 +1577,7 @@ impl Engine {
             exit_value: 0.0,
             trade_id: pending.trade_id.clone(),
             shadow: false,
+            profit_guard_armed: false,
         };
         {
             let mut runtime = self.automation.lock().unwrap();
@@ -1613,7 +1930,9 @@ impl Engine {
                     break;
                 }
 
-                if engine.pending_entry_market_close_due(engine.automation_now()) {
+                if engine.pending_entry_market_close_due(engine.automation_now())
+                    && engine.market_is_open()
+                {
                     if let Err(error) = engine
                         .cancel_known_auto_open_orders("15:15 pending 진입 주문 정리")
                         .await
@@ -1996,6 +2315,7 @@ impl Engine {
                                 target_price: position.target_price,
                                 first_fill_time: position.first_fill_at,
                                 last_price: position.last_price.round() as u64,
+                                profit_guard_armed: position.profit_guard_armed,
                             },
                         )
                     },
@@ -2055,14 +2375,21 @@ impl Engine {
         let now_epoch = now_kst_fake_epoch();
         let settings = self.settings.read().unwrap().clone();
 
-        // 보유 ETF 틱은 화면 수익률과 Auto/Shadow 청산 조건에 즉시 반영한다.
-        let owned = {
-            let mut runtime = self.automation.lock().unwrap();
-            runtime
-                .update_position_price(&quote.code, quote.price)
-                .map(|rate| (runtime.mode(), runtime.position().cloned(), rate))
-        };
-        if let Some((mode, Some(position), rate)) = owned {
+        // 실제 체결로 식별되는 틱만 수익 보호의 무장·발동에 사용한다.
+        let valid_trade_tick =
+            quote.volume > 0.0 && quote.trade_sequence > 0 && quote.received_at_micros > 0;
+        let owned = valid_trade_tick
+            .then(|| {
+                let mut runtime = self.automation.lock().unwrap();
+                runtime
+                    .update_position_price(&quote.code, quote.price)
+                    .map(|update| (runtime.mode(), runtime.position().cloned(), update))
+            })
+            .flatten();
+        if let Some((mode, Some(position), update)) = owned {
+            if mode == ControlMode::Auto && update.guard_armed_changed {
+                self.persist_automation();
+            }
             self.emit_automation_state();
             if mode == ControlMode::Shadow {
                 self.handle_shadow_trade(quote);
@@ -2070,8 +2397,10 @@ impl Engine {
                 let reason =
                     if schedule::has_reached_position_flatten(position.first_fill_at, now_epoch) {
                         Some("market_close")
-                    } else if rate <= crate::util::AUTO_STOP_LOSS_PCT {
+                    } else if update.rate <= crate::util::AUTO_STOP_LOSS_PCT {
                         Some("stop_loss")
+                    } else if update.profit_guard_triggered {
+                        Some("profit_guard")
                     } else if now_epoch >= position.exit_deadline {
                         Some("max_holding")
                     } else {
@@ -2973,6 +3302,7 @@ impl Engine {
     }
 
     fn sync_scenario_ledger(&self) {
+        let market_day = self.effective_market_day_state();
         let (decision_key, snapshot) = {
             let settings = self.settings.read().unwrap();
             let runtime = self.automation.lock().unwrap();
@@ -2983,6 +3313,8 @@ impl Engine {
                     self.runtime_generation,
                     &settings.auto_symbols,
                     self.monotonic_now(),
+                    market_day.status,
+                    market_day.message.clone(),
                 ),
             )
         };
@@ -3029,6 +3361,7 @@ impl Engine {
     }
 
     fn mark_current_group_replaced(&self) {
+        let market_day = self.effective_market_day_state();
         let (decision_key, snapshot) = {
             let settings = self.settings.read().unwrap();
             let runtime = self.automation.lock().unwrap();
@@ -3039,6 +3372,8 @@ impl Engine {
                     self.runtime_generation,
                     &settings.auto_symbols,
                     self.monotonic_now(),
+                    market_day.status,
+                    market_day.message.clone(),
                 ),
             )
         };
@@ -3077,9 +3412,15 @@ impl Engine {
     fn automation_tick(self: &Arc<Self>) {
         let now = now_kst_fake_epoch();
         let monotonic = self.monotonic_now();
+        let market_open = self.market_is_open();
+        if !market_open {
+            self.mark_current_group_replaced();
+        }
         let schedule_changed = {
             let mut runtime = self.automation.lock().unwrap();
-            if matches!(runtime.mode(), ControlMode::Auto | ControlMode::Shadow)
+            if !market_open {
+                runtime.pause_for_market_day()
+            } else if matches!(runtime.mode(), ControlMode::Auto | ControlMode::Shadow)
                 && runtime.position().is_none()
             {
                 let recovered = schedule::recover_decision_slot(runtime.next_decision_at(), now);
@@ -3143,6 +3484,10 @@ impl Engine {
                     };
                     if rate <= crate::util::AUTO_STOP_LOSS_PCT {
                         Some("stop_loss")
+                    } else if position.profit_guard_armed
+                        && rate <= crate::util::AUTO_PROFIT_GUARD_PCT
+                    {
+                        Some("profit_guard")
                     } else if now >= position.exit_deadline {
                         Some("max_holding")
                     } else {
@@ -3161,6 +3506,7 @@ impl Engine {
             let no_position = self.automation.lock().unwrap().position().is_none();
             let day = now.div_euclid(86_400);
             if no_position
+                && market_open
                 && schedule::is_at_or_after_flatten(now)
                 && self.last_flatten_day.load(Ordering::SeqCst) != day
                 && !self.auto_flatten_pending.swap(true, Ordering::SeqCst)
@@ -3189,6 +3535,9 @@ impl Engine {
                 .filter(|slot| *slot <= now)
                 .map(|slot| (slot, runtime.mode()))
         };
+        if !market_open {
+            return;
+        }
         let Some((slot, mode)) = due else {
             return;
         };
@@ -3760,6 +4109,7 @@ impl Engine {
             exit_value: 0.0,
             trade_id: trade_id.clone(),
             shadow: true,
+            profit_guard_armed: position.profit_guard_armed,
         };
         {
             let mut runtime = self.automation.lock().unwrap();
@@ -4074,8 +4424,7 @@ impl Engine {
                 runtime.sync_position(position.qty, position.last_price as f64);
             } else if update.position_closed {
                 runtime.complete_exit();
-                runtime
-                    .set_next_decision_at(schedule::next_decision_slot(now_kst_fake_epoch() + 1));
+                runtime.set_next_decision_at(self.next_automation_slot(now_kst_fake_epoch() + 1));
             }
         }
         if update.position_closed {
@@ -5196,6 +5545,7 @@ impl Engine {
             exit_value: 0.0,
             trade_id: trade_id.clone(),
             shadow: false,
+            profit_guard_armed: false,
         };
         if !self
             .automation
@@ -5562,6 +5912,8 @@ impl Engine {
                 "market_close".to_string()
             } else if runtime.exit_reason() == Some("stop_loss") {
                 "stop_loss".to_string()
+            } else if runtime.exit_reason() == Some("profit_guard") {
+                "profit_guard".to_string()
             } else if exit_deadline.is_some_and(|deadline| fill.filled_at >= deadline) {
                 "max_holding".to_string()
             } else if target_fill
@@ -5605,7 +5957,7 @@ impl Engine {
     }
 
     fn complete_real_exit(&self, reason: &str, exited_at: i64) {
-        let position = {
+        let (position, final_reason) = {
             let mut runtime = self.automation.lock().unwrap();
             let complete = runtime.position().is_some_and(|position| {
                 position.qty == 0 && position.exit_qty >= position.entry_qty
@@ -5619,9 +5971,10 @@ impl Engine {
                 self.emit_automation_state();
                 return;
             }
+            let final_reason = runtime.exit_reason().unwrap_or(reason).to_string();
             let position = runtime.complete_exit();
-            runtime.set_next_decision_at(schedule::next_decision_slot(exited_at.saturating_add(1)));
-            position
+            runtime.set_next_decision_at(self.next_automation_slot(exited_at.saturating_add(1)));
+            (position, final_reason)
         };
         let Some(position) = position else { return };
         let exit_avg = if position.exit_qty > 0 {
@@ -5653,7 +6006,7 @@ impl Engine {
             entered_at: position.first_fill_at,
             exited_at: Some(exited_at),
             status: LedgerTradeStatus::Closed,
-            exit_reason: Some(reason.into()),
+            exit_reason: Some(final_reason),
             updated_at: exited_at,
         });
         if let Some(reservation) = self.reservations.write().unwrap().remove(&position.code) {
@@ -5958,6 +6311,9 @@ impl Engine {
     }
 
     fn start_target_cancel_reconcile(self: &Arc<Self>, reason: &'static str, order_no: String) {
+        if self.defer_auto_exit_for_market_day() {
+            return;
+        }
         if self.exit_reconcile_pending.swap(true, Ordering::SeqCst) {
             return;
         }
@@ -5968,6 +6324,9 @@ impl Engine {
     }
 
     fn start_active_exit_reconcile(self: &Arc<Self>, reason: &'static str, order_no: String) {
+        if self.defer_auto_exit_for_market_day() {
+            return;
+        }
         if self.exit_reconcile_pending.swap(true, Ordering::SeqCst) {
             return;
         }
@@ -5986,7 +6345,13 @@ impl Engine {
     }
 
     async fn execute_auto_exit(self: Arc<Self>, reason: &'static str) {
+        if self.defer_auto_exit_for_market_day() {
+            return;
+        }
         let _actor = self.order_actor.lock().await;
+        if self.defer_auto_exit_for_market_day() {
+            return;
+        }
         let position = {
             let runtime = self.automation.lock().unwrap();
             if runtime.mode() != ControlMode::Auto
@@ -6040,6 +6405,9 @@ impl Engine {
             position.target_order_no.as_deref(),
             position.target_org_no.as_deref(),
         ) {
+            if self.defer_auto_exit_for_market_day() {
+                return;
+            }
             let cancel_intent = match self
                 .record_auto_cancel_intent(&position, "자동 목표 취소 의도 기록 실패")
             {
@@ -6120,6 +6488,9 @@ impl Engine {
         }
         if qty == 0 {
             self.complete_real_exit(reason, now_kst_fake_epoch());
+            return;
+        }
+        if self.defer_auto_exit_for_market_day() {
             return;
         }
 
@@ -6285,6 +6656,9 @@ impl Engine {
         intent_id: String,
         requested_at: i64,
     ) {
+        if self.defer_auto_exit_for_market_day() {
+            return;
+        }
         if self.exit_reconcile_pending.swap(true, Ordering::SeqCst) {
             return;
         }
@@ -6299,6 +6673,10 @@ impl Engine {
     async fn reconcile_target_cancel(self: Arc<Self>, reason: &'static str, order_no: String) {
         for _ in 0..30 {
             tokio::time::sleep(Duration::from_secs(2)).await;
+            if self.defer_auto_exit_for_market_day() {
+                self.exit_reconcile_pending.store(false, Ordering::SeqCst);
+                return;
+            }
             let Some(position) = self.automation.lock().unwrap().position().cloned() else {
                 self.exit_reconcile_pending.store(false, Ordering::SeqCst);
                 return;
@@ -6487,6 +6865,10 @@ impl Engine {
     async fn reconcile_active_exit(self: Arc<Self>, reason: &'static str, order_no: String) {
         for _ in 0..30 {
             tokio::time::sleep(Duration::from_secs(2)).await;
+            if self.defer_auto_exit_for_market_day() {
+                self.exit_reconcile_pending.store(false, Ordering::SeqCst);
+                return;
+            }
             let Some(position) = self.automation.lock().unwrap().position().cloned() else {
                 self.exit_reconcile_pending.store(false, Ordering::SeqCst);
                 return;
@@ -6793,6 +7175,10 @@ impl Engine {
         }
         for _ in 0..30 {
             tokio::time::sleep(Duration::from_secs(2)).await;
+            if self.defer_auto_exit_for_market_day() {
+                self.exit_reconcile_pending.store(false, Ordering::SeqCst);
+                return;
+            }
             let Some(position) = self.automation.lock().unwrap().position().cloned() else {
                 self.exit_reconcile_pending.store(false, Ordering::SeqCst);
                 return;
@@ -7371,7 +7757,7 @@ impl Engine {
             runtime.set_session_id(new_session);
             runtime.set_mode_after_cleanup(
                 mode,
-                schedule::next_decision_slot(now_kst_fake_epoch().saturating_add(1)),
+                self.next_automation_slot(now_kst_fake_epoch().saturating_add(1)),
                 (mode == ControlMode::Shadow).then_some(account_cash),
             );
         }
@@ -8283,7 +8669,9 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::broker::{BrokerFill, BrokerOpenOrder, BrokerOrderStatus, OrderAck};
+    use crate::broker::{
+        BrokerFill, BrokerMarketDay, BrokerOpenOrder, BrokerOrderStatus, OrderAck,
+    };
     use crate::error::{AppError, AppResult};
     use crate::mock::MockBroker;
     use std::sync::atomic::AtomicUsize;
@@ -8320,6 +8708,13 @@ mod tests {
             stop_loss_lock: Mutex::new(HashMap::new()),
             market_history: MarketHistory::new(),
             automation: Mutex::new(AutomationRuntime::new(PersistedAutomation::default(), None)),
+            market_day: RwLock::new(PersistedMarketDayState {
+                date: market_date_info(test_automation_now()).unwrap().0,
+                status: MarketDayStatus::Open,
+                message: None,
+                last_attempt_at: test_automation_now(),
+            }),
+            market_day_refresh_pending: AtomicBool::new(false),
             shadow: Mutex::new(None),
             ledger,
             order_actor: tokio::sync::Mutex::new(()),
@@ -8724,6 +9119,9 @@ mod tests {
     /// 잔고 조회 횟수만 세는 브로커 (합류 검증용)
     struct CountingBroker {
         account_calls: AtomicUsize,
+        market_day_calls: AtomicUsize,
+        market_open: AtomicBool,
+        market_error: AtomicBool,
     }
 
     struct ShadowPostCountingBroker {
@@ -9426,6 +9824,8 @@ mod tests {
                 engine.runtime_generation,
                 &engine.settings.read().unwrap().auto_symbols,
                 engine.monotonic_now(),
+                MarketDayStatus::Open,
+                None,
             )
             .error
             .as_deref()
@@ -9563,6 +9963,7 @@ mod tests {
             exit_value: 0.0,
             trade_id: trade_id.into(),
             shadow: false,
+            profit_guard_armed: false,
         }
     }
 
@@ -10246,6 +10647,8 @@ mod tests {
                 engine.runtime_generation,
                 &engine.settings.read().unwrap().auto_symbols,
                 engine.monotonic_now(),
+                MarketDayStatus::Open,
+                None,
             )
             .error
             .as_deref()
@@ -11480,6 +11883,7 @@ mod tests {
                 exit_value: 0.0,
                 trade_id: "handoff-trade".into(),
                 shadow: false,
+                profit_guard_armed: false,
             });
         }
 
@@ -11610,6 +12014,7 @@ mod tests {
                 exit_value: 0.0,
                 trade_id: "durable-handoff-trade".into(),
                 shadow: false,
+                profit_guard_armed: false,
             });
         }
 
@@ -11739,6 +12144,7 @@ mod tests {
                 exit_value: 0.0,
                 trade_id: "unresolved-target-trade".into(),
                 shadow: false,
+                profit_guard_armed: false,
             });
         }
 
@@ -12005,6 +12411,17 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Broker for CountingBroker {
+        async fn market_days(&self, basis_date: &str) -> AppResult<Vec<BrokerMarketDay>> {
+            self.market_day_calls.fetch_add(1, Ordering::SeqCst);
+            if self.market_error.load(Ordering::SeqCst) {
+                return Err(AppError::Kis("휴장일 테스트 오류".into()));
+            }
+            Ok(vec![BrokerMarketDay {
+                date: basis_date.to_string(),
+                is_open: self.market_open.load(Ordering::SeqCst),
+            }])
+        }
+
         async fn candles_1m(&self, _code: &str) -> AppResult<Vec<Candle>> {
             Ok(Vec::new())
         }
@@ -12043,11 +12460,190 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn 개장일_조회는_같은날_한번만_호출하고_결과를_영속화한다() {
+        let broker = Arc::new(CountingBroker {
+            account_calls: AtomicUsize::new(0),
+            market_day_calls: AtomicUsize::new(0),
+            market_open: AtomicBool::new(true),
+            market_error: AtomicBool::new(false),
+        });
+        let engine = test_engine(Arc::clone(&broker) as Arc<dyn Broker>, Settings::default());
+        let date = market_date_info(engine.automation_now()).unwrap().0;
+        *engine.market_day.write().unwrap() = PersistedMarketDayState {
+            date,
+            status: MarketDayStatus::Unknown,
+            message: None,
+            last_attempt_at: 0,
+        };
+
+        engine.refresh_market_day_if_needed().await;
+        engine.refresh_market_day_if_needed().await;
+
+        assert_eq!(broker.market_day_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            engine.effective_market_day_state().status,
+            MarketDayStatus::Open
+        );
+        let saved = engine
+            .ledger
+            .get_runtime_state::<PersistedMarketDayState>(MARKET_DAY_STATE_KEY)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.status, MarketDayStatus::Open);
+    }
+
+    #[tokio::test]
+    async fn 개장일_조회실패는_30분간_재호출하지_않고_신규진입을_막는다() {
+        let broker = Arc::new(CountingBroker {
+            account_calls: AtomicUsize::new(0),
+            market_day_calls: AtomicUsize::new(0),
+            market_open: AtomicBool::new(true),
+            market_error: AtomicBool::new(true),
+        });
+        let engine = test_engine(Arc::clone(&broker) as Arc<dyn Broker>, Settings::default());
+        let date = market_date_info(engine.automation_now()).unwrap().0;
+        *engine.market_day.write().unwrap() = PersistedMarketDayState {
+            date,
+            status: MarketDayStatus::Unknown,
+            message: None,
+            last_attempt_at: 0,
+        };
+
+        engine.refresh_market_day_if_needed().await;
+        engine.refresh_market_day_if_needed().await;
+
+        assert_eq!(broker.market_day_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            engine.effective_market_day_state().status,
+            MarketDayStatus::Unknown
+        );
+        assert!(!engine.market_is_open());
+    }
+
+    #[test]
+    fn 주말은_kis_조회없이_즉시_휴장으로_판정한다() {
+        let ledger = Ledger::open_in_memory().unwrap();
+        let saturday = crate::util::kst_str_to_fake_epoch("20260725", "100000").unwrap();
+        let state = initial_market_day_state(&ledger, saturday).unwrap();
+        assert_eq!(state.status, MarketDayStatus::Closed);
+        assert!(state.message.unwrap().contains("주말"));
+    }
+
+    #[tokio::test]
+    async fn 휴장일에는_판단슬롯을_비우고_다음_개장일에_자동복구한다() {
+        let broker = Arc::new(CountingBroker {
+            account_calls: AtomicUsize::new(0),
+            market_day_calls: AtomicUsize::new(0),
+            market_open: AtomicBool::new(false),
+            market_error: AtomicBool::new(false),
+        });
+        let engine = test_engine(Arc::clone(&broker) as Arc<dyn Broker>, Settings::default());
+        let now = engine.automation_now();
+        let date = market_date_info(now).unwrap().0;
+        engine.automation.lock().unwrap().set_mode_after_cleanup(
+            ControlMode::Auto,
+            schedule::next_decision_slot(now),
+            None,
+        );
+        *engine.market_day.write().unwrap() = PersistedMarketDayState {
+            date,
+            status: MarketDayStatus::Unknown,
+            message: None,
+            last_attempt_at: 0,
+        };
+
+        engine.refresh_market_day_if_needed().await;
+        assert_eq!(
+            engine.effective_market_day_state().status,
+            MarketDayStatus::Closed
+        );
+        assert!(engine
+            .automation
+            .lock()
+            .unwrap()
+            .next_decision_at()
+            .is_none());
+
+        broker.market_open.store(true, Ordering::SeqCst);
+        engine
+            .automation_now_override
+            .store(now + 86_400, Ordering::SeqCst);
+        engine.refresh_market_day_if_needed().await;
+        assert_eq!(
+            engine.effective_market_day_state().status,
+            MarketDayStatus::Open
+        );
+        assert!(engine
+            .automation
+            .lock()
+            .unwrap()
+            .next_decision_at()
+            .is_some());
+        assert_eq!(broker.market_day_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn 휴장판정과_경합한_실전진입은_주문직전에_폐기한다() {
+        let broker = auto_entry_broker(10, None);
+        let engine = test_engine(Arc::clone(&broker) as Arc<dyn Broker>, Settings::default());
+        seed_shadow_quotes(&engine, 100_000, 100_000);
+        let triggered = arm_auto_dual_trigger(&engine);
+        let date = market_date_info(engine.automation_now()).unwrap().0;
+        *engine.market_day.write().unwrap() = PersistedMarketDayState {
+            date,
+            status: MarketDayStatus::Closed,
+            message: Some("테스트 휴장일".into()),
+            last_attempt_at: engine.automation_now(),
+        };
+
+        Arc::clone(&engine).execute_real_entry(triggered).await;
+
+        assert_eq!(broker.buy_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            engine.automation.lock().unwrap().phase(),
+            crate::types::AutomationPhase::Idle
+        );
+    }
+
+    #[tokio::test]
+    async fn 휴장중_청산필요상태는_보존하지만_새_post는_보내지_않는다() {
+        let broker = Arc::new(ShadowPostCountingBroker {
+            post_calls: AtomicUsize::new(0),
+        });
+        let engine = test_engine(Arc::clone(&broker) as Arc<dyn Broker>, Settings::default());
+        let now = engine.automation_now();
+        {
+            let mut runtime = engine.automation.lock().unwrap();
+            runtime.set_mode_after_cleanup(ControlMode::Auto, None, None);
+            runtime.mark_holding(recovered_position("closed-day-exit", None));
+            assert!(runtime.begin_exit("profit_guard").is_some());
+        }
+        let date = market_date_info(now).unwrap().0;
+        *engine.market_day.write().unwrap() = PersistedMarketDayState {
+            date,
+            status: MarketDayStatus::Closed,
+            message: Some("테스트 휴장일".into()),
+            last_attempt_at: now,
+        };
+
+        Arc::clone(&engine).execute_auto_exit("profit_guard").await;
+
+        assert_eq!(broker.post_calls.load(Ordering::SeqCst), 0);
+        let runtime = engine.automation.lock().unwrap();
+        assert_eq!(runtime.phase(), crate::types::AutomationPhase::ExitPending);
+        assert_eq!(runtime.exit_reason(), Some("profit_guard"));
+        assert!(runtime.position().is_some());
+    }
+
     /// 부분체결 연발 등으로 갱신 예약이 몰려도 실제 잔고 조회는 1회로 합류돼야 한다
     #[tokio::test]
     async fn burst_refresh_requests_coalesce_into_one() {
         let broker = Arc::new(CountingBroker {
             account_calls: AtomicUsize::new(0),
+            market_day_calls: AtomicUsize::new(0),
+            market_open: AtomicBool::new(true),
+            market_error: AtomicBool::new(false),
         });
         let engine = test_engine(Arc::clone(&broker) as Arc<dyn Broker>, Settings::default());
 

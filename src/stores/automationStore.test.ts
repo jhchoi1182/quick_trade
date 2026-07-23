@@ -11,6 +11,7 @@ function snapshot(runtimeId: string, runtimeGeneration: number, revision: number
     phase: "idle",
     nextDecisionAt: null,
     scenarios: [],
+    marketDayStatus: "open",
   };
 }
 

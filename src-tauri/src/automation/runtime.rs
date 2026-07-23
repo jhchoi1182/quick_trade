@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use super::oco::{OcoGroup, TickOutcome, TradeTick, TriggeredScenario, ValidatedDecision};
 use crate::types::{
     AutoSymbols, AutomationPhase, AutomationPositionInfo, AutomationScenarioInfo,
-    AutomationSnapshot, ControlMode, ProductKind,
+    AutomationSnapshot, ControlMode, MarketDayStatus, ProductKind,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +45,25 @@ pub struct OwnedPosition {
     pub exit_value: f64,
     pub trade_id: String,
     pub shadow: bool,
+    #[serde(default)]
+    pub profit_guard_armed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PositionPriceUpdate {
+    pub rate: f64,
+    pub guard_armed_changed: bool,
+    pub profit_guard_triggered: bool,
+}
+
+fn exit_reason_priority(reason: &str) -> u8 {
+    match reason {
+        "market_close" => 4,
+        "stop_loss" => 3,
+        "profit_guard" => 2,
+        "max_holding" => 1,
+        _ => 0,
+    }
 }
 
 /// 실전 Auto 진입 POST 전부터 목표 주문의 소유권이 확정될 때까지 유지하는 복구 표식.
@@ -156,8 +175,36 @@ impl AutomationRuntime {
         self.next_decision_at
     }
 
+    pub fn last_decision_slot(&self) -> Option<i64> {
+        self.last_decision_slot
+    }
+
     pub fn set_next_decision_at(&mut self, next: Option<i64>) {
         self.next_decision_at = next;
+    }
+
+    /// 휴장·개장일 확인 실패 중에는 기존 포지션 소유권은 그대로 두고 신규 판단
+    /// 상태만 폐기한다. 진행 중인 진입 태스크도 revision/phase 불일치로 주문 전에 멈춘다.
+    pub fn pause_for_market_day(&mut self) -> bool {
+        let mut changed = self.next_decision_at.take().is_some();
+        if self.position.is_none()
+            && self.pending_entry.is_none()
+            && matches!(
+                self.phase,
+                AutomationPhase::Idle
+                    | AutomationPhase::Analyzing
+                    | AutomationPhase::ArmedOco
+                    | AutomationPhase::EntryPending
+            )
+        {
+            changed |= self.group.is_some() || self.phase != AutomationPhase::Idle;
+            self.replace_group();
+            self.phase = AutomationPhase::Idle;
+        }
+        if changed {
+            self.revision = self.revision.saturating_add(1);
+        }
+        changed
     }
 
     pub fn session_id(&self) -> Option<&str> {
@@ -562,10 +609,22 @@ impl AutomationRuntime {
     }
 
     pub fn begin_exit(&mut self, reason: impl Into<String>) -> Option<OwnedPosition> {
+        let reason = reason.into();
+        if self.phase == AutomationPhase::ExitPending {
+            let current = self.exit_reason.as_deref().unwrap_or_default();
+            if exit_reason_priority(&reason) > exit_reason_priority(current) {
+                self.exit_reason = Some(reason.clone());
+                if let Some(position) = &mut self.position {
+                    position.pending_exit_reason = Some(reason);
+                }
+                self.error = None;
+                self.revision = self.revision.saturating_add(1);
+            }
+            return None;
+        }
         if self.phase != AutomationPhase::Holding {
             return None;
         }
-        let reason = reason.into();
         self.phase = AutomationPhase::ExitPending;
         self.exit_reason = Some(reason.clone());
         if let Some(position) = &mut self.position {
@@ -738,13 +797,25 @@ impl AutomationRuntime {
             .is_some_and(|position| !position.shadow && position.code == code)
     }
 
-    pub fn update_position_price(&mut self, code: &str, price: f64) -> Option<f64> {
+    pub fn update_position_price(&mut self, code: &str, price: f64) -> Option<PositionPriceUpdate> {
         let position = self.position.as_mut()?;
         if position.code != code || position.avg_price <= 0.0 {
             return None;
         }
         position.last_price = price;
-        Some((price / position.avg_price - 1.0) * 100.0)
+        let rate = (price / position.avg_price - 1.0) * 100.0;
+        let was_armed = position.profit_guard_armed;
+        if position.target_return_pct > crate::util::AUTO_PROFIT_GUARD_PCT
+            && rate > crate::util::AUTO_PROFIT_GUARD_PCT
+        {
+            position.profit_guard_armed = true;
+        }
+        Some(PositionPriceUpdate {
+            rate,
+            guard_armed_changed: !was_armed && position.profit_guard_armed,
+            profit_guard_triggered: position.profit_guard_armed
+                && rate <= crate::util::AUTO_PROFIT_GUARD_PCT,
+        })
     }
 
     pub fn snapshot(
@@ -753,6 +824,8 @@ impl AutomationRuntime {
         runtime_generation: u64,
         symbols: &AutoSymbols,
         now: Duration,
+        market_day_status: MarketDayStatus,
+        market_day_message: Option<String>,
     ) -> AutomationSnapshot {
         let scenarios = self
             .group
@@ -796,6 +869,7 @@ impl AutomationRuntime {
                 target_price: position.target_price,
                 exit_deadline: position.exit_deadline,
                 shadow: position.shadow,
+                profit_guard_armed: position.profit_guard_armed,
             });
         AutomationSnapshot {
             runtime_id: runtime_id.to_string(),
@@ -810,6 +884,8 @@ impl AutomationRuntime {
             position,
             shadow_cash: self.shadow_cash,
             error: self.error.clone(),
+            market_day_status,
+            market_day_message,
         }
     }
 
@@ -825,6 +901,34 @@ impl AutomationRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn position(target_return_pct: f64) -> OwnedPosition {
+        OwnedPosition {
+            product: ProductKind::Leverage,
+            code: "0193T0".into(),
+            entry_qty: 10,
+            qty: 10,
+            avg_price: 10_000.0,
+            last_price: 10_000.0,
+            target_return_pct,
+            target_price: 10_040,
+            first_fill_at: 1_000,
+            exit_deadline: 1_600,
+            target_order_no: None,
+            target_org_no: None,
+            target_intent_id: None,
+            exit_order_no: None,
+            exit_order_org_no: None,
+            exit_intent_id: None,
+            exit_requested_at: None,
+            pending_exit_reason: None,
+            exit_qty: 0,
+            exit_value: 0.0,
+            trade_id: "profit-guard-test".into(),
+            shadow: false,
+            profit_guard_armed: false,
+        }
+    }
 
     #[test]
     fn 판단_시작_슬롯과_다음_슬롯을_재시작_상태에_보존한다() {
@@ -854,5 +958,74 @@ mod tests {
 
         assert_eq!(saved.next_decision_at, None);
         assert_eq!(saved.last_decision_slot, None);
+    }
+
+    #[test]
+    fn 목표가_03_초과일_때만_초과후_되밀림에서_수익보호가_발동한다() {
+        let mut runtime = AutomationRuntime::new(PersistedAutomation::default(), None);
+        runtime.mark_holding(position(0.4));
+
+        let before = runtime.update_position_price("0193T0", 10_030.0).unwrap();
+        assert!(!before.guard_armed_changed);
+        assert!(!before.profit_guard_triggered);
+
+        let armed = runtime.update_position_price("0193T0", 10_035.0).unwrap();
+        assert!(armed.guard_armed_changed);
+        assert!(!armed.profit_guard_triggered);
+        assert!(runtime.position().unwrap().profit_guard_armed);
+
+        let retraced = runtime.update_position_price("0193T0", 10_030.0).unwrap();
+        assert!(retraced.profit_guard_triggered);
+
+        let mut target_point_three = AutomationRuntime::new(PersistedAutomation::default(), None);
+        target_point_three.mark_holding(position(0.3));
+        let update = target_point_three
+            .update_position_price("0193T0", 10_035.0)
+            .unwrap();
+        assert!(!update.guard_armed_changed);
+        assert!(!update.profit_guard_triggered);
+    }
+
+    #[test]
+    fn 수익보호_무장상태는_구버전_호환과_재시작을_모두_지킨다() {
+        let mut saved = PersistedAutomation {
+            position: Some(position(0.4)),
+            ..PersistedAutomation::default()
+        };
+        saved.position.as_mut().unwrap().profit_guard_armed = true;
+        let json = serde_json::to_value(&saved).unwrap();
+        let restored: PersistedAutomation = serde_json::from_value(json.clone()).unwrap();
+        assert!(restored.position.unwrap().profit_guard_armed);
+
+        let mut old_json = json;
+        old_json["position"]
+            .as_object_mut()
+            .unwrap()
+            .remove("profitGuardArmed");
+        let old: PersistedAutomation = serde_json::from_value(old_json).unwrap();
+        assert!(!old.position.unwrap().profit_guard_armed);
+    }
+
+    #[test]
+    fn auto_청산사유는_장마감_손절_수익보호_최대보유_순으로_승격된다() {
+        let mut runtime = AutomationRuntime::new(PersistedAutomation::default(), None);
+        runtime.mode = ControlMode::Auto;
+        runtime.mark_holding(position(0.4));
+
+        assert!(runtime.begin_exit("max_holding").is_some());
+        assert!(runtime.begin_exit("profit_guard").is_none());
+        assert_eq!(runtime.exit_reason(), Some("profit_guard"));
+        assert!(runtime.begin_exit("max_holding").is_none());
+        assert_eq!(runtime.exit_reason(), Some("profit_guard"));
+        assert!(runtime.begin_exit("stop_loss").is_none());
+        assert_eq!(runtime.exit_reason(), Some("stop_loss"));
+        assert!(runtime.begin_market_close_exit().is_none());
+        assert_eq!(runtime.exit_reason(), Some("market_close"));
+        assert_eq!(
+            runtime
+                .position()
+                .and_then(|position| position.pending_exit_reason.as_deref()),
+            Some("market_close")
+        );
     }
 }

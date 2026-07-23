@@ -370,6 +370,7 @@ body {
 }
 
 .automation-position > :first-child { font-weight: 700; }
+.position-profit-guard { color: var(--accent); }
 .position-timer { margin-left: auto; color: var(--accent); }
 
 .shadow-cash {
@@ -383,6 +384,14 @@ body {
   padding: 4px 6px;
   border-top: 1px solid rgba(229, 72, 77, 0.3);
   color: var(--up);
+  font-size: 9px;
+  overflow-wrap: anywhere;
+}
+
+.automation-market-message {
+  padding: 4px 6px;
+  border-top: 1px solid var(--border);
+  color: var(--text-dim);
   font-size: 9px;
   overflow-wrap: anywhere;
 }

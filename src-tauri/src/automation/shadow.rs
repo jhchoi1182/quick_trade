@@ -8,6 +8,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::broker::ShadowCashSource;
+use crate::util::AUTO_PROFIT_GUARD_PCT;
 
 /// 진입에 사용하는 가상현금 비율(95%).
 pub const CASH_USE_BPS: u64 = 9_500;
@@ -76,6 +77,7 @@ pub enum ExitReason {
     TargetReached,
     ModeExit,
     MaxHolding,
+    ProfitGuard,
     StopLoss,
     MarketClose,
 }
@@ -86,8 +88,9 @@ impl ExitReason {
             Self::TargetReached => 0,
             Self::ModeExit => 1,
             Self::MaxHolding => 2,
-            Self::StopLoss => 3,
-            Self::MarketClose => 4,
+            Self::ProfitGuard => 3,
+            Self::StopLoss => 4,
+            Self::MarketClose => 5,
         }
     }
 
@@ -198,6 +201,8 @@ pub struct ShadowPosition {
     pub target_price: u64,
     pub first_fill_time: i64,
     pub last_price: u64,
+    #[serde(default)]
+    pub profit_guard_armed: bool,
 }
 
 impl ShadowPosition {
@@ -529,6 +534,7 @@ impl ShadowSession {
             target_price,
             first_fill_time: now,
             last_price: book.ask_price,
+            profit_guard_armed: false,
         });
         self.target_order_id = Some(target_order_id);
         self.forced_order_id = None;
@@ -566,6 +572,13 @@ impl ShadowSession {
             .as_mut()
             .expect("위에서 확인한 포지션")
             .last_price = tick.price;
+        if let Some(position) = self.position.as_mut() {
+            if position.target_return_pct > AUTO_PROFIT_GUARD_PCT
+                && position.simple_return_pct() > AUTO_PROFIT_GUARD_PCT
+            {
+                position.profit_guard_armed = true;
+            }
+        }
 
         if let Some(reason) = self.select_forced_reason(tick.at, false) {
             self.begin_forced_exit(reason, tick.at)?;
@@ -639,6 +652,10 @@ impl ShadowSession {
             Some(ExitReason::MarketClose)
         } else if position.simple_return_pct() <= STOP_LOSS_PCT + FLOAT_EPSILON {
             Some(ExitReason::StopLoss)
+        } else if position.profit_guard_armed
+            && position.simple_return_pct() <= AUTO_PROFIT_GUARD_PCT + FLOAT_EPSILON
+        {
+            Some(ExitReason::ProfitGuard)
         } else if now >= position.first_fill_time
             && now - position.first_fill_time >= MAX_HOLD_SECONDS
         {
@@ -1090,6 +1107,57 @@ mod tests {
             })
             .unwrap();
         assert_eq!(stopped.exit_reason, Some(ExitReason::StopLoss));
+    }
+
+    #[test]
+    fn 목표가_03_초과인_섀도포지션은_초과후_되밀림에서_수익을_보호한다() {
+        let now = at(10, 0, 0);
+        let mut session = ShadowSession::start(1_000_000);
+        enter(&mut session, now, 10_000, 10, 9_995, 10, 0.4);
+
+        let armed = session
+            .on_trade_tick(ShadowTradeTick {
+                product: ShadowProduct::Leverage,
+                sequence: 1,
+                price: 10_035,
+                volume: 10,
+                at: now + 1,
+            })
+            .unwrap();
+        assert!(armed.fill.is_none());
+        assert!(session.position().unwrap().profit_guard_armed);
+
+        session
+            .on_book(book(2, 10_035, 10, 10_030, 10, now + 1))
+            .unwrap();
+        let protected = session
+            .on_trade_tick(ShadowTradeTick {
+                product: ShadowProduct::Leverage,
+                sequence: 2,
+                price: 10_030,
+                volume: 10,
+                at: now + 2,
+            })
+            .unwrap();
+        assert_eq!(protected.exit_reason, Some(ExitReason::ProfitGuard));
+        assert!(protected.position_closed);
+        assert_eq!(
+            session.orders().last().unwrap().kind,
+            ShadowOrderKind::ForcedExit(ExitReason::ProfitGuard)
+        );
+
+        let mut point_three = ShadowSession::start(1_000_000);
+        enter(&mut point_three, now, 10_000, 10, 9_995, 10, 0.3);
+        point_three
+            .on_trade_tick(ShadowTradeTick {
+                product: ShadowProduct::Leverage,
+                sequence: 1,
+                price: 10_025,
+                volume: 10,
+                at: now + 1,
+            })
+            .unwrap();
+        assert!(!point_three.position().unwrap().profit_guard_armed);
     }
 
     #[test]

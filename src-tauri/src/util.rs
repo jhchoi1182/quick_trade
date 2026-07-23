@@ -67,6 +67,9 @@ pub const STOP_LOSS_PCT: f64 = -0.6;
 /// 자동·섀도 포지션 전용 손절선. 수동 포지션의 -0.6%와 분리한다.
 pub const AUTO_STOP_LOSS_PCT: f64 = -0.3;
 
+/// 목표수익률이 이 값보다 높을 때만 적용하는 자동·섀도 수익 보호선.
+pub const AUTO_PROFIT_GUARD_PCT: f64 = 0.3;
+
 /// 매수 지정가: 기준 가격 +3%, 호가단위에 맞춰 내림 정렬
 pub fn buy_limit_price(base: u64, etf: bool) -> u64 {
     let raw = base + base * BUY_PREMIUM_PCT / 100;

@@ -6,6 +6,12 @@ use tokio::task::JoinHandle;
 use crate::error::AppResult;
 use crate::types::{AccountSnapshot, Candle, FeedEvent, Quote, Side};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrokerMarketDay {
+    pub date: String,
+    pub is_open: bool,
+}
+
 /// 주문 접수 응답 (체결은 피드의 Fill 이벤트로 별도 통지)
 #[derive(Debug, Clone)]
 pub struct OrderAck {
@@ -126,6 +132,15 @@ impl ShadowCashSource for BrokerShadowCashSource {
 /// 실전 브로커 인터페이스. 테스트에서는 cfg(test) 더블로 구현한다.
 #[async_trait::async_trait]
 pub trait Broker: Send + Sync {
+    /// KIS 국내휴장일조회 결과. 제품 런타임은 오늘 날짜의 `opnd_yn`을 사용한다.
+    /// 기본값은 테스트 더블 호환용이며 실제 브로커는 반드시 정확한 달력을 구현한다.
+    async fn market_days(&self, basis_date: &str) -> AppResult<Vec<BrokerMarketDay>> {
+        Ok(vec![BrokerMarketDay {
+            date: basis_date.to_string(),
+            is_open: true,
+        }])
+    }
+
     /// 차트용 1분봉 (MA120 계산이 가능하도록 과거 영업일 포함 약 5일치)
     async fn candles_1m(&self, code: &str) -> AppResult<Vec<Candle>>;
 
