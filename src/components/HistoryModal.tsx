@@ -2,6 +2,13 @@ import { useEffect, useRef, useState } from "react";
 import { listLlmDecisions, listTradeRecords } from "../lib/tauri";
 import { formatPrice, formatRate, rateClass } from "../lib/format";
 import { formatLlmTokenUsage } from "../lib/llmUsage";
+import {
+  formatDecisionStatus,
+  formatEmptyDecisionMessage,
+  formatLedgerScenarioStatus,
+  formatMarketRegime,
+  formatSetupLabel,
+} from "../lib/automationPresentation";
 import { useUiStore } from "../stores/uiStore";
 import type {
   CursorPage,
@@ -82,26 +89,58 @@ function DecisionRecordRow({ record }: { record: LlmDecisionRecord }) {
     <article className="history-card decision-record-card">
       <div className="history-card-head">
         <span className="origin-tag origin-auto">LLM</span>
-        <b>{record.status}</b>
+        <b>{formatDecisionStatus(record.status)}</b>
         <time>{formatDateTime(record.asOfTs)}</time>
+      </div>
+      <div className="decision-context">
+        <b>{formatMarketRegime(record.marketRegime)}</b>
+        {record.decisionSummaryKo ? <p>{record.decisionSummaryKo}</p> : null}
       </div>
       <div className="decision-scenarios">
         {record.scenarios.length === 0 ? (
-          <span className="flat">SKIP</span>
+          <span className="flat">
+            {formatEmptyDecisionMessage(record.status, Boolean(record.decisionSummaryKo))}
+          </span>
         ) : (
           record.scenarios.slice(0, 2).map((scenario, index) => (
             <div key={scenario.id ?? `${scenario.product}-${index}`}>
-              <span>{scenario.product === "leverage" ? "↑" : "↓"}</span>
-              <b>{DECISION_PRODUCT_LABEL[scenario.product]}</b>
-              <span>{formatPrice(scenario.triggerPrice)}</span>
-              <span>+{scenario.targetReturnPct.toFixed(1)}%</span>
-              <span className={`decision-status status-${scenario.status}`}>{scenario.status}</span>
+              <div className="decision-scenario-head">
+                <span>{scenario.product === "leverage" ? "↑" : "↓"}</span>
+                <b>{formatSetupLabel(scenario.product, scenario.setupType)}</b>
+                <span>{DECISION_PRODUCT_LABEL[scenario.product]}</span>
+                <span>목표 +{scenario.targetReturnPct.toFixed(1)}%</span>
+                <span className={`decision-status status-${scenario.status}`}>
+                  {formatLedgerScenarioStatus(scenario.status)}
+                </span>
+              </div>
+              <div className="decision-levels">
+                <span>R {scenario.referencePrice ? formatPrice(scenario.referencePrice) : "-"}</span>
+                <span>C {scenario.confirmationPrice ? formatPrice(scenario.confirmationPrice) : "-"}</span>
+                <span>적용 C {formatPrice(scenario.triggerPrice)}</span>
+                <span>I {scenario.invalidationPrice ? formatPrice(scenario.invalidationPrice) : "-"}</span>
+              </div>
+              {scenario.rationaleKo ? <p className="decision-rationale">{scenario.rationaleKo}</p> : null}
+              {(scenario.setupType === "reversal" && scenario.referenceObservedAt)
+                || scenario.terminalReason ? (
+                <div className="decision-terminal">
+                  {scenario.setupType === "reversal" ? (
+                    scenario.referenceObservedAt ? (
+                      <span>기준선 관찰 {formatDateTime(scenario.referenceObservedAt)}</span>
+                    ) : (
+                      <span>기준선 미관찰</span>
+                    )
+                  ) : null}
+                  {scenario.terminalReason ? <span>{scenario.terminalReason}</span> : null}
+                </div>
+              ) : null}
             </div>
           ))
         )}
       </div>
       <div className="decision-meta">
         {selected ? <span>선택 {DECISION_PRODUCT_LABEL[selected.product]}</span> : null}
+        <span>{record.model}</span>
+        <span>프롬프트 {record.promptVersion}</span>
         {record.inputTokens > 0 || record.cacheWriteTokens > 0 || record.outputTokens > 0 ? (
           <span>{formatLlmTokenUsage(record)}</span>
         ) : null}

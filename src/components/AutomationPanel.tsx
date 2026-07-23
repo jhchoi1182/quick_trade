@@ -1,6 +1,12 @@
 import { useEffect, useState } from "react";
 import type { AutomationPhase, AutomationScenario, ScenarioProduct } from "../types";
 import { formatCompactKrw, formatPrice, formatRate, rateClass } from "../lib/format";
+import {
+  formatEmptyDecisionMessage,
+  formatLiveScenarioProgress,
+  formatMarketRegime,
+  formatSetupLabel,
+} from "../lib/automationPresentation";
 import { useAutomationStore } from "../stores/automationStore";
 
 const EMPTY_SCENARIOS: AutomationScenario[] = [];
@@ -10,7 +16,7 @@ const PHASE_LABEL: Record<AutomationPhase, string> = {
   reconciling: "주문·잔고 확인",
   idle: "다음 판단 대기",
   analyzing: "LLM 분석 중",
-  armedOco: "양방향 조건 감시",
+  armedOco: "진입 시나리오 감시",
   entryPending: "진입 주문 확인",
   holding: "포지션 관리",
   exitPending: "청산 주문 확인",
@@ -31,27 +37,6 @@ function formatClock(fakeKstEpoch: number | null | undefined): string {
   return `${hour}:${minute}`;
 }
 
-function scenarioProgress(scenario: AutomationScenario): string {
-  if (scenario.status === "confirming") {
-    const seconds = Math.min(3, Math.max(0, (scenario.confirmingElapsedMs ?? 0) / 1000));
-    return `${scenario.product === "LEVERAGE" ? "상단" : "하단"} 확인 ${seconds.toFixed(1)}초 · ${Math.min(3, scenario.confirmingTicks ?? 0)}/3틱`;
-  }
-  switch (scenario.status) {
-    case "armed":
-      return "조건 대기";
-    case "triggered":
-      return "진입 확정";
-    case "cancelledByOco":
-      return "OCO 취소";
-    case "expired":
-      return "만료";
-    case "replaced":
-      return "새 판단으로 교체";
-    case "invalid":
-      return "무효";
-  }
-}
-
 function useDeadlineSeconds(deadline: number | undefined): number | undefined {
   const calculate = () => deadline === undefined
     ? undefined
@@ -70,6 +55,9 @@ function useDeadlineSeconds(deadline: number | undefined): number | undefined {
 
 function ScenarioRow({ scenario }: { scenario: AutomationScenario }) {
   const isUp = scenario.product === "LEVERAGE";
+  const referencePrice = scenario.referencePrice ?? scenario.triggerPrice;
+  const confirmationPrice = scenario.triggerPrice;
+  const progress = formatLiveScenarioProgress(scenario);
   return (
     <div className={`automation-scenario ${isUp ? "up-scenario" : "down-scenario"}`}>
       <span className="scenario-arrow" aria-hidden="true">
@@ -77,10 +65,28 @@ function ScenarioRow({ scenario }: { scenario: AutomationScenario }) {
       </span>
       <div className="scenario-main">
         <div className="scenario-condition">
-          <b>{formatPrice(scenario.triggerPrice)}</b> 확인 시 {PRODUCT_LABEL[scenario.product]}
+          <b>{formatSetupLabel(scenario.product, scenario.setupType)}</b>
+          <span>{PRODUCT_LABEL[scenario.product]}</span>
           <span className="scenario-target">목표 +{scenario.targetReturnPct.toFixed(1)}%</span>
         </div>
-        <div className={`scenario-progress status-${scenario.status}`}>{scenarioProgress(scenario)}</div>
+        <div className="scenario-levels">
+          <span>R {formatPrice(referencePrice)}</span>
+          <span>→ C {formatPrice(confirmationPrice)}</span>
+          <span>I {scenario.invalidationPrice ? formatPrice(scenario.invalidationPrice) : "-"}</span>
+        </div>
+        {scenario.rationaleKo ? (
+          <div className="scenario-rationale" title={scenario.rationaleKo}>{scenario.rationaleKo}</div>
+        ) : null}
+        <div
+          className={`scenario-progress status-${scenario.status}`}
+          title={scenario.terminalReason ?? undefined}
+        >
+          {progress}
+          {scenario.setupType === "REVERSAL" && scenario.referenceObservedAt
+            ? ` · R ${formatClock(scenario.referenceObservedAt)} 관찰`
+            : ""}
+          {scenario.terminalReason ? ` · ${scenario.terminalReason}` : ""}
+        </div>
       </div>
     </div>
   );
@@ -90,6 +96,9 @@ export function AutomationPanel() {
   const mode = useAutomationStore((s) => s.snapshot?.mode ?? "manual");
   const phase = useAutomationStore((s) => s.snapshot?.phase ?? "reconciling");
   const nextDecisionAt = useAutomationStore((s) => s.snapshot?.nextDecisionAt ?? null);
+  const decisionStatus = useAutomationStore((s) => s.snapshot?.decisionStatus ?? null);
+  const marketRegime = useAutomationStore((s) => s.snapshot?.marketRegime ?? null);
+  const decisionSummaryKo = useAutomationStore((s) => s.snapshot?.decisionSummaryKo ?? null);
   const scenarios = useAutomationStore((s) => s.snapshot?.scenarios ?? EMPTY_SCENARIOS);
   const position = useAutomationStore((s) => s.snapshot?.position ?? null);
   const shadowCash = useAutomationStore((s) => s.snapshot?.shadowCash ?? null);
@@ -110,6 +119,13 @@ export function AutomationPanel() {
         <span className="automation-phase">{phaseLabel}</span>
         <span className="automation-next">다음 {formatClock(nextDecisionAt)}</span>
       </div>
+
+      {marketRegime || decisionSummaryKo ? (
+        <div className="automation-decision-context">
+          <span>{formatMarketRegime(marketRegime)}</span>
+          {decisionSummaryKo ? <p title={decisionSummaryKo}>{decisionSummaryKo}</p> : null}
+        </div>
+      ) : null}
 
       {position ? (
         <div className="automation-position">
@@ -136,7 +152,9 @@ export function AutomationPanel() {
         </div>
       ) : !position ? (
         <div className="automation-empty">
-          {phase === "analyzing" ? "현재 시세와 10·15분봉을 분석하고 있습니다" : "무장된 진입 조건이 없습니다"}
+          {phase === "analyzing"
+            ? "현재 시세와 1·3·5·15분봉을 분석하고 있습니다"
+            : formatEmptyDecisionMessage(decisionStatus, Boolean(decisionSummaryKo))}
         </div>
       ) : null}
 

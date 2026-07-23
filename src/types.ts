@@ -121,6 +121,19 @@ export type AutomationPhase =
   | "suspended";
 
 export type ScenarioProduct = "LEVERAGE" | "INVERSE";
+export type SetupType = "CONTINUATION" | "REVERSAL";
+export type MarketRegime = "UPTREND" | "DOWNTREND" | "RANGE" | "TRANSITION" | "UNCLEAR";
+export type AutomationDecisionStatus =
+  | "armed"
+  | "skipped"
+  | "triggered"
+  | "expired"
+  | "replaced"
+  | "missed"
+  | "invalidated"
+  | "invalid"
+  | "error"
+  | "discarded";
 
 export type ScenarioStatus =
   | "armed"
@@ -129,15 +142,25 @@ export type ScenarioStatus =
   | "expired"
   | "replaced"
   | "cancelledByOco"
+  | "missed"
+  | "invalidated"
   | "invalid";
 
 export interface AutomationScenario {
   id?: string | number;
   code?: string;
   product: ScenarioProduct;
+  /** 구 런타임 스냅샷에는 없을 수 있다. */
+  setupType?: SetupType;
+  referencePrice?: number;
+  confirmationPrice?: number;
+  invalidationPrice?: number;
   triggerPrice: number;
   targetReturnPct: number;
+  rationaleKo?: string;
   status: ScenarioStatus;
+  referenceObservedAt?: number | null;
+  terminalReason?: string | null;
   confirmingElapsedMs?: number;
   confirmingTicks?: number;
 }
@@ -166,6 +189,10 @@ export interface AutomationSnapshot {
   nextDecisionAt: number | null;
   decisionId?: number | null;
   groupId?: string | number | null;
+  /** 구 런타임 스냅샷 호환을 위해 optional로 받는다. */
+  decisionStatus?: AutomationDecisionStatus | null;
+  marketRegime?: MarketRegime | null;
+  decisionSummaryKo?: string | null;
   scenarios: AutomationScenario[];
   position?: AutomationPosition | null;
   shadowCash?: number | null;
@@ -203,14 +230,32 @@ export interface TradeRecord {
 }
 
 export type DecisionScenarioProduct = "leverage" | "inverse";
+export type DecisionSetupType = "continuation" | "reversal";
+export type DecisionMarketRegime = "uptrend" | "downtrend" | "range" | "transition" | "unclear";
 
 export interface DecisionScenarioRecord {
   id: number;
   decisionId: string;
   product: DecisionScenarioProduct;
+  setupType?: DecisionSetupType | null;
+  referencePrice?: number | null;
+  confirmationPrice?: number | null;
+  invalidationPrice?: number | null;
   triggerPrice: number;
   targetReturnPct: number;
-  status: "armed" | "confirming" | "triggered" | "expired" | "replaced" | "cancelled_by_oco" | "invalid";
+  rationaleKo?: string | null;
+  status:
+    | "armed"
+    | "confirming"
+    | "triggered"
+    | "expired"
+    | "replaced"
+    | "cancelled_by_oco"
+    | "missed"
+    | "invalidated"
+    | "invalid";
+  referenceObservedAt?: number | null;
+  terminalReason?: string | null;
   confirmationStartedAt?: number | null;
   confirmationTickCount: number;
   updatedAt: number;
@@ -225,9 +270,11 @@ export interface LlmDecisionRecord {
   asOfTs: number;
   expiresAt: number;
   underlyingPrice: number;
-  status: "armed" | "skipped" | "triggered" | "expired" | "replaced" | "invalid" | "error" | "discarded";
+  status: AutomationDecisionStatus;
   model: string;
   promptVersion: string;
+  marketRegime?: DecisionMarketRegime | null;
+  decisionSummaryKo?: string | null;
   inputTokens: number;
   cachedInputTokens: number;
   cacheWriteTokens: number;

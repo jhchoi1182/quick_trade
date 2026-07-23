@@ -313,12 +313,36 @@ body {
 .automation-phase { flex: 1; color: var(--text); }
 .automation-next { color: var(--text-dim); white-space: nowrap; }
 
+.automation-decision-context {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 5px;
+  padding: 3px 6px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: 9px;
+}
+
+.automation-decision-context > span {
+  color: var(--accent);
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.automation-decision-context p {
+  overflow: hidden;
+  margin: 0;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .automation-scenarios { display: flex; flex-direction: column; }
 
 .automation-scenario {
   display: flex;
   align-items: center;
-  min-height: 34px;
+  min-height: 52px;
   padding: 4px 6px;
 }
 
@@ -346,13 +370,34 @@ body {
 
 .scenario-condition b { font-size: 11px; }
 .scenario-target { margin-left: auto; color: var(--accent); font-weight: 700; }
-.scenario-progress { margin-top: 1px; color: var(--text-dim); font-size: 9px; }
+.scenario-levels {
+  display: flex;
+  gap: 7px;
+  margin-top: 1px;
+  color: var(--text-dim);
+  font-size: 9px;
+  white-space: nowrap;
+}
+
+.scenario-rationale,
+.scenario-progress {
+  overflow: hidden;
+  margin-top: 1px;
+  color: var(--text-dim);
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.scenario-rationale { color: var(--text); }
 .status-confirming { color: var(--accent); }
 .status-triggered { color: #2ecc71; }
 .status-cancelledByOco,
 .status-expired,
 .status-replaced,
+.status-missed,
 .status-invalid { color: var(--text-dim); }
+.status-invalidated { color: var(--up); }
 
 .automation-empty {
   padding: 8px;
@@ -902,6 +947,25 @@ body {
 .history-result b { font-size: 11px; }
 .history-result time { margin-left: auto; }
 
+.decision-context {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin-top: 5px;
+  color: var(--text-dim);
+  font-size: 9px;
+}
+
+.decision-context b {
+  flex: none;
+  color: var(--accent);
+}
+
+.decision-context p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
 .decision-scenarios {
   display: flex;
   flex-direction: column;
@@ -910,14 +974,43 @@ body {
 }
 
 .decision-scenarios > div {
-  display: grid;
-  grid-template-columns: 12px 48px 1fr 36px auto;
-  gap: 4px;
-  align-items: center;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
   font-size: 9px;
 }
 
+.decision-scenario-head {
+  display: grid;
+  grid-template-columns: 12px 52px 42px 1fr auto;
+  gap: 4px;
+  align-items: center;
+}
+
+.decision-levels {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px 8px;
+  margin-top: 3px;
+  color: var(--text-dim);
+}
+
+.decision-rationale {
+  margin: 3px 0 0;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.decision-terminal {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px 8px;
+  margin-top: 3px;
+  color: var(--text-dim);
+}
+
 .decision-status { color: var(--text-dim); text-align: right; }
+.decision-meta { flex-wrap: wrap; }
 .decision-meta span + span { margin-left: 5px; }
 .history-error { color: var(--up); overflow-wrap: anywhere; }
 

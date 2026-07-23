@@ -5,9 +5,10 @@ use serde::Serialize;
 use crate::error::{AppError, AppResult};
 use crate::types::Candle;
 
-pub const COMPOSITE_WIDTH: u32 = 1_280;
-pub const COMPOSITE_HEIGHT: u32 = 768;
+pub const COMPOSITE_WIDTH: u32 = 1_600;
+pub const COMPOSITE_HEIGHT: u32 = 1_000;
 const VISIBLE_BARS: usize = 60;
+const PAYLOAD_BARS: usize = 30;
 const MA_PERIODS: [usize; 4] = [5, 20, 60, 120];
 
 const BG: Rgb<u8> = Rgb([12, 17, 27]);
@@ -17,6 +18,7 @@ const BORDER: Rgb<u8> = Rgb([72, 82, 102]);
 const UP: Rgb<u8> = Rgb([235, 73, 88]);
 const DOWN: Rgb<u8> = Rgb([57, 128, 232]);
 const FLAT: Rgb<u8> = Rgb([174, 181, 194]);
+const LIVE: Rgb<u8> = Rgb([255, 174, 66]);
 const MA_COLORS: [Rgb<u8>; 4] = [
     Rgb([255, 211, 74]),
     Rgb([81, 209, 139]),
@@ -35,18 +37,48 @@ pub struct MovingAveragePayload {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AverageVolumePayload {
+    pub volume5: Option<f64>,
+    pub volume20: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TimeframeIndicatorPayload {
     pub interval_minutes: u32,
-    pub bar_count: usize,
-    pub current_ohlcv: Option<Candle>,
+    pub completed_candles: Vec<Candle>,
+    pub forming_candle: Option<Candle>,
+    pub forming_progress_pct: Option<f64>,
     pub moving_averages: MovingAveragePayload,
+    pub average_volumes: AverageVolumePayload,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DayIndicatorPayload {
+    pub open: Option<f64>,
+    pub high: Option<f64>,
+    pub low: Option<f64>,
+    pub hlc3_volume_weighted_average: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IndicatorPayload {
-    pub ten_minute: TimeframeIndicatorPayload,
+    pub as_of_epoch: i64,
+    pub day: DayIndicatorPayload,
+    pub one_minute: TimeframeIndicatorPayload,
+    pub three_minute: TimeframeIndicatorPayload,
+    pub five_minute: TimeframeIndicatorPayload,
     pub fifteen_minute: TimeframeIndicatorPayload,
+}
+
+#[derive(Debug, Clone)]
+struct TimeframeSeries {
+    interval_minutes: u32,
+    completed: Vec<Candle>,
+    forming: Option<Candle>,
+    forming_progress_pct: Option<f64>,
 }
 
 /// 오름차순 1분봉을 지정 분봉으로 집계한다. 입력 순서가 섞여 있어도
@@ -103,46 +135,77 @@ pub fn last_moving_average(bars: &[Candle], period: usize) -> Option<f64> {
     Some(sum / period as f64)
 }
 
-/// LLM의 텍스트 입력에 넣을 10·15분 현재 OHLCV와 MA 5/20/60/120.
-pub fn indicator_payload(one_minute: &[Candle]) -> IndicatorPayload {
-    let ten = aggregate_candles(one_minute, 10);
-    let fifteen = aggregate_candles(one_minute, 15);
+fn last_average_volume(bars: &[Candle], period: usize) -> Option<f64> {
+    if period == 0 || bars.len() < period {
+        return None;
+    }
+    let sum: f64 = bars[bars.len() - period..]
+        .iter()
+        .map(|bar| bar.volume.max(0.0))
+        .sum();
+    Some(sum / period as f64)
+}
+
+/// 판단 시각을 기준으로 1·3·5·15분봉의 완성봉과 형성 중 봉을 분리한다.
+/// `as_of_epoch`은 Candle.time과 동일한 KST 벽시계 기반 가짜 epoch다.
+pub fn indicator_payload(one_minute: &[Candle], as_of_epoch: i64) -> IndicatorPayload {
     IndicatorPayload {
-        ten_minute: timeframe_payload(10, &ten),
-        fifteen_minute: timeframe_payload(15, &fifteen),
+        as_of_epoch,
+        day: day_payload(one_minute, as_of_epoch),
+        one_minute: timeframe_payload(&timeframe_series(one_minute, 1, as_of_epoch)),
+        three_minute: timeframe_payload(&timeframe_series(one_minute, 3, as_of_epoch)),
+        five_minute: timeframe_payload(&timeframe_series(one_minute, 5, as_of_epoch)),
+        fifteen_minute: timeframe_payload(&timeframe_series(one_minute, 15, as_of_epoch)),
     }
 }
 
-/// 최근 60개 10분봉과 15분봉을 좌우 패널로 그린 1280×768 PNG.
-/// 외부 폰트 없이 작은 비트맵 라벨, 캔들, 거래량, 4개 이동평균만 그린다.
-pub fn render_composite_png(one_minute: &[Candle]) -> AppResult<Vec<u8>> {
-    let ten = aggregate_candles(one_minute, 10);
-    let fifteen = aggregate_candles(one_minute, 15);
+/// 최근 60개 1·3·5·15분봉을 2×2 패널로 그린 1600×1000 PNG.
+/// 가격·시간축과 거래량, 완성봉 기준 이동평균, 형성 중 봉의 LIVE 표시를 포함한다.
+pub fn render_composite_png(one_minute: &[Candle], as_of_epoch: i64) -> AppResult<Vec<u8>> {
+    let frames = [
+        (
+            timeframe_series(one_minute, 1, as_of_epoch),
+            "1 MIN",
+            Rgb([79, 145, 255]),
+        ),
+        (
+            timeframe_series(one_minute, 3, as_of_epoch),
+            "3 MIN",
+            Rgb([130, 116, 255]),
+        ),
+        (
+            timeframe_series(one_minute, 5, as_of_epoch),
+            "5 MIN",
+            Rgb([66, 198, 153]),
+        ),
+        (
+            timeframe_series(one_minute, 15, as_of_epoch),
+            "15 MIN",
+            Rgb([255, 151, 71]),
+        ),
+    ];
     let mut image = RgbImage::from_pixel(COMPOSITE_WIDTH, COMPOSITE_HEIGHT, BG);
 
     let margin = 16;
     let gap = 16;
     let panel_width = (COMPOSITE_WIDTH - margin * 2 - gap) / 2;
-    let panel_height = COMPOSITE_HEIGHT - margin * 2;
-    render_panel(
-        &mut image,
-        Rect::new(margin, margin, panel_width, panel_height),
-        &ten,
-        "10 MIN",
-        Rgb([79, 145, 255]),
-    );
-    render_panel(
-        &mut image,
-        Rect::new(
-            margin + panel_width + gap,
-            margin,
-            panel_width,
-            panel_height,
-        ),
-        &fifteen,
-        "15 MIN",
-        Rgb([255, 151, 71]),
-    );
+    let panel_height = (COMPOSITE_HEIGHT - margin * 2 - gap) / 2;
+    for (index, (frame, label, accent)) in frames.iter().enumerate() {
+        let column = index as u32 % 2;
+        let row = index as u32 / 2;
+        render_panel(
+            &mut image,
+            Rect::new(
+                margin + column * (panel_width + gap),
+                margin + row * (panel_height + gap),
+                panel_width,
+                panel_height,
+            ),
+            frame,
+            label,
+            *accent,
+        );
+    }
 
     let mut png = Vec::new();
     PngEncoder::new(&mut png)
@@ -156,17 +219,99 @@ pub fn render_composite_png(one_minute: &[Candle]) -> AppResult<Vec<u8>> {
     Ok(png)
 }
 
-fn timeframe_payload(interval_minutes: u32, bars: &[Candle]) -> TimeframeIndicatorPayload {
-    TimeframeIndicatorPayload {
+fn timeframe_series(
+    one_minute: &[Candle],
+    interval_minutes: u32,
+    as_of_epoch: i64,
+) -> TimeframeSeries {
+    let visible_source: Vec<Candle> = one_minute
+        .iter()
+        .copied()
+        .filter(|bar| bar.time <= as_of_epoch)
+        .collect();
+    let aggregated = aggregate_candles(&visible_source, interval_minutes);
+    let bucket_seconds = i64::from(interval_minutes) * 60;
+    let current_bucket = as_of_epoch.div_euclid(bucket_seconds) * bucket_seconds;
+    let split_at = aggregated.partition_point(|bar| bar.time < current_bucket);
+    let completed = aggregated[..split_at].to_vec();
+    let forming = aggregated
+        .get(split_at)
+        .copied()
+        .filter(|bar| bar.time == current_bucket);
+    let forming_progress_pct = forming.map(|_| {
+        (as_of_epoch.saturating_sub(current_bucket) as f64 / bucket_seconds as f64 * 100.0)
+            .clamp(0.0, 100.0)
+    });
+    TimeframeSeries {
         interval_minutes,
-        bar_count: bars.len(),
-        current_ohlcv: bars.last().copied(),
+        completed,
+        forming,
+        forming_progress_pct,
+    }
+}
+
+fn timeframe_payload(series: &TimeframeSeries) -> TimeframeIndicatorPayload {
+    let start = series.completed.len().saturating_sub(PAYLOAD_BARS);
+    TimeframeIndicatorPayload {
+        interval_minutes: series.interval_minutes,
+        completed_candles: series.completed[start..].to_vec(),
+        forming_candle: series.forming,
+        forming_progress_pct: series.forming_progress_pct,
         moving_averages: MovingAveragePayload {
-            ma5: last_moving_average(bars, 5),
-            ma20: last_moving_average(bars, 20),
-            ma60: last_moving_average(bars, 60),
-            ma120: last_moving_average(bars, 120),
+            ma5: last_moving_average(&series.completed, 5),
+            ma20: last_moving_average(&series.completed, 20),
+            ma60: last_moving_average(&series.completed, 60),
+            ma120: last_moving_average(&series.completed, 120),
         },
+        average_volumes: AverageVolumePayload {
+            volume5: last_average_volume(&series.completed, 5),
+            volume20: last_average_volume(&series.completed, 20),
+        },
+    }
+}
+
+fn day_payload(one_minute: &[Candle], as_of_epoch: i64) -> DayIndicatorPayload {
+    let day = as_of_epoch.div_euclid(86_400);
+    let mut bars: Vec<Candle> = one_minute
+        .iter()
+        .copied()
+        .filter(|bar| {
+            bar.time <= as_of_epoch
+                && bar.time.div_euclid(86_400) == day
+                && bar.open.is_finite()
+                && bar.high.is_finite()
+                && bar.low.is_finite()
+                && bar.close.is_finite()
+                && bar.volume.is_finite()
+        })
+        .collect();
+    bars.sort_by_key(|bar| bar.time);
+    let Some(first) = bars.first() else {
+        return DayIndicatorPayload {
+            open: None,
+            high: None,
+            low: None,
+            hlc3_volume_weighted_average: None,
+        };
+    };
+
+    let high = bars
+        .iter()
+        .map(|bar| bar.high)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let low = bars.iter().map(|bar| bar.low).fold(f64::INFINITY, f64::min);
+    let total_volume: f64 = bars.iter().map(|bar| bar.volume.max(0.0)).sum();
+    let hlc3_volume_weighted_average = (total_volume > 0.0).then(|| {
+        bars.iter()
+            .map(|bar| ((bar.high + bar.low + bar.close) / 3.0) * bar.volume.max(0.0))
+            .sum::<f64>()
+            / total_volume
+    });
+    DayIndicatorPayload {
+        open: Some(first.open),
+        high: high.is_finite().then_some(high),
+        low: low.is_finite().then_some(low),
+        hlc3_volume_weighted_average,
     }
 }
 
@@ -200,7 +345,7 @@ impl Rect {
 fn render_panel(
     image: &mut RgbImage,
     panel: Rect,
-    all_bars: &[Candle],
+    frame: &TimeframeSeries,
     label: &str,
     accent: Rgb<u8>,
 ) {
@@ -213,39 +358,62 @@ fn render_panel(
     );
     draw_text(image, panel.x + 14, panel.y + 14, label, accent, 2);
 
-    // 이동평균 색 범례. 라벨 없이도 네 선의 색 순서를 고정한다.
-    for (index, color) in MA_COLORS.iter().enumerate() {
-        let x = panel.right().saturating_sub(116) + index as u32 * 27;
-        hline(image, x, x + 18, panel.y + 21, *color);
+    draw_text(image, panel.x + 100, panel.y + 18, "MA", FLAT, 1);
+    let legend = [("5", 5), ("20", 20), ("60", 60), ("120", 120)];
+    for (index, ((text, _), color)) in legend.iter().zip(MA_COLORS.iter()).enumerate() {
+        let x = panel.x + 134 + index as u32 * 76;
+        hline(image, x, x + 20, panel.y + 21, *color);
+        draw_text(image, x + 25, panel.y + 18, text, *color, 1);
+    }
+    if let Some(progress) = frame.forming_progress_pct {
+        let live_text = format!("LIVE {:.0}%", progress);
+        let width = text_width(&live_text, 1);
+        draw_text(
+            image,
+            panel.right().saturating_sub(width + 13),
+            panel.y + 18,
+            &live_text,
+            LIVE,
+            1,
+        );
     }
 
     let plot_left = panel.x + 14;
-    let plot_right = panel.right() - 14;
+    let plot_right = panel.right() - 76;
     let price_top = panel.y + 42;
-    let price_bottom = panel.y + panel.height * 72 / 100;
+    let price_bottom = panel.y + panel.height * 68 / 100;
     let volume_top = price_bottom + 15;
-    let volume_bottom = panel.bottom() - 14;
+    let volume_bottom = panel.bottom() - 34;
 
     for row in 0..=4 {
         let y = price_top + (price_bottom - price_top) * row / 4;
         hline(image, plot_left, plot_right, y, GRID);
     }
-    for column in 0..=6 {
-        let x = plot_left + (plot_right - plot_left) * column / 6;
+    for column in 0..=4 {
+        let x = plot_left + (plot_right - plot_left) * column / 4;
         vline(image, x, price_top, volume_bottom, GRID);
     }
     hline(image, plot_left, plot_right, price_bottom, BORDER);
     hline(image, plot_left, plot_right, volume_top, GRID);
 
-    let start = all_bars.len().saturating_sub(VISIBLE_BARS);
-    let bars = &all_bars[start..];
+    let completed_limit = if frame.forming.is_some() {
+        VISIBLE_BARS.saturating_sub(1)
+    } else {
+        VISIBLE_BARS
+    };
+    let start = frame.completed.len().saturating_sub(completed_limit);
+    let completed_bars = &frame.completed[start..];
+    let mut bars = completed_bars.to_vec();
+    if let Some(forming) = frame.forming {
+        bars.push(forming);
+    }
     if bars.is_empty() {
         return;
     }
 
     let ma_series: Vec<Vec<Option<f64>>> = MA_PERIODS
         .iter()
-        .map(|period| moving_average_series(all_bars, *period))
+        .map(|period| moving_average_series(&frame.completed, *period))
         .collect();
     let mut low = bars.iter().map(|bar| bar.low).fold(f64::INFINITY, f64::min);
     let mut high = bars
@@ -306,6 +474,25 @@ fn render_panel(
             ),
             color,
         );
+        if frame.forming.is_some() && index + 1 == bars.len() {
+            let left = x.saturating_sub(body_half + 2).max(plot_left);
+            let right = (x + body_half + 2).min(plot_right);
+            draw_rect(
+                image,
+                Rect::new(
+                    left,
+                    high_y.min(low_y).saturating_sub(2).max(price_top),
+                    right.saturating_sub(left) + 1,
+                    high_y
+                        .max(low_y)
+                        .saturating_add(2)
+                        .min(price_bottom)
+                        .saturating_sub(high_y.min(low_y).saturating_sub(2).max(price_top))
+                        + 1,
+                ),
+                LIVE,
+            );
+        }
 
         if max_volume > 0.0 {
             let available = volume_bottom - volume_top;
@@ -342,6 +529,51 @@ fn render_panel(
             previous = Some(point);
         }
     }
+
+    for row in 0..=4 {
+        let ratio = row as f64 / 4.0;
+        let value = high - (high - low) * ratio;
+        let y = price_top + (price_bottom - price_top) * row / 4;
+        draw_text(
+            image,
+            plot_right + 8,
+            y.saturating_sub(3),
+            &format_price(value),
+            FLAT,
+            1,
+        );
+    }
+
+    let time_indices = [0, bars.len() / 2, bars.len().saturating_sub(1)];
+    for (position, index) in time_indices.into_iter().enumerate() {
+        let text = format_time(bars[index].time);
+        let x = bar_x(plot_left, slot, index);
+        let label_x = match position {
+            0 => x.saturating_sub(2),
+            1 => x.saturating_sub(text_width(&text, 1) / 2),
+            _ => x.saturating_sub(text_width(&text, 1)),
+        }
+        .max(plot_left)
+        .min(plot_right.saturating_sub(text_width(&text, 1)));
+        draw_text(image, label_x, volume_bottom + 10, &text, FLAT, 1);
+    }
+}
+
+fn format_price(value: f64) -> String {
+    if value.abs() >= 1_000.0 {
+        format!("{value:.0}")
+    } else if value.abs() >= 100.0 {
+        format!("{value:.1}")
+    } else {
+        format!("{value:.2}")
+    }
+}
+
+fn format_time(fake_epoch: i64) -> String {
+    let seconds = fake_epoch.rem_euclid(86_400);
+    let hour = seconds / 3_600;
+    let minute = (seconds % 3_600) / 60;
+    format!("{hour:02}:{minute:02}")
 }
 
 fn moving_average_series(bars: &[Candle], period: usize) -> Vec<Option<f64>> {
@@ -469,6 +701,10 @@ fn draw_text(image: &mut RgbImage, x: u32, y: u32, text: &str, color: Rgb<u8>, s
     }
 }
 
+fn text_width(text: &str, scale: u32) -> u32 {
+    text.chars().count() as u32 * 6 * scale
+}
+
 fn glyph(character: char) -> [u8; 7] {
     match character {
         '0' => [
@@ -501,6 +737,15 @@ fn glyph(character: char) -> [u8; 7] {
         '9' => [
             0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110,
         ],
+        'A' => [
+            0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+        ],
+        'E' => [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111,
+        ],
+        'L' => [
+            0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111,
+        ],
         'M' => [
             0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001,
         ],
@@ -509,6 +754,21 @@ fn glyph(character: char) -> [u8; 7] {
         ],
         'N' => [
             0b10001, 0b11001, 0b11001, 0b10101, 0b10011, 0b10011, 0b10001,
+        ],
+        'V' => [
+            0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100,
+        ],
+        ':' => [
+            0b00000, 0b00100, 0b00100, 0b00000, 0b00100, 0b00100, 0b00000,
+        ],
+        '.' => [
+            0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00110, 0b00110,
+        ],
+        '-' => [
+            0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000,
+        ],
+        '%' => [
+            0b11001, 0b11010, 0b00100, 0b01000, 0b10110, 0b00110, 0b00000,
         ],
         _ => [0; 7],
     }
@@ -519,7 +779,7 @@ mod tests {
     use super::*;
 
     fn minute_bars(count: usize) -> Vec<Candle> {
-        let base = 3_600_i64;
+        let base = 9 * 3_600_i64;
         (0..count)
             .map(|index| {
                 let open = 100.0 + index as f64;
@@ -536,51 +796,132 @@ mod tests {
     }
 
     #[test]
-    fn aggregates_ohlcv_into_ten_and_fifteen_minutes() {
+    fn 일분봉을_1_3_5_15분_ohlcv로_집계한다() {
         let source = minute_bars(30);
-        let ten = aggregate_candles(&source, 10);
+        let one = aggregate_candles(&source, 1);
+        let three = aggregate_candles(&source, 3);
+        let five = aggregate_candles(&source, 5);
         let fifteen = aggregate_candles(&source, 15);
 
-        assert_eq!(ten.len(), 3);
+        assert_eq!(one.len(), 30);
+        assert_eq!(three.len(), 10);
+        assert_eq!(five.len(), 6);
         assert_eq!(fifteen.len(), 2);
-        assert_eq!(ten[0].open, 100.0);
-        assert_eq!(ten[0].high, 111.0);
-        assert_eq!(ten[0].low, 99.0);
-        assert_eq!(ten[0].close, 110.0);
-        assert_eq!(ten[0].volume, (1..=10).sum::<u32>() as f64);
+        assert_eq!(three[0].open, 100.0);
+        assert_eq!(three[0].high, 104.0);
+        assert_eq!(three[0].low, 99.0);
+        assert_eq!(three[0].close, 103.0);
+        assert_eq!(three[0].volume, (1..=3).sum::<u32>() as f64);
         assert_eq!(fifteen[1].open, 115.0);
         assert_eq!(fifteen[1].close, 130.0);
     }
 
     #[test]
-    fn payload_contains_current_ohlcv_and_all_moving_averages() {
-        let source = minute_bars(1_800);
-        let payload = indicator_payload(&source);
+    fn 판단시각을_기준으로_완성봉과_형성봉을_분리한다() {
+        let source = minute_bars(16);
+        let as_of = 9 * 3_600 + 15 * 60 + 30;
+        let payload = indicator_payload(&source, as_of);
 
-        assert_eq!(payload.ten_minute.bar_count, 180);
-        assert_eq!(payload.fifteen_minute.bar_count, 120);
-        assert!(payload.ten_minute.current_ohlcv.is_some());
-        assert!(payload.fifteen_minute.current_ohlcv.is_some());
-        assert!(payload.ten_minute.moving_averages.ma120.is_some());
-        assert!(payload.fifteen_minute.moving_averages.ma120.is_some());
-
-        let fifteen = aggregate_candles(&source, 15);
+        assert_eq!(payload.one_minute.completed_candles.len(), 15);
         assert_eq!(
-            payload.fifteen_minute.moving_averages.ma5,
-            last_moving_average(&fifteen, 5)
+            payload.one_minute.forming_candle.unwrap().time,
+            9 * 3_600 + 15 * 60
+        );
+        assert_eq!(payload.one_minute.forming_progress_pct, Some(50.0));
+        assert_eq!(payload.three_minute.completed_candles.len(), 5);
+        assert_eq!(payload.five_minute.completed_candles.len(), 3);
+        assert_eq!(payload.fifteen_minute.completed_candles.len(), 1);
+        assert!((payload.fifteen_minute.forming_progress_pct.unwrap() - 3.333_333).abs() < 0.001);
+    }
+
+    #[test]
+    fn payload는_최근_완성봉_30개와_완성봉_통계만_담는다() {
+        let mut source = minute_bars(1_802);
+        source.last_mut().unwrap().close = 1_000_000.0;
+        let as_of = 9 * 3_600 + 1_801 * 60 + 30;
+        let payload = indicator_payload(&source, as_of);
+
+        assert_eq!(payload.one_minute.completed_candles.len(), 30);
+        assert_eq!(payload.one_minute.completed_candles[29].close, 1_901.0);
+        assert_eq!(
+            payload.one_minute.forming_candle.unwrap().close,
+            1_000_000.0
+        );
+        assert_eq!(
+            payload.one_minute.moving_averages.ma5,
+            last_moving_average(&source[..1_801], 5)
+        );
+        assert_eq!(
+            payload.one_minute.average_volumes.volume20,
+            last_average_volume(&source[..1_801], 20)
+        );
+        assert!(payload.fifteen_minute.moving_averages.ma120.is_some());
+    }
+
+    #[test]
+    fn 당일_ohl과_hlc3_거래량가중평균을_계산한다() {
+        let source = vec![
+            Candle {
+                time: 9 * 3_600,
+                open: 100.0,
+                high: 110.0,
+                low: 90.0,
+                close: 105.0,
+                volume: 10.0,
+            },
+            Candle {
+                time: 9 * 3_600 + 60,
+                open: 105.0,
+                high: 120.0,
+                low: 100.0,
+                close: 115.0,
+                volume: 30.0,
+            },
+        ];
+        let payload = indicator_payload(&source, 9 * 3_600 + 90);
+        let expected =
+            (((110.0 + 90.0 + 105.0) / 3.0) * 10.0 + ((120.0 + 100.0 + 115.0) / 3.0) * 30.0) / 40.0;
+
+        assert_eq!(payload.day.open, Some(100.0));
+        assert_eq!(payload.day.high, Some(120.0));
+        assert_eq!(payload.day.low, Some(90.0));
+        assert!(
+            (payload.day.hlc3_volume_weighted_average.unwrap() - expected).abs() < f64::EPSILON
         );
     }
 
     #[test]
-    fn composite_is_deterministic_1280_by_768_png() {
+    fn 복합차트는_결정적_1600x1000_png다() {
         let source = minute_bars(1_800);
-        let first = render_composite_png(&source).unwrap();
-        let second = render_composite_png(&source).unwrap();
+        let as_of = source.last().unwrap().time + 30;
+        let first = render_composite_png(&source, as_of).unwrap();
+        let second = render_composite_png(&source, as_of).unwrap();
 
         assert_eq!(&first[..8], b"\x89PNG\r\n\x1a\n");
         assert_eq!(first, second);
         let decoded = image::load_from_memory(&first).unwrap();
         assert_eq!(decoded.width(), COMPOSITE_WIDTH);
         assert_eq!(decoded.height(), COMPOSITE_HEIGHT);
+        let rgb = decoded.to_rgb8();
+        let margin = 16;
+        let gap = 16;
+        let panel_width = (COMPOSITE_WIDTH - margin * 2 - gap) / 2;
+        let panel_height = (COMPOSITE_HEIGHT - margin * 2 - gap) / 2;
+        assert_eq!(*rgb.get_pixel(margin + 1, margin + 1), Rgb([79, 145, 255]));
+        assert_eq!(
+            *rgb.get_pixel(margin + panel_width + gap + 1, margin + 1),
+            Rgb([130, 116, 255])
+        );
+        assert_eq!(
+            *rgb.get_pixel(margin + 1, margin + panel_height + gap + 1),
+            Rgb([66, 198, 153])
+        );
+        assert_eq!(
+            *rgb.get_pixel(
+                margin + panel_width + gap + 1,
+                margin + panel_height + gap + 1
+            ),
+            Rgb([255, 151, 71])
+        );
     }
 }

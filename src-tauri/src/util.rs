@@ -2,8 +2,8 @@ use chrono::{Duration, NaiveDate, NaiveDateTime, Utc};
 use std::sync::OnceLock;
 use std::time::{Duration as StdDuration, Instant};
 
-/// 프로세스 전체에서 공유하는 단조 시계. WebSocket 파서가 채널에 넣기 직전 찍은
-/// 시각과 OCO 무장 시각을 같은 원점으로 비교해 큐에 남아 있던 사전 틱을 차단한다.
+/// 프로세스 전체에서 공유하는 단조 시계. WebSocket 파서의 수신시각과 OCO의
+/// 확인 지속시간·만료·재연결 장벽을 같은 원점에서 비교한다.
 pub fn monotonic_now() -> StdDuration {
     static START: OnceLock<Instant> = OnceLock::new();
     START.get_or_init(Instant::now).elapsed()
@@ -17,6 +17,12 @@ pub fn now_kst() -> NaiveDateTime {
 /// KST 벽시계를 UTC epoch처럼 취급한 "가짜 epoch" 초 (Candle.time / Quote.ts 규약)
 pub fn now_kst_fake_epoch() -> i64 {
     now_kst().and_utc().timestamp()
+}
+
+/// 위 가짜 epoch와 같은 원점의 밀리초 값. 판단 슬롯 만료를 초 경계에 정확히
+/// 맞추면서 OCO 내부에서는 단조 시계 deadline으로 변환할 때 사용한다.
+pub fn now_kst_fake_epoch_millis() -> i64 {
+    now_kst().and_utc().timestamp_millis()
 }
 
 pub fn naive_to_fake_epoch(dt: NaiveDateTime) -> i64 {

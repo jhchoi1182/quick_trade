@@ -61,6 +61,9 @@ export function useTauriEvents(): void {
       listen<unknown>("trade-recorded", () => {
         useUiStore.getState().bumpHistoryRevision();
       }),
+      listen<unknown>("llm-decision-recorded", () => {
+        useUiStore.getState().bumpHistoryRevision();
+      }),
       listen<string>("engine-error", (e) => {
         useUiStore.getState().pushToast("error", e.payload);
       }),

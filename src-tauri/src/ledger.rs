@@ -21,7 +21,7 @@ use rusqlite::{
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const CONTROL_MODE_KEY: &str = "control_mode";
 const DEFAULT_PAGE_SIZE: usize = 50;
 const MAX_PAGE_SIZE: usize = 200;
@@ -179,6 +179,25 @@ ledger_string_enum! {
 }
 
 ledger_string_enum! {
+    /// LLM이 분류한 상위 시간축 시장 국면.
+    pub enum LedgerMarketRegime {
+        Uptrend => "uptrend",
+        Downtrend => "downtrend",
+        Range => "range",
+        Transition => "transition",
+        Unclear => "unclear",
+    }
+}
+
+ledger_string_enum! {
+    /// 추세 지속 진입과 지지·저항 반전 진입을 구분한다.
+    pub enum LedgerSetupType {
+        Continuation => "continuation",
+        Reversal => "reversal",
+    }
+}
+
+ledger_string_enum! {
     pub enum LedgerOrigin {
         Manual => "manual",
         Auto => "auto",
@@ -210,6 +229,8 @@ ledger_string_enum! {
         Triggered => "triggered",
         Expired => "expired",
         Replaced => "replaced",
+        Missed => "missed",
+        Invalidated => "invalidated",
         Invalid => "invalid",
         Error => "error",
         Discarded => "discarded",
@@ -224,6 +245,8 @@ ledger_string_enum! {
         Expired => "expired",
         Replaced => "replaced",
         CancelledByOco => "cancelled_by_oco",
+        Missed => "missed",
+        Invalidated => "invalidated",
         Invalid => "invalid",
     }
 }
@@ -292,6 +315,8 @@ pub struct NewDecision {
     pub latency_ms: u64,
     pub input_hash: Option<String>,
     pub chart_hash: Option<String>,
+    pub market_regime: Option<LedgerMarketRegime>,
+    pub decision_summary_ko: Option<String>,
     pub error: Option<String>,
     pub created_at: i64,
 }
@@ -300,9 +325,28 @@ pub struct NewDecision {
 #[serde(rename_all = "camelCase")]
 pub struct NewDecisionScenario {
     pub product: LedgerProductKind,
+    pub setup_type: Option<LedgerSetupType>,
+    pub reference_price: Option<u64>,
+    pub confirmation_price: Option<u64>,
+    pub invalidation_price: Option<u64>,
     pub trigger_price: u64,
     pub target_return_pct: f64,
+    pub rationale_ko: Option<String>,
     pub status: LedgerScenarioStatus,
+    pub reference_observed_at: Option<i64>,
+    pub terminal_reason: Option<String>,
+}
+
+/// 판단 상태와 함께 원자적으로 반영할 시나리오 상태 변경.
+#[derive(Debug, Clone, Copy)]
+pub struct ScenarioStatusUpdate<'a> {
+    pub product: LedgerProductKind,
+    pub status: LedgerScenarioStatus,
+    pub confirmation_started_at: Option<i64>,
+    pub confirmation_tick_count: u32,
+    pub updated_at: i64,
+    pub terminal_reason: Option<&'a str>,
+    pub reference_observed_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -311,9 +355,16 @@ pub struct ScenarioRecord {
     pub id: i64,
     pub decision_id: String,
     pub product: LedgerProductKind,
+    pub setup_type: Option<LedgerSetupType>,
+    pub reference_price: Option<u64>,
+    pub confirmation_price: Option<u64>,
+    pub invalidation_price: Option<u64>,
     pub trigger_price: u64,
     pub target_return_pct: f64,
+    pub rationale_ko: Option<String>,
     pub status: LedgerScenarioStatus,
+    pub reference_observed_at: Option<i64>,
+    pub terminal_reason: Option<String>,
     pub confirmation_started_at: Option<i64>,
     pub confirmation_tick_count: u32,
     pub updated_at: i64,
@@ -341,6 +392,8 @@ pub struct DecisionRecord {
     pub latency_ms: u64,
     pub input_hash: Option<String>,
     pub chart_hash: Option<String>,
+    pub market_regime: Option<LedgerMarketRegime>,
+    pub decision_summary_ko: Option<String>,
     pub error: Option<String>,
     pub created_at: i64,
     pub scenarios: Vec<ScenarioRecord>,
@@ -709,10 +762,10 @@ impl Ledger {
                 decision_id, session_id, control_mode, revision, as_of_ts, expires_at,
                 underlying_price, status, model, prompt_version, input_tokens,
                 cached_input_tokens, cache_write_tokens, output_tokens, reasoning_tokens, latency_ms,
-                input_hash, chart_hash, error, created_at
+                input_hash, chart_hash, market_regime, decision_summary_ko, error, created_at
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20
+                ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22
              )",
             params![
                 decision.decision_id,
@@ -733,6 +786,8 @@ impl Ledger {
                 latency_ms,
                 decision.input_hash,
                 decision.chart_hash,
+                decision.market_regime,
+                decision.decision_summary_ko,
                 decision.error,
                 decision.created_at,
             ],
@@ -742,15 +797,27 @@ impl Ledger {
         for scenario in scenarios {
             tx.execute(
                 "INSERT INTO decision_scenarios(
-                    decision_id, product, trigger_price, target_return_pct, status,
-                    confirmation_started_at, confirmation_tick_count, updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, 0, ?6)",
+                    decision_id, product, setup_type, reference_price, confirmation_price,
+                    invalidation_price, trigger_price, target_return_pct, rationale_ko, status,
+                    reference_observed_at, terminal_reason, confirmation_started_at,
+                    confirmation_tick_count, updated_at
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                    ?11, ?12, NULL, 0, ?13
+                 )",
                 params![
                     decision.decision_id,
                     scenario.product,
+                    scenario.setup_type,
+                    optional_u64_to_i64(scenario.reference_price, "reference_price")?,
+                    optional_u64_to_i64(scenario.confirmation_price, "confirmation_price")?,
+                    optional_u64_to_i64(scenario.invalidation_price, "invalidation_price")?,
                     u64_to_i64(scenario.trigger_price, "trigger_price")?,
                     scenario.target_return_pct,
+                    scenario.rationale_ko,
                     scenario.status,
+                    scenario.reference_observed_at,
+                    scenario.terminal_reason,
                     decision.created_at,
                 ],
             )?;
@@ -759,54 +826,125 @@ impl Ledger {
         Ok(row_id)
     }
 
-    pub fn update_decision_status(
+    /// 여러 시나리오와 부모 판단 상태를 한 트랜잭션으로 갱신한다.
+    ///
+    /// OCO 상태 전이·판단 폐기처럼 부모/자식이 반드시 함께 움직여야 하는 경로에서
+    /// 부분 반영과 성공 전 이력 이벤트 발행을 막는다.
+    pub fn update_decision_and_scenarios(
         &self,
         decision_id: &str,
-        status: LedgerDecisionStatus,
-        error: Option<&str>,
+        decision_status: Option<LedgerDecisionStatus>,
+        decision_error: Option<&str>,
+        scenarios: &[ScenarioStatusUpdate<'_>],
     ) -> LedgerResult<()> {
-        let conn = self.lock()?;
-        let changed = conn.execute(
-            "UPDATE llm_decisions
-             SET status = ?2, error = COALESCE(?3, error)
-             WHERE decision_id = ?1",
-            params![decision_id, status, error],
-        )?;
-        ensure_changed(changed, "decision", decision_id)
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for scenario in scenarios {
+            let changed = tx.execute(
+                "UPDATE decision_scenarios
+                 SET status = ?3,
+                     confirmation_started_at = ?4,
+                     confirmation_tick_count = ?5,
+                     updated_at = ?6,
+                     terminal_reason = COALESCE(?7, terminal_reason),
+                     reference_observed_at = ?8
+                 WHERE decision_id = ?1 AND product = ?2",
+                params![
+                    decision_id,
+                    scenario.product,
+                    scenario.status,
+                    scenario.confirmation_started_at,
+                    i64::from(scenario.confirmation_tick_count),
+                    scenario.updated_at,
+                    scenario.terminal_reason,
+                    scenario.reference_observed_at,
+                ],
+            )?;
+            ensure_changed(
+                changed,
+                "scenario",
+                &format!("{decision_id}/{}", scenario.product.as_str()),
+            )?;
+        }
+        if let Some(status) = decision_status {
+            let changed = tx.execute(
+                "UPDATE llm_decisions
+                 SET status = ?2, error = COALESCE(?3, error)
+                 WHERE decision_id = ?1",
+                params![decision_id, status, decision_error],
+            )?;
+            ensure_changed(changed, "decision", decision_id)?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
-    /// 확인 진행 상태까지 통째로 덮어쓴다. `None, 0`은 확인 초기화를 뜻한다.
-    pub fn update_scenario_status(
-        &self,
-        decision_id: &str,
-        product: LedgerProductKind,
-        status: LedgerScenarioStatus,
-        confirmation_started_at: Option<i64>,
-        confirmation_tick_count: u32,
-        updated_at: i64,
-    ) -> LedgerResult<()> {
-        let conn = self.lock()?;
-        let changed = conn.execute(
+    /// 프로세스 재시작으로 복원할 수 없는 메모리 OCO의 활성 장부를 종결한다.
+    ///
+    /// 슬롯이 이미 끝났으면 부모·자식을 `expired`로, 아직 슬롯 안이면 실행되지
+    /// 않은 응답을 부모 `discarded`/자식 `replaced`로 한 트랜잭션에서 바꾼다.
+    pub fn close_unrestorable_oco_decisions(&self, restarted_at: i64) -> LedgerResult<usize> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
             "UPDATE decision_scenarios
-             SET status = ?3,
-                 confirmation_started_at = ?4,
-                 confirmation_tick_count = ?5,
-                 updated_at = ?6
-             WHERE decision_id = ?1 AND product = ?2",
+             SET status = CASE
+                    WHEN (
+                        SELECT expires_at
+                        FROM llm_decisions
+                        WHERE llm_decisions.decision_id = decision_scenarios.decision_id
+                    ) <= ?1 THEN ?2
+                    ELSE ?3
+                 END,
+                 confirmation_started_at = NULL,
+                 confirmation_tick_count = 0,
+                 updated_at = ?1,
+                 terminal_reason = CASE
+                    WHEN (
+                        SELECT expires_at
+                        FROM llm_decisions
+                        WHERE llm_decisions.decision_id = decision_scenarios.decision_id
+                    ) <= ?1 THEN '앱 재시작 중 판단 슬롯 만료'
+                    ELSE '앱 재시작으로 메모리 OCO를 복원하지 않음'
+                 END
+             WHERE status IN (?4, ?5)
+               AND decision_id IN (
+                    SELECT decision_id
+                    FROM llm_decisions
+                    WHERE status = ?6
+               )",
             params![
-                decision_id,
-                product,
-                status,
-                confirmation_started_at,
-                i64::from(confirmation_tick_count),
-                updated_at,
+                restarted_at,
+                LedgerScenarioStatus::Expired,
+                LedgerScenarioStatus::Replaced,
+                LedgerScenarioStatus::Armed,
+                LedgerScenarioStatus::Confirming,
+                LedgerDecisionStatus::Armed,
             ],
         )?;
-        ensure_changed(
-            changed,
-            "scenario",
-            &format!("{decision_id}/{}", product.as_str()),
-        )
+        let changed = tx.execute(
+            "UPDATE llm_decisions
+             SET status = CASE
+                    WHEN expires_at <= ?1 THEN ?2
+                    ELSE ?3
+                 END,
+                 error = COALESCE(
+                    error,
+                    CASE
+                        WHEN expires_at <= ?1 THEN '앱 재시작 중 판단 슬롯 만료'
+                        ELSE '앱 재시작으로 메모리 OCO를 복원하지 않음'
+                    END
+                 )
+             WHERE status = ?4",
+            params![
+                restarted_at,
+                LedgerDecisionStatus::Expired,
+                LedgerDecisionStatus::Discarded,
+                LedgerDecisionStatus::Armed,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(changed)
     }
 
     pub fn record_order_intent(&self, intent: &NewOrderIntent) -> LedgerResult<i64> {
@@ -1320,7 +1458,8 @@ impl Ledger {
                 id, decision_id, session_id, control_mode, revision, as_of_ts,
                 expires_at, underlying_price, status, model, prompt_version,
                 input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, reasoning_tokens,
-                latency_ms, input_hash, chart_hash, error, created_at
+                latency_ms, input_hash, chart_hash, error, created_at,
+                market_regime, decision_summary_ko
              FROM llm_decisions
              WHERE id < ?1
                AND (?2 IS NULL OR control_mode = ?2)
@@ -1404,6 +1543,8 @@ fn migrate(conn: &mut Connection) -> LedgerResult<()> {
                 latency_ms           INTEGER NOT NULL DEFAULT 0 CHECK(latency_ms >= 0),
                 input_hash           TEXT,
                 chart_hash           TEXT,
+                market_regime        TEXT,
+                decision_summary_ko  TEXT,
                 error                TEXT,
                 created_at           INTEGER NOT NULL
              );
@@ -1412,9 +1553,16 @@ fn migrate(conn: &mut Connection) -> LedgerResult<()> {
                 id                         INTEGER PRIMARY KEY AUTOINCREMENT,
                 decision_id                TEXT NOT NULL REFERENCES llm_decisions(decision_id) ON DELETE CASCADE,
                 product                    TEXT NOT NULL,
+                setup_type                 TEXT,
+                reference_price            INTEGER CHECK(reference_price IS NULL OR reference_price > 0),
+                confirmation_price         INTEGER CHECK(confirmation_price IS NULL OR confirmation_price > 0),
+                invalidation_price         INTEGER CHECK(invalidation_price IS NULL OR invalidation_price > 0),
                 trigger_price              INTEGER NOT NULL CHECK(trigger_price > 0),
                 target_return_pct          REAL NOT NULL,
+                rationale_ko               TEXT,
                 status                     TEXT NOT NULL,
+                reference_observed_at      INTEGER,
+                terminal_reason            TEXT,
                 confirmation_started_at    INTEGER,
                 confirmation_tick_count    INTEGER NOT NULL DEFAULT 0 CHECK(confirmation_tick_count >= 0),
                 updated_at                 INTEGER NOT NULL,
@@ -1526,7 +1674,7 @@ fn migrate(conn: &mut Connection) -> LedgerResult<()> {
              CREATE INDEX idx_trades_updated
                 ON trades(updated_at DESC);
 
-             PRAGMA user_version = 4;",
+             PRAGMA user_version = 5;",
         )?;
     } else if version == 1 {
         tx.execute_batch(
@@ -1649,9 +1797,9 @@ fn migrate(conn: &mut Connection) -> LedgerResult<()> {
         )?;
     }
 
-    // v1~v3 장부의 LLM 사용량에 GPT-5.6 캐시 쓰기 토큰을 별도 보존한다.
+    // 구 장부의 GPT-5.6 캐시 쓰기 토큰과 v5 판단 메타데이터를 보강한다.
     // 일부 초기 마이그레이션 테스트 DB에는 주문·체결 표만 있으므로 표 존재를
-    // 확인한 뒤 열을 추가한다. 기존 행은 DEFAULT 0으로 안전하게 이관된다.
+    // 확인한 뒤 열을 추가한다. 기존 판단·시나리오의 신규 메타데이터는 NULL이다.
     let has_llm_decisions: i64 = tx.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'llm_decisions'",
         [],
@@ -1668,6 +1816,45 @@ fn migrate(conn: &mut Connection) -> LedgerResult<()> {
                 "ALTER TABLE llm_decisions
                  ADD COLUMN cache_write_tokens INTEGER NOT NULL DEFAULT 0
                  CHECK(cache_write_tokens >= 0);",
+            )?;
+        }
+
+        let has_market_regime: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('llm_decisions') WHERE name = 'market_regime'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_market_regime == 0 {
+            tx.execute_batch(
+                "ALTER TABLE llm_decisions ADD COLUMN market_regime TEXT;
+                 ALTER TABLE llm_decisions ADD COLUMN decision_summary_ko TEXT;",
+            )?;
+        }
+    }
+
+    let has_decision_scenarios: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'decision_scenarios'",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_decision_scenarios > 0 {
+        let has_setup_type: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('decision_scenarios') WHERE name = 'setup_type'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_setup_type == 0 {
+            tx.execute_batch(
+                "ALTER TABLE decision_scenarios ADD COLUMN setup_type TEXT;
+                 ALTER TABLE decision_scenarios ADD COLUMN reference_price INTEGER
+                    CHECK(reference_price IS NULL OR reference_price > 0);
+                 ALTER TABLE decision_scenarios ADD COLUMN confirmation_price INTEGER
+                    CHECK(confirmation_price IS NULL OR confirmation_price > 0);
+                 ALTER TABLE decision_scenarios ADD COLUMN invalidation_price INTEGER
+                    CHECK(invalidation_price IS NULL OR invalidation_price > 0);
+                 ALTER TABLE decision_scenarios ADD COLUMN rationale_ko TEXT;
+                 ALTER TABLE decision_scenarios ADD COLUMN reference_observed_at INTEGER;
+                 ALTER TABLE decision_scenarios ADD COLUMN terminal_reason TEXT;",
             )?;
         }
     }
@@ -1740,8 +1927,19 @@ fn validate_scenarios(scenarios: &[NewDecisionScenario]) -> LedgerResult<()> {
     for scenario in scenarios {
         if scenario.trigger_price == 0 {
             return Err(LedgerError::InvalidInput(
-                "시나리오 기준가는 1 이상이어야 합니다".into(),
+                "시나리오 실제 확인가는 1 이상이어야 합니다".into(),
             ));
+        }
+        for (field, price) in [
+            ("reference_price", scenario.reference_price),
+            ("confirmation_price", scenario.confirmation_price),
+            ("invalidation_price", scenario.invalidation_price),
+        ] {
+            if price == Some(0) {
+                return Err(LedgerError::InvalidInput(format!(
+                    "시나리오 {field}는 1 이상이어야 합니다"
+                )));
+            }
         }
         if !products.insert(scenario.product.as_str()) {
             return Err(LedgerError::InvalidInput(
@@ -1871,6 +2069,8 @@ fn map_decision_without_scenarios(row: &rusqlite::Row<'_>) -> rusqlite::Result<D
         chart_hash: row.get(18)?,
         error: row.get(19)?,
         created_at: row.get(20)?,
+        market_regime: row.get(21)?,
+        decision_summary_ko: row.get(22)?,
         scenarios: Vec::new(),
     })
 }
@@ -1879,13 +2079,18 @@ fn load_scenarios(conn: &Connection, decision_id: &str) -> LedgerResult<Vec<Scen
     let mut stmt = conn.prepare(
         "SELECT
             id, decision_id, product, trigger_price, target_return_pct, status,
-            confirmation_started_at, confirmation_tick_count, updated_at
+            confirmation_started_at, confirmation_tick_count, updated_at,
+            setup_type, reference_price, confirmation_price, invalidation_price,
+            rationale_ko, reference_observed_at, terminal_reason
          FROM decision_scenarios
          WHERE decision_id = ?1
          ORDER BY id ASC",
     )?;
     let rows = stmt.query_map([decision_id], |row| {
         let trigger_price: i64 = row.get(3)?;
+        let reference_price: Option<i64> = row.get(10)?;
+        let confirmation_price: Option<i64> = row.get(11)?;
+        let invalidation_price: Option<i64> = row.get(12)?;
         let tick_count: i64 = row.get(7)?;
         let confirmation_tick_count = u32::try_from(tick_count).map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(
@@ -1898,9 +2103,16 @@ fn load_scenarios(conn: &Connection, decision_id: &str) -> LedgerResult<Vec<Scen
             id: row.get(0)?,
             decision_id: row.get(1)?,
             product: row.get(2)?,
+            setup_type: row.get(9)?,
+            reference_price: optional_i64_to_u64(reference_price, 10)?,
+            confirmation_price: optional_i64_to_u64(confirmation_price, 11)?,
+            invalidation_price: optional_i64_to_u64(invalidation_price, 12)?,
             trigger_price: i64_to_u64(trigger_price, 3)?,
             target_return_pct: row.get(4)?,
+            rationale_ko: row.get(13)?,
             status: row.get(5)?,
+            reference_observed_at: row.get(14)?,
+            terminal_reason: row.get(15)?,
             confirmation_started_at: row.get(6)?,
             confirmation_tick_count,
             updated_at: row.get(8)?,
@@ -1951,6 +2163,8 @@ mod tests {
             latency_ms: 800,
             input_hash: Some("input-hash".into()),
             chart_hash: Some("chart-hash".into()),
+            market_regime: Some(LedgerMarketRegime::Range),
+            decision_summary_ko: Some("저항 반락과 지지 반등 후보를 함께 감시".into()),
             error: None,
             created_at: 1_100 + revision,
         }
@@ -1960,15 +2174,29 @@ mod tests {
         vec![
             NewDecisionScenario {
                 product: LedgerProductKind::Leverage,
+                setup_type: Some(LedgerSetupType::Continuation),
+                reference_price: Some(185_800),
+                confirmation_price: Some(186_000),
+                invalidation_price: Some(185_400),
                 trigger_price: 186_000,
                 target_return_pct: 0.3,
+                rationale_ko: Some("거래량을 동반한 상단 압축 돌파".into()),
                 status: LedgerScenarioStatus::Armed,
+                reference_observed_at: None,
+                terminal_reason: None,
             },
             NewDecisionScenario {
                 product: LedgerProductKind::Inverse,
+                setup_type: Some(LedgerSetupType::Reversal),
+                reference_price: Some(185_500),
+                confirmation_price: Some(185_200),
+                invalidation_price: Some(185_800),
                 trigger_price: 183_500,
                 target_return_pct: 0.2,
+                rationale_ko: Some("저항 반복 시험 뒤 거래량 소진".into()),
                 status: LedgerScenarioStatus::Armed,
+                reference_observed_at: Some(1_090),
+                terminal_reason: None,
             },
         ]
     }
@@ -2139,6 +2367,88 @@ mod tests {
     }
 
     #[test]
+    fn 버전4_판단과_시나리오를_nullable_v5_메타데이터로_마이그레이션한다() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure_connection(&mut conn).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE llm_decisions (
+                id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                decision_id          TEXT NOT NULL UNIQUE,
+                session_id           TEXT,
+                control_mode         TEXT NOT NULL,
+                revision             INTEGER NOT NULL,
+                as_of_ts             INTEGER NOT NULL,
+                expires_at           INTEGER NOT NULL,
+                underlying_price     REAL NOT NULL,
+                status               TEXT NOT NULL,
+                model                TEXT NOT NULL,
+                prompt_version       TEXT NOT NULL,
+                input_tokens         INTEGER NOT NULL DEFAULT 0,
+                cached_input_tokens  INTEGER NOT NULL DEFAULT 0,
+                cache_write_tokens   INTEGER NOT NULL DEFAULT 0,
+                output_tokens        INTEGER NOT NULL DEFAULT 0,
+                reasoning_tokens     INTEGER NOT NULL DEFAULT 0,
+                latency_ms           INTEGER NOT NULL DEFAULT 0,
+                input_hash           TEXT,
+                chart_hash           TEXT,
+                error                TEXT,
+                created_at           INTEGER NOT NULL
+             );
+             CREATE TABLE decision_scenarios (
+                id                         INTEGER PRIMARY KEY AUTOINCREMENT,
+                decision_id                TEXT NOT NULL,
+                product                    TEXT NOT NULL,
+                trigger_price              INTEGER NOT NULL,
+                target_return_pct          REAL NOT NULL,
+                status                     TEXT NOT NULL,
+                confirmation_started_at    INTEGER,
+                confirmation_tick_count    INTEGER NOT NULL DEFAULT 0,
+                updated_at                 INTEGER NOT NULL,
+                UNIQUE(decision_id, product)
+             );
+             INSERT INTO llm_decisions(
+                decision_id, control_mode, revision, as_of_ts, expires_at,
+                underlying_price, status, model, prompt_version, created_at
+             ) VALUES (
+                'legacy-v4', 'auto', 1, 1100, 1400,
+                185000, 'armed', 'gpt-5.6-sol', 'oco-v3', 1101
+             );
+             INSERT INTO decision_scenarios(
+                decision_id, product, trigger_price, target_return_pct, status, updated_at
+             ) VALUES ('legacy-v4', 'inverse', 184900, 0.3, 'armed', 1101);
+             PRAGMA user_version = 4;",
+        )
+        .unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        let ledger = Ledger {
+            conn: Mutex::new(conn),
+        };
+        let page = ledger
+            .list_decisions(&DecisionQuery::default(), None, 10)
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].market_regime, None);
+        assert_eq!(page.items[0].decision_summary_ko, None);
+        assert_eq!(page.items[0].scenarios.len(), 1);
+        let scenario = &page.items[0].scenarios[0];
+        assert_eq!(scenario.setup_type, None);
+        assert_eq!(scenario.reference_price, None);
+        assert_eq!(scenario.confirmation_price, None);
+        assert_eq!(scenario.invalidation_price, None);
+        assert_eq!(scenario.rationale_ko, None);
+        assert_eq!(scenario.reference_observed_at, None);
+        assert_eq!(scenario.terminal_reason, None);
+        assert_eq!(scenario.trigger_price, 184_900);
+    }
+
+    #[test]
     fn 결정과_양방향_시나리오를_원자적으로_기록하고_갱신한다() {
         let ledger = Ledger::open_in_memory().unwrap();
         ledger.start_session(&session()).unwrap();
@@ -2147,17 +2457,31 @@ mod tests {
             .unwrap();
 
         ledger
-            .update_scenario_status(
+            .update_decision_and_scenarios(
                 "decision-1",
-                LedgerProductKind::Leverage,
-                LedgerScenarioStatus::Confirming,
-                Some(1_200),
-                2,
-                1_202,
+                Some(LedgerDecisionStatus::Triggered),
+                None,
+                &[
+                    ScenarioStatusUpdate {
+                        product: LedgerProductKind::Leverage,
+                        status: LedgerScenarioStatus::Confirming,
+                        confirmation_started_at: Some(1_200),
+                        confirmation_tick_count: 2,
+                        updated_at: 1_202,
+                        terminal_reason: None,
+                        reference_observed_at: Some(1_198),
+                    },
+                    ScenarioStatusUpdate {
+                        product: LedgerProductKind::Inverse,
+                        status: LedgerScenarioStatus::Invalidated,
+                        confirmation_started_at: None,
+                        confirmation_tick_count: 0,
+                        updated_at: 1_203,
+                        terminal_reason: Some("무효화가 선행 침범"),
+                        reference_observed_at: Some(1_090),
+                    },
+                ],
             )
-            .unwrap();
-        ledger
-            .update_decision_status("decision-1", LedgerDecisionStatus::Triggered, None)
             .unwrap();
 
         let page = ledger
@@ -2166,6 +2490,11 @@ mod tests {
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].status, LedgerDecisionStatus::Triggered);
         assert_eq!(page.items[0].cache_write_tokens, 12);
+        assert_eq!(page.items[0].market_regime, Some(LedgerMarketRegime::Range));
+        assert_eq!(
+            page.items[0].decision_summary_ko.as_deref(),
+            Some("저항 반락과 지지 반등 후보를 함께 감시")
+        );
         assert_eq!(
             serde_json::to_value(&page.items[0]).unwrap()["cacheWriteTokens"],
             12
@@ -2176,6 +2505,164 @@ mod tests {
             LedgerScenarioStatus::Confirming
         );
         assert_eq!(page.items[0].scenarios[0].confirmation_tick_count, 2);
+        assert_eq!(
+            page.items[0].scenarios[0].setup_type,
+            Some(LedgerSetupType::Continuation)
+        );
+        assert_eq!(page.items[0].scenarios[0].reference_price, Some(185_800));
+        assert_eq!(page.items[0].scenarios[0].confirmation_price, Some(186_000));
+        assert_eq!(page.items[0].scenarios[0].invalidation_price, Some(185_400));
+        assert_eq!(
+            page.items[0].scenarios[0].rationale_ko.as_deref(),
+            Some("거래량을 동반한 상단 압축 돌파")
+        );
+        assert_eq!(
+            page.items[0].scenarios[0].reference_observed_at,
+            Some(1_198)
+        );
+        assert_eq!(page.items[0].scenarios[0].terminal_reason, None);
+        assert_eq!(
+            page.items[0].scenarios[1].status,
+            LedgerScenarioStatus::Invalidated
+        );
+        assert_eq!(
+            page.items[0].scenarios[1].terminal_reason.as_deref(),
+            Some("무효화가 선행 침범")
+        );
+    }
+
+    #[test]
+    fn 부모자식_상태갱신은_한_시나리오라도_없으면_전부_롤백한다() {
+        let ledger = Ledger::open_in_memory().unwrap();
+        ledger.start_session(&session()).unwrap();
+        let one = vec![scenarios().remove(0)];
+        ledger
+            .record_decision(&decision("decision-atomic", 1), &one)
+            .unwrap();
+
+        let result = ledger.update_decision_and_scenarios(
+            "decision-atomic",
+            Some(LedgerDecisionStatus::Triggered),
+            None,
+            &[
+                ScenarioStatusUpdate {
+                    product: LedgerProductKind::Leverage,
+                    status: LedgerScenarioStatus::Confirming,
+                    confirmation_started_at: Some(1_200),
+                    confirmation_tick_count: 2,
+                    updated_at: 1_202,
+                    terminal_reason: None,
+                    reference_observed_at: None,
+                },
+                ScenarioStatusUpdate {
+                    product: LedgerProductKind::Inverse,
+                    status: LedgerScenarioStatus::Invalidated,
+                    confirmation_started_at: None,
+                    confirmation_tick_count: 0,
+                    updated_at: 1_203,
+                    terminal_reason: Some("존재하지 않는 행"),
+                    reference_observed_at: None,
+                },
+            ],
+        );
+        assert!(matches!(result, Err(LedgerError::NotFound(_))));
+
+        let page = ledger
+            .list_decisions(&DecisionQuery::default(), None, 10)
+            .unwrap();
+        assert_eq!(page.items[0].status, LedgerDecisionStatus::Armed);
+        assert_eq!(
+            page.items[0].scenarios[0].status,
+            LedgerScenarioStatus::Armed
+        );
+        assert_eq!(page.items[0].scenarios[0].confirmation_tick_count, 0);
+    }
+
+    #[test]
+    fn 재시작은_복원불가_oco를_슬롯여부에_따라_원자종결한다() {
+        let ledger = Ledger::open_in_memory().unwrap();
+        ledger.start_session(&session()).unwrap();
+
+        let mut within_slot = decision("decision-restart-discarded", 1);
+        within_slot.expires_at = 2_000;
+        ledger.record_decision(&within_slot, &scenarios()).unwrap();
+
+        let mut expired = decision("decision-restart-expired", 2);
+        expired.expires_at = 1_200;
+        ledger.record_decision(&expired, &scenarios()).unwrap();
+
+        let mut triggered = decision("decision-restart-triggered", 3);
+        triggered.status = LedgerDecisionStatus::Triggered;
+        ledger.record_decision(&triggered, &scenarios()).unwrap();
+
+        assert_eq!(ledger.close_unrestorable_oco_decisions(1_500).unwrap(), 2);
+
+        let page = ledger
+            .list_decisions(&DecisionQuery::default(), None, 10)
+            .unwrap();
+        let discarded = page
+            .items
+            .iter()
+            .find(|item| item.decision_id == within_slot.decision_id)
+            .unwrap();
+        assert_eq!(discarded.status, LedgerDecisionStatus::Discarded);
+        assert!(discarded
+            .scenarios
+            .iter()
+            .all(|scenario| scenario.status == LedgerScenarioStatus::Replaced));
+        assert!(discarded.scenarios.iter().all(|scenario| {
+            scenario.terminal_reason.as_deref() == Some("앱 재시작으로 메모리 OCO를 복원하지 않음")
+        }));
+
+        let expired = page
+            .items
+            .iter()
+            .find(|item| item.decision_id == expired.decision_id)
+            .unwrap();
+        assert_eq!(expired.status, LedgerDecisionStatus::Expired);
+        assert!(expired
+            .scenarios
+            .iter()
+            .all(|scenario| scenario.status == LedgerScenarioStatus::Expired));
+
+        let triggered = page
+            .items
+            .iter()
+            .find(|item| item.decision_id == triggered.decision_id)
+            .unwrap();
+        assert_eq!(triggered.status, LedgerDecisionStatus::Triggered);
+        assert!(triggered
+            .scenarios
+            .iter()
+            .all(|scenario| scenario.status == LedgerScenarioStatus::Armed));
+    }
+
+    #[test]
+    fn 추격금지와_무효화_종결상태를_장부에서_왕복한다() {
+        let ledger = Ledger::open_in_memory().unwrap();
+        ledger.start_session(&session()).unwrap();
+        let mut decision = decision("decision-terminal", 1);
+        decision.status = LedgerDecisionStatus::Missed;
+        let mut scenarios = scenarios();
+        scenarios[0].status = LedgerScenarioStatus::Missed;
+        scenarios[0].terminal_reason = Some("응답 적용 전에 확인가 통과".into());
+        scenarios[1].status = LedgerScenarioStatus::Invalidated;
+        scenarios[1].terminal_reason = Some("응답 적용 전에 무효화가 침범".into());
+
+        ledger.record_decision(&decision, &scenarios).unwrap();
+
+        let page = ledger
+            .list_decisions(&DecisionQuery::default(), None, 10)
+            .unwrap();
+        assert_eq!(page.items[0].status, LedgerDecisionStatus::Missed);
+        assert_eq!(
+            page.items[0].scenarios[0].status,
+            LedgerScenarioStatus::Missed
+        );
+        assert_eq!(
+            page.items[0].scenarios[1].status,
+            LedgerScenarioStatus::Invalidated
+        );
     }
 
     #[test]

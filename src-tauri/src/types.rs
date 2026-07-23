@@ -62,6 +62,24 @@ pub enum ProductKind {
     Inverse,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SetupType {
+    Continuation,
+    Reversal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MarketRegime {
+    Uptrend,
+    Downtrend,
+    Range,
+    Transition,
+    #[default]
+    Unclear,
+}
+
 impl ProductKind {
     pub fn code<'a>(&self, symbols: &'a AutoSymbols) -> &'a str {
         match self {
@@ -295,6 +313,8 @@ pub enum ScenarioStatus {
     Replaced,
     CancelledByOco,
     Invalid,
+    Missed,
+    Invalidated,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -311,17 +331,38 @@ pub enum AutomationPhase {
     Suspended,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AutomationDecisionStatus {
+    Armed,
+    Skipped,
+    Triggered,
+    Expired,
+    Replaced,
+    Missed,
+    Invalidated,
+    Invalid,
+    Error,
+    Discarded,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelScenario {
     pub product: ProductKind,
-    pub trigger_price: u64,
+    pub setup_type: SetupType,
+    pub reference_price: u64,
+    pub confirmation_price: u64,
+    pub invalidation_price: u64,
     pub target_return_pct: f64,
+    pub rationale_ko: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelDecision {
+    pub market_regime: MarketRegime,
+    pub decision_summary_ko: String,
     pub scenarios: Vec<ModelScenario>,
 }
 
@@ -331,8 +372,14 @@ pub struct AutomationScenarioInfo {
     pub id: i64,
     pub product: ProductKind,
     pub code: String,
+    pub setup_type: SetupType,
+    pub reference_price: u64,
+    pub confirmation_price: u64,
     pub trigger_price: u64,
+    pub invalidation_price: u64,
     pub target_return_pct: f64,
+    pub rationale_ko: String,
+    pub reference_observed_at: Option<i64>,
     pub status: ScenarioStatus,
     pub confirming_ticks: u32,
     pub confirming_elapsed_ms: u64,
@@ -364,6 +411,9 @@ pub struct AutomationSnapshot {
     pub next_decision_at: Option<i64>,
     pub decision_id: Option<i64>,
     pub group_id: Option<i64>,
+    pub decision_status: Option<AutomationDecisionStatus>,
+    pub market_regime: Option<MarketRegime>,
+    pub decision_summary_ko: Option<String>,
     pub scenarios: Vec<AutomationScenarioInfo>,
     pub position: Option<AutomationPositionInfo>,
     pub shadow_cash: Option<u64>,
@@ -414,6 +464,9 @@ pub enum FeedEvent {
     },
     Fill(FillEvent),
     Conn(bool),
+    /// LLM 응답 적용 전에 이 이벤트보다 먼저 큐에 들어온 피드를 모두 처리했음을
+    /// 확인하는 엔진 내부 배리어. 브로커와 프론트에는 노출하지 않는다.
+    AutomationBarrier(tokio::sync::mpsc::UnboundedSender<()>),
 }
 
 #[cfg(test)]
@@ -436,5 +489,30 @@ mod tests {
         assert_eq!(s.exchange, "KRX");
         assert_eq!(s.auto_symbols.underlying, "000660");
         assert!(!s.real_trading_confirmed);
+    }
+
+    #[test]
+    fn llm_v4_enum과_필드는_공개계약_이름으로_직렬화된다() {
+        let value = serde_json::to_value(ModelDecision {
+            market_regime: MarketRegime::Transition,
+            decision_summary_ko: "시간축 충돌로 관망".into(),
+            scenarios: vec![ModelScenario {
+                product: ProductKind::Inverse,
+                setup_type: SetupType::Reversal,
+                reference_price: 185_200,
+                confirmation_price: 184_800,
+                invalidation_price: 185_400,
+                target_return_pct: 0.3,
+                rationale_ko: "저항 반복 시험".into(),
+            }],
+        })
+        .unwrap();
+
+        assert_eq!(value["marketRegime"], "TRANSITION");
+        assert_eq!(value["scenarios"][0]["product"], "INVERSE");
+        assert_eq!(value["scenarios"][0]["setupType"], "REVERSAL");
+        assert_eq!(value["scenarios"][0]["referencePrice"], 185_200);
+        assert_eq!(value["scenarios"][0]["confirmationPrice"], 184_800);
+        assert_eq!(value["scenarios"][0]["invalidationPrice"], 185_400);
     }
 }

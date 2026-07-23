@@ -1,16 +1,21 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 
 use chrono::{Datelike, Weekday};
+use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::automation::oco::{validate_decision, TradeTick, TriggeredScenario};
+use crate::automation::oco::{
+    validate_decision, OcoGroup, ScenarioInvalidReason, ScenarioSeed, TradeTick, TriggeredScenario,
+    ValidatedDecision, ValidatedScenario,
+};
 use crate::automation::openai::{
-    DecisionInput, IndicatorInput, MarketQuoteInput, OpenAiClient, TokenUsage, MODEL,
+    serialized_dynamic_input, DecisionInput, MarketQuoteInput, OpenAiClient, TokenUsage, MODEL,
     PROMPT_VERSION,
 };
 use crate::automation::runtime::{
@@ -29,16 +34,20 @@ use crate::kis::rest::is_rate_limit_error;
 use crate::kis::KisBroker;
 use crate::ledger::{
     BrokerOrderKey, Ledger, LedgerControlMode, LedgerDecisionStatus, LedgerExecutionKind,
-    LedgerOrderStatus, LedgerOrderType, LedgerOrigin, LedgerProductKind, LedgerScenarioStatus,
-    LedgerSide, LedgerTradeStatus, NewDecision, NewDecisionScenario, NewFill, NewFillNotice,
-    NewOrderIntent, NewSession, NewTrade, OrderAcknowledgement, OrderRecord,
+    LedgerMarketRegime, LedgerOrderStatus, LedgerOrderType, LedgerOrigin, LedgerProductKind,
+    LedgerScenarioStatus, LedgerSetupType, LedgerSide, LedgerTradeStatus, NewDecision,
+    NewDecisionScenario, NewFill, NewFillNotice, NewOrderIntent, NewSession, NewTrade,
+    OrderAcknowledgement, OrderRecord, ScenarioStatusUpdate,
 };
 use crate::market_history::MarketHistory;
 use crate::types::{
-    AccountSnapshot, AutomationSnapshot, Candle, ControlMode, FeedEvent, MarketDayStatus,
-    OrderResult, ProductKind, Quote, ReservationInfo, Settings, Side,
+    AccountSnapshot, AutomationDecisionStatus, AutomationSnapshot, Candle, ControlMode, FeedEvent,
+    MarketDayStatus, MarketRegime, OrderResult, ProductKind, Quote, ReservationInfo, Settings,
+    SetupType, Side,
 };
-use crate::util::{buy_limit_price, max_buy_qty, now_kst_fake_epoch, sell_target_price};
+use crate::util::{
+    buy_limit_price, max_buy_qty, now_kst_fake_epoch, now_kst_fake_epoch_millis, sell_target_price,
+};
 
 /// 강제 손절 발동 후 같은 종목의 재발동을 막는 잠금 시간.
 /// 정상 체결이면 그 전에 잔고 갱신(700ms)이 포지션을 지워 재발동이 없고,
@@ -64,8 +73,22 @@ const LEGACY_RATE_LIMIT_RECONCILE_SECS: i64 = 10;
 const FILL_RECONCILE_SETTLE_SECS: u64 = 2;
 /// 식별 불명확/REST 장애 때 단일 작업이 무한 폴링하지 않도록 제한한다.
 const FILL_RECONCILE_MAX_ATTEMPTS: u64 = 90;
+/// LLM 입력 이후 본주 체결을 정확한 순서로 재생하기 위한 메모리 상한.
+///
+/// 5분 판단 한 회차에 이 수를 넘기면 오래된 틱을 추측하지 않고 해당 판단을
+/// 안전하게 폐기한다.
+const AUTOMATION_TRADE_JOURNAL_CAPACITY: usize = 50_000;
 /// 같은 프로세스에서 재생성된 엔진의 스냅샷 순서를 프론트가 판별하는 단조 세대값.
 static ENGINE_GENERATION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut encoded, "{byte:02x}").expect("String 쓰기는 실패하지 않음");
+    }
+    encoded
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -198,6 +221,116 @@ struct FillReconcileState {
     side: Side,
 }
 
+/// LLM에 전달한 시세 스냅샷과 이후 체결 재생의 정확한 경계.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AutomationMarketMarker {
+    feed_generation: u64,
+    trade_cursor: u64,
+    trade_sequence: u64,
+    /// 마지막 연결/시세 공백 뒤 첫 journal 위치. 재연결 분의 bucket 시작시각이
+    /// reset보다 이르더라도 실제 reset 이후 R 시험만 복원하는 데 사용한다.
+    reset_cursor: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct JournalTrade {
+    cursor: u64,
+    tick: TradeTick,
+}
+
+#[derive(Debug, Default)]
+struct AutomationTradeJournal {
+    next_cursor: u64,
+    dropped_through: u64,
+    reset_cursor: Option<u64>,
+    trades: VecDeque<JournalTrade>,
+}
+
+impl AutomationTradeJournal {
+    fn marker(&self, feed_generation: u64, trade_sequence: u64) -> AutomationMarketMarker {
+        AutomationMarketMarker {
+            feed_generation,
+            trade_cursor: self.next_cursor,
+            trade_sequence,
+            reset_cursor: self.reset_cursor,
+        }
+    }
+
+    fn mark_reset(&mut self) {
+        self.reset_cursor = Some(self.next_cursor);
+    }
+
+    fn push(&mut self, tick: TradeTick) {
+        self.next_cursor = self.next_cursor.saturating_add(1);
+        self.trades.push_back(JournalTrade {
+            cursor: self.next_cursor,
+            tick,
+        });
+        while self.trades.len() > AUTOMATION_TRADE_JOURNAL_CAPACITY {
+            if let Some(dropped) = self.trades.pop_front() {
+                self.dropped_through = dropped.cursor;
+            }
+        }
+    }
+
+    fn after(&self, marker: AutomationMarketMarker) -> Result<Vec<TradeTick>, String> {
+        if marker.trade_cursor < self.dropped_through {
+            return Err("LLM 응답 대기 중 본주 체결이 재생 버퍼를 초과해 판단을 폐기합니다".into());
+        }
+        let mut last_sequence = (marker.trade_sequence > 0).then_some(marker.trade_sequence);
+        Ok(self
+            .trades
+            .iter()
+            .filter(|trade| trade.cursor > marker.trade_cursor)
+            .filter_map(|trade| {
+                let tick = trade.tick;
+                if tick.volume == 0
+                    || tick.price == 0
+                    || last_sequence.is_some_and(|sequence| tick.sequence <= sequence)
+                {
+                    return None;
+                }
+                last_sequence = Some(tick.sequence);
+                Some(tick)
+            })
+            .collect())
+    }
+
+    /// 마지막 reset보다 뒤이면서 입력 marker까지 처리된 정확한 체결만 반환한다.
+    /// 거래소 체결 순번은 재연결·거래일 경계에서 다시 시작할 수 있어 reset 이전
+    /// marker 순번을 기준으로 필터링하지 않는다.
+    fn since_reset_through(
+        &self,
+        marker: AutomationMarketMarker,
+    ) -> Result<Vec<TradeTick>, String> {
+        let Some(reset_cursor) = marker.reset_cursor else {
+            return Ok(Vec::new());
+        };
+        if reset_cursor < self.dropped_through {
+            return Err(
+                "재연결 이후 기준선 시험 체결이 재생 버퍼를 초과해 판단을 폐기합니다".into(),
+            );
+        }
+        let mut last_sequence = None;
+        Ok(self
+            .trades
+            .iter()
+            .filter(|trade| trade.cursor > reset_cursor && trade.cursor <= marker.trade_cursor)
+            .filter_map(|trade| {
+                let tick = trade.tick;
+                if tick.volume == 0
+                    || tick.price == 0
+                    || last_sequence.is_some_and(|sequence| tick.sequence <= sequence)
+                {
+                    return None;
+                }
+                last_sequence = Some(tick.sequence);
+                Some(tick)
+            })
+            .collect())
+    }
+}
+
 /// 예약 상태를 프론트 emit/조회용 직렬화 타입으로 변환
 fn reservation_info(
     code: &str,
@@ -237,10 +370,21 @@ pub struct Engine {
     market_history: MarketHistory,
     /// 모드·OCO·포지션 소유권은 한 잠금 안에서만 전환한다.
     automation: Mutex<AutomationRuntime>,
+    /// 피드의 시세·연결 변경과 LLM의 최종 OCO 무장을 직렬화한다.
+    ///
+    /// 응답 적용 검사와 실제 무장 사이에 재연결 또는 새 C/I 체결이 끼어드는
+    /// TOCTOU를 막기 위한 잠금이며, 외부 REST 호출은 이 잠금 안에서 하지 않는다.
+    automation_market_gate: tokio::sync::Mutex<()>,
+    /// LLM 입력 직후부터 최종 무장 직전까지의 본주 체결을 순서대로 보존한다.
+    automation_trade_journal: Mutex<AutomationTradeJournal>,
+    /// 실제 피드와 같은 FIFO에 LLM 적용 배리어를 넣기 위한 송신 핸들.
+    automation_feed_tx: Mutex<Option<mpsc::Sender<FeedEvent>>>,
     market_day: RwLock<PersistedMarketDayState>,
     market_day_refresh_pending: AtomicBool,
     shadow: Mutex<Option<ShadowSession>>,
     ledger: Arc<Ledger>,
+    /// 장부에 반영한 시나리오 상태가 실제로 바뀐 경우에만 이력 갱신 이벤트를 보낸다.
+    scenario_history_fingerprint: Mutex<Option<String>>,
     /// 수동·자동 주문 POST를 하나의 actor 임계구역으로 직렬화한다.
     order_actor: tokio::sync::Mutex<()>,
     /// KIS REST 누적체결의 조회→delta 기록을 프로세스 안에서 원자화한다.
@@ -250,6 +394,12 @@ pub struct Engine {
     fill_reconcile_pending: Mutex<HashMap<String, FillReconcileState>>,
     trade_sequence: AtomicU64,
     connected: AtomicBool,
+    /// 최초 정상 연결은 과거 15봉 seed를 허용하고, 그 이후 연결만 재연결로 구분한다.
+    automation_feed_seen_connection: AtomicBool,
+    /// WebSocket 재연결·시세 공백마다 증가한다. 분석 중 값이 바뀌면 응답을 폐기한다.
+    automation_feed_generation: AtomicU64,
+    /// 반전 seed는 이 시각 이후에 새로 관측된 기준선 시험만 인정한다.
+    automation_feed_reset_epoch: AtomicI64,
     auto_flatten_pending: AtomicBool,
     entry_reconcile_pending: AtomicBool,
     exit_reconcile_pending: AtomicBool,
@@ -365,6 +515,18 @@ pub async fn start(
         ShadowEntryExecutor::new(Arc::new(BrokerShadowCashSource::new(Arc::clone(&broker))));
 
     let now = now_kst_fake_epoch();
+    let closed_oco_count = ledger
+        .close_unrestorable_oco_decisions(now)
+        .map_err(|error| {
+            crate::error::AppError::Config(format!(
+                "재시작 시 활성 LLM 판단 장부 종결 실패: {error}"
+            ))
+        })?;
+    if closed_oco_count > 0 {
+        tracing::warn!(
+            "재시작으로 복원할 수 없는 활성 LLM OCO {closed_oco_count}건을 장부에서 종결했습니다"
+        );
+    }
     let market_day = initial_market_day_state(&ledger, now)?;
     let bundle = ledger
         .get_runtime_state::<PersistedAutomationBundle>(AUTOMATION_BUNDLE_STATE_KEY)
@@ -421,15 +583,22 @@ pub async fn start(
         stop_loss_lock: Mutex::new(HashMap::new()),
         market_history: MarketHistory::new(),
         automation: Mutex::new(runtime),
+        automation_market_gate: tokio::sync::Mutex::new(()),
+        automation_trade_journal: Mutex::new(AutomationTradeJournal::default()),
+        automation_feed_tx: Mutex::new(None),
         market_day: RwLock::new(market_day),
         market_day_refresh_pending: AtomicBool::new(false),
         shadow: Mutex::new(saved_shadow),
         ledger: Arc::clone(&ledger),
+        scenario_history_fingerprint: Mutex::new(None),
         order_actor: tokio::sync::Mutex::new(()),
         fill_ingest_lock: Mutex::new(()),
         fill_reconcile_pending: Mutex::new(HashMap::new()),
         trade_sequence: AtomicU64::new(0),
         connected: AtomicBool::new(false),
+        automation_feed_seen_connection: AtomicBool::new(false),
+        automation_feed_generation: AtomicU64::new(0),
+        automation_feed_reset_epoch: AtomicI64::new(0),
         auto_flatten_pending: AtomicBool::new(false),
         entry_reconcile_pending: AtomicBool::new(false),
         exit_reconcile_pending: AtomicBool::new(false),
@@ -496,6 +665,7 @@ pub async fn start(
     }
 
     let (tx, rx) = mpsc::channel::<FeedEvent>(512);
+    *engine.automation_feed_tx.lock().unwrap() = Some(tx.clone());
     let mut tasks = broker.start_feed(settings.all_codes(), tx).await?;
 
     tasks.push(tokio::spawn(consume_feed(Arc::clone(&engine), rx)));
@@ -538,6 +708,7 @@ async fn consume_feed(engine: Arc<Engine>, mut rx: mpsc::Receiver<FeedEvent>) {
     while let Some(ev) = rx.recv().await {
         match ev {
             FeedEvent::Quote(mut q) => {
+                let _market_guard = engine.automation_market_gate.lock().await;
                 if first_tick_seen.insert(q.code.clone()) {
                     tracing::info!("실시간 체결가 첫 수신: {}", q.code);
                 }
@@ -564,6 +735,31 @@ async fn consume_feed(engine: Arc<Engine>, mut rx: mpsc::Receiver<FeedEvent>) {
                     engine.reset_confirmation_for_market_gap(&q.code, "체결");
                 }
                 engine.market_history.apply_trade(&q).await;
+                let underlying_code = engine
+                    .settings
+                    .read()
+                    .unwrap()
+                    .auto_symbols
+                    .underlying
+                    .clone();
+                if q.code == underlying_code
+                    && q.volume > 0.0
+                    && q.price > 0.0
+                    && q.trade_sequence > 0
+                    && q.received_at_micros > 0
+                {
+                    engine
+                        .automation_trade_journal
+                        .lock()
+                        .unwrap()
+                        .push(TradeTick {
+                            sequence: q.trade_sequence,
+                            price: q.price.round() as u64,
+                            volume: q.volume.max(0.0).round() as u64,
+                            at: Duration::from_micros(q.received_at_micros),
+                            epoch: q.trade_ts,
+                        });
+                }
                 engine.emit("quote", &q);
                 engine.handle_automation_quote(&q);
                 // 실시간 체결가 기준 수익률이 강제 손절선(-0.6%) 이하면 전량 시장가 매도.
@@ -584,6 +780,7 @@ async fn consume_feed(engine: Arc<Engine>, mut rx: mpsc::Receiver<FeedEvent>) {
                 bid1_qty,
                 ts,
             } => {
+                let _market_guard = engine.automation_market_gate.lock().await;
                 let (merged, book_gap) = {
                     let mut map = engine.quotes.write().unwrap();
                     let mut book_gap = false;
@@ -594,8 +791,11 @@ async fn consume_feed(engine: Arc<Engine>, mut rx: mpsc::Receiver<FeedEvent>) {
                         q.ask1_qty = ask1_qty;
                         q.bid1_qty = bid1_qty;
                         q.book_ts = ts;
-                        q.volume = 0.0;
-                        q.clone()
+                        // 캐시에는 마지막 체결량을 남겨 LLM 입력에 전달하고, 호가
+                        // 이벤트 복사본만 volume=0으로 표시해 차트 중복 반영을 막는다.
+                        let mut emitted = q.clone();
+                        emitted.volume = 0.0;
+                        emitted
                     });
                     (merged, book_gap)
                 };
@@ -623,7 +823,21 @@ async fn consume_feed(engine: Arc<Engine>, mut rx: mpsc::Receiver<FeedEvent>) {
                 engine.schedule_account_refresh();
             }
             FeedEvent::Conn(connected) => {
+                let _market_guard = engine.automation_market_gate.lock().await;
                 engine.connected.store(connected, Ordering::SeqCst);
+                let seen_connection = if connected {
+                    engine
+                        .automation_feed_seen_connection
+                        .swap(true, Ordering::SeqCst)
+                } else {
+                    engine
+                        .automation_feed_seen_connection
+                        .load(Ordering::SeqCst)
+                };
+                if seen_connection {
+                    engine.mark_automation_feed_reset();
+                    engine.invalidate_automation_quote_freshness();
+                }
                 let now = engine.monotonic_now();
                 if engine.automation.lock().unwrap().reset_confirmation(now) {
                     engine.sync_scenario_ledger();
@@ -633,6 +847,11 @@ async fn consume_feed(engine: Arc<Engine>, mut rx: mpsc::Receiver<FeedEvent>) {
                     engine.market_history.mark_all_gapped().await;
                 }
                 engine.emit("conn", &serde_json::json!({ "connected": connected }));
+            }
+            FeedEvent::AutomationBarrier(ack) => {
+                // 단일 consumer가 이 지점에 도달했다면 같은 채널에서 앞선 모든
+                // 시세·연결 이벤트의 캐시/journal 반영이 완료된 상태다.
+                let _ = ack.send(());
             }
         }
     }
@@ -681,7 +900,7 @@ async fn automation_scheduler(engine: Arc<Engine>) {
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         timer.tick().await;
-        engine.automation_tick();
+        engine.automation_tick().await;
     }
 }
 
@@ -714,6 +933,38 @@ fn ledger_product(product: ProductKind) -> LedgerProductKind {
     match product {
         ProductKind::Leverage => LedgerProductKind::Leverage,
         ProductKind::Inverse => LedgerProductKind::Inverse,
+    }
+}
+
+fn ledger_setup_type(setup_type: SetupType) -> LedgerSetupType {
+    match setup_type {
+        SetupType::Continuation => LedgerSetupType::Continuation,
+        SetupType::Reversal => LedgerSetupType::Reversal,
+    }
+}
+
+fn ledger_market_regime(regime: MarketRegime) -> LedgerMarketRegime {
+    match regime {
+        MarketRegime::Uptrend => LedgerMarketRegime::Uptrend,
+        MarketRegime::Downtrend => LedgerMarketRegime::Downtrend,
+        MarketRegime::Range => LedgerMarketRegime::Range,
+        MarketRegime::Transition => LedgerMarketRegime::Transition,
+        MarketRegime::Unclear => LedgerMarketRegime::Unclear,
+    }
+}
+
+fn automation_decision_status(status: LedgerDecisionStatus) -> AutomationDecisionStatus {
+    match status {
+        LedgerDecisionStatus::Armed => AutomationDecisionStatus::Armed,
+        LedgerDecisionStatus::Skipped => AutomationDecisionStatus::Skipped,
+        LedgerDecisionStatus::Triggered => AutomationDecisionStatus::Triggered,
+        LedgerDecisionStatus::Expired => AutomationDecisionStatus::Expired,
+        LedgerDecisionStatus::Replaced => AutomationDecisionStatus::Replaced,
+        LedgerDecisionStatus::Missed => AutomationDecisionStatus::Missed,
+        LedgerDecisionStatus::Invalidated => AutomationDecisionStatus::Invalidated,
+        LedgerDecisionStatus::Invalid => AutomationDecisionStatus::Invalid,
+        LedgerDecisionStatus::Error => AutomationDecisionStatus::Error,
+        LedgerDecisionStatus::Discarded => AutomationDecisionStatus::Discarded,
     }
 }
 
@@ -781,6 +1032,244 @@ fn ledger_scenario_status(status: crate::types::ScenarioStatus) -> LedgerScenari
         crate::types::ScenarioStatus::Replaced => LedgerScenarioStatus::Replaced,
         crate::types::ScenarioStatus::CancelledByOco => LedgerScenarioStatus::CancelledByOco,
         crate::types::ScenarioStatus::Invalid => LedgerScenarioStatus::Invalid,
+        crate::types::ScenarioStatus::Missed => LedgerScenarioStatus::Missed,
+        crate::types::ScenarioStatus::Invalidated => LedgerScenarioStatus::Invalidated,
+    }
+}
+
+fn scenario_invalid_reason_ko(reason: ScenarioInvalidReason) -> &'static str {
+    match reason {
+        ScenarioInvalidReason::InvalidPrice => "가격이 0이거나 호가 정규화할 수 없음",
+        ScenarioInvalidReason::WrongPriceOrder => "셋업별 S·R·C·I 가격 순서 불일치",
+        ScenarioInvalidReason::ConfirmationTooClose => "기준가와 확인가 사이 10bp 미만",
+        ScenarioInvalidReason::InvalidTargetReturn => "목표수익률 범위 또는 0.1% 단위 불일치",
+    }
+}
+
+fn scenario_terminal_reason(status: crate::types::ScenarioStatus) -> Option<&'static str> {
+    match status {
+        crate::types::ScenarioStatus::Missed => {
+            Some("응답 적용 시 확인가를 이미 지나 추격 진입하지 않음")
+        }
+        crate::types::ScenarioStatus::Invalidated => Some("무효화가 침범"),
+        crate::types::ScenarioStatus::Expired => Some("다음 판단 슬롯 만료"),
+        crate::types::ScenarioStatus::Replaced => Some("새 LLM 판단으로 교체"),
+        crate::types::ScenarioStatus::CancelledByOco => Some("반대 시나리오 진입 확정"),
+        crate::types::ScenarioStatus::Invalid => Some("의미 검증 실패"),
+        _ => None,
+    }
+}
+
+fn reference_observed_at(
+    scenario: &ValidatedScenario,
+    one_minute: &[Candle],
+    minimum_epoch: i64,
+) -> Option<i64> {
+    if scenario.setup_type != SetupType::Reversal {
+        return None;
+    }
+    // reset이 찍힌 분봉은 bucket 안에 reset 직전 틱이 섞일 수 있으므로 통째로
+    // 제외한다. 같은 분의 reset 이후 시험은 journal reset cursor로만 복원한다.
+    let first_whole_bar_after_reset = (minimum_epoch > 0)
+        .then(|| {
+            minimum_epoch
+                .div_euclid(60)
+                .saturating_add(1)
+                .saturating_mul(60)
+        })
+        .unwrap_or(0);
+    let mut bars: Vec<&Candle> = one_minute
+        .iter()
+        .filter(|bar| {
+            bar.time >= first_whole_bar_after_reset
+                && bar.high.is_finite()
+                && bar.low.is_finite()
+                && bar.high > 0.0
+                && bar.low > 0.0
+        })
+        .collect();
+    bars.sort_unstable_by_key(|bar| bar.time);
+    let start = bars.len().saturating_sub(15);
+    bars[start..].iter().rev().find_map(|bar| {
+        let touched = match scenario.product {
+            ProductKind::Leverage => bar.low <= scenario.reference_price as f64,
+            ProductKind::Inverse => bar.high >= scenario.reference_price as f64,
+        };
+        touched.then_some(bar.time)
+    })
+}
+
+fn recent_input_window_start(
+    input_one_minute: &chart_image::TimeframeIndicatorPayload,
+) -> Option<i64> {
+    let mut bars = input_one_minute.completed_candles.clone();
+    if let Some(forming) = input_one_minute.forming_candle {
+        bars.push(forming);
+    }
+    bars.retain(|bar| {
+        bar.time > 0
+            && bar.high.is_finite()
+            && bar.low.is_finite()
+            && bar.high > 0.0
+            && bar.low > 0.0
+    });
+    bars.sort_unstable_by_key(|bar| bar.time);
+    bars.get(bars.len().saturating_sub(15)).map(|bar| bar.time)
+}
+
+fn needs_reset_minute_tick_recovery(
+    input_one_minute: &chart_image::TimeframeIndicatorPayload,
+    minimum_reference_epoch: i64,
+) -> bool {
+    if minimum_reference_epoch <= 0 {
+        return false;
+    }
+    let reset_bucket = minimum_reference_epoch.div_euclid(60) * 60;
+    recent_input_window_start(input_one_minute)
+        .is_some_and(|window_start| reset_bucket >= window_start)
+}
+
+fn seed_scenario_from_latest_market(
+    scenario: &ValidatedScenario,
+    current_price: u64,
+    current_epoch: i64,
+    one_minute: &[Candle],
+    input_one_minute: &chart_image::TimeframeIndicatorPayload,
+    minimum_reference_epoch: i64,
+    pre_input_reference_ticks: &[TradeTick],
+    replay_ticks: &[TradeTick],
+) -> ScenarioSeed {
+    let mut input_bars = input_one_minute.completed_candles.clone();
+    if let Some(forming) = input_one_minute.forming_candle {
+        input_bars.push(forming);
+    }
+    let mut observed_at = reference_observed_at(scenario, &input_bars, minimum_reference_epoch);
+    let recent_window_start = recent_input_window_start(input_one_minute).unwrap_or(i64::MIN);
+    if scenario.setup_type == SetupType::Reversal {
+        for tick in pre_input_reference_ticks {
+            if tick.epoch >= minimum_reference_epoch
+                && tick.epoch >= recent_window_start
+                && scenario.reference_reached(tick.price)
+            {
+                observed_at = Some(
+                    observed_at
+                        .map(|observed| observed.max(tick.epoch))
+                        .unwrap_or(tick.epoch),
+                );
+            }
+        }
+    }
+    let mut market_bars: Vec<&Candle> = one_minute
+        .iter()
+        .filter(|bar| {
+            bar.time <= current_epoch
+                && bar.high.is_finite()
+                && bar.low.is_finite()
+                && bar.high > 0.0
+                && bar.low > 0.0
+        })
+        .collect();
+    market_bars.sort_unstable_by_key(|bar| bar.time);
+    if let (Some(observed), Some(oldest_recent)) = (
+        observed_at,
+        market_bars
+            .get(market_bars.len().saturating_sub(15))
+            .map(|bar| bar.time),
+    ) {
+        if observed < oldest_recent {
+            observed_at = None;
+        }
+    }
+
+    let mut invalidated_while_waiting = false;
+    let mut confirmation_passed = false;
+    for tick in replay_ticks {
+        invalidated_while_waiting |= scenario.invalidation_reached(tick.price);
+
+        if scenario.setup_type == SetupType::Reversal
+            && observed_at.is_none()
+            && tick.epoch >= minimum_reference_epoch
+            && scenario.reference_reached(tick.price)
+        {
+            observed_at = Some(tick.epoch);
+        }
+        let reference_ready =
+            scenario.setup_type == SetupType::Continuation || observed_at.is_some();
+        if reference_ready && scenario.confirmation_reached(tick.price) {
+            confirmation_passed = true;
+        }
+    }
+
+    if scenario.setup_type == SetupType::Reversal
+        && observed_at.is_none()
+        && current_epoch >= minimum_reference_epoch
+        && scenario.reference_reached(current_price)
+    {
+        observed_at = Some(current_epoch);
+    }
+    if invalidated_while_waiting || scenario.invalidation_reached(current_price) {
+        return ScenarioSeed::invalidated(scenario.product, observed_at);
+    }
+
+    let reference_ready = scenario.setup_type == SetupType::Continuation || observed_at.is_some();
+    if reference_ready && (confirmation_passed || scenario.confirmation_reached(current_price)) {
+        return ScenarioSeed::missed(scenario.product, observed_at);
+    }
+    ScenarioSeed::armed(scenario.product, observed_at)
+}
+
+fn merge_scenario_seed(previous: ScenarioSeed, latest: ScenarioSeed) -> ScenarioSeed {
+    let priority = |status| match status {
+        crate::types::ScenarioStatus::Invalidated => 3,
+        crate::types::ScenarioStatus::Missed => 2,
+        crate::types::ScenarioStatus::Armed => 1,
+        _ => 0,
+    };
+    ScenarioSeed {
+        product: previous.product,
+        status: if priority(latest.status) > priority(previous.status) {
+            latest.status
+        } else {
+            previous.status
+        },
+        reference_observed_at: match (previous.reference_observed_at, latest.reference_observed_at)
+        {
+            (Some(left), Some(right)) => Some(left.max(right)),
+            (left, right) => left.or(right),
+        },
+    }
+}
+
+fn initial_decision_status(
+    current_matches: bool,
+    decision: &ValidatedDecision,
+    seeds: &[ScenarioSeed],
+) -> LedgerDecisionStatus {
+    if !current_matches {
+        return LedgerDecisionStatus::Discarded;
+    }
+    if decision.scenarios.is_empty() {
+        return if decision.rejected.is_empty() {
+            LedgerDecisionStatus::Skipped
+        } else {
+            LedgerDecisionStatus::Invalid
+        };
+    }
+    if decision.scenarios.iter().any(|scenario| {
+        seeds
+            .iter()
+            .find(|seed| seed.product == scenario.product)
+            .is_none_or(|seed| seed.status == crate::types::ScenarioStatus::Armed)
+    }) {
+        return LedgerDecisionStatus::Armed;
+    }
+    if seeds
+        .iter()
+        .any(|seed| seed.status == crate::types::ScenarioStatus::Invalidated)
+    {
+        LedgerDecisionStatus::Invalidated
+    } else {
+        LedgerDecisionStatus::Missed
     }
 }
 
@@ -795,6 +1284,36 @@ fn unique_id(prefix: &str) -> String {
 impl Engine {
     fn monotonic_now(&self) -> Duration {
         crate::util::monotonic_now()
+    }
+
+    /// 같은 mpsc FIFO에서 배리어보다 앞선 피드를 모두 cache/journal에 반영한다.
+    ///
+    /// 이 경계를 지난 뒤 최종 seed를 다시 계산하면 모델 응답 중 이미 지나간 C/I를
+    /// 놓치지 않고 `missed`/`invalidated`로 종결할 수 있다. 배리어 뒤에 들어온
+    /// 이벤트는 OCO 무장 뒤의 정상 실시간 틱으로 처리된다.
+    async fn drain_automation_feed_queue(&self, expiry: i64) -> Result<(), String> {
+        let tx = self
+            .automation_feed_tx
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "자동매매 피드 큐가 준비되지 않았습니다".to_string())?;
+        let remaining = expiry.saturating_sub(now_kst_fake_epoch());
+        if remaining <= 0 {
+            return Err("피드 동기화 전에 판단 슬롯이 만료되었습니다".into());
+        }
+        let (ack_tx, mut ack_rx) = mpsc::unbounded_channel();
+        tokio::time::timeout(Duration::from_secs(remaining as u64), async move {
+            tx.send(FeedEvent::AutomationBarrier(ack_tx))
+                .await
+                .map_err(|_| "자동매매 피드 큐가 종료되었습니다".to_string())?;
+            ack_rx
+                .recv()
+                .await
+                .ok_or_else(|| "자동매매 피드 배리어 응답이 끊겼습니다".to_string())
+        })
+        .await
+        .map_err(|_| "피드 동기화 중 판단 슬롯이 만료되었습니다".to_string())?
     }
 
     /// 제품에서는 KST 벽시계를 그대로 사용한다. 단위 테스트만 명시적으로 주입한
@@ -928,8 +1447,18 @@ impl Engine {
         }
 
         if state.status != MarketDayStatus::Open {
-            self.mark_current_group_replaced();
-            if self.automation.lock().unwrap().pause_for_market_day() {
+            let replacement_recorded = match self.mark_current_group_replaced() {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::error!("휴장 전 OCO 장부 종결 실패, 다음 tick에서 재시도: {error}");
+                    self.emit(
+                        "engine-error",
+                        &format!("휴장 전 자동 시나리오 장부 종결을 재시도합니다: {error}"),
+                    );
+                    false
+                }
+            };
+            if replacement_recorded && self.automation.lock().unwrap().pause_for_market_day() {
                 self.persist_automation();
             }
         } else {
@@ -2221,23 +2750,20 @@ impl Engine {
         let open_orders = match self.broker.open_orders().await {
             Ok(orders) => orders,
             Err(error) => {
-                self.automation.lock().unwrap().suspend(format!(
+                let _market_guard = self.automation_market_gate.lock().await;
+                self.suspend_automation_with_group_ledger_safety(format!(
                     "자동 유휴 상태의 미체결 노출 확인 실패로 신규 진입을 중단합니다: {error}"
                 ));
-                self.persist_automation();
-                self.emit_automation_state();
                 return;
             }
         };
         let settings = self.settings.read().unwrap().clone();
         if Self::has_unknown_auto_exposure(&settings, None, &self.account_snapshot(), &open_orders)
         {
-            self.mark_current_group_replaced();
-            self.automation.lock().unwrap().suspend(
+            let _market_guard = self.automation_market_gate.lock().await;
+            self.suspend_automation_with_group_ledger_safety(
                 "자동 유휴 중 양방향 ETF에 외부·지연 보유 또는 미체결이 생겨 신규 진입을 중단했습니다",
             );
-            self.persist_automation();
-            self.emit_automation_state();
         }
     }
 
@@ -2445,6 +2971,36 @@ impl Engine {
         })
     }
 
+    fn mark_automation_feed_reset(&self) {
+        let now = now_kst_fake_epoch();
+        self.automation_trade_journal.lock().unwrap().mark_reset();
+        self.automation_feed_reset_epoch
+            .fetch_max(now, Ordering::SeqCst);
+        self.automation_feed_generation
+            .fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// 재연결 직후 이전 연결의 10초 이내 시세가 우연히 신선해 보이는 것을 막는다.
+    /// 가격 표시는 보존하되 세 종목 모두 새 체결·호가를 받은 뒤에만 LLM 입력을 허용한다.
+    fn invalidate_automation_quote_freshness(&self) {
+        let settings = self.settings.read().unwrap();
+        let codes = [
+            settings.auto_symbols.underlying.as_str(),
+            settings.auto_symbols.leverage.as_str(),
+            settings.auto_symbols.inverse.as_str(),
+        ];
+        let mut quotes = self.quotes.write().unwrap();
+        for code in codes {
+            if let Some(quote) = quotes.get_mut(code) {
+                quote.volume = 0.0;
+                quote.trade_sequence = 0;
+                quote.received_at_micros = 0;
+                quote.trade_ts = 0;
+                quote.book_ts = 0;
+            }
+        }
+    }
+
     fn reset_confirmation_for_market_gap(&self, code: &str, stream: &str) {
         let settings = self.settings.read().unwrap();
         let is_auto_symbol = code == settings.auto_symbols.underlying
@@ -2454,6 +3010,7 @@ impl Engine {
         if !is_auto_symbol {
             return;
         }
+        self.mark_automation_feed_reset();
         if self
             .automation
             .lock()
@@ -2532,7 +3089,13 @@ impl Engine {
             // 실시간 체결임을 증명할 수 없으므로 OCO 확인 틱으로 사용하지 않는다.
             return;
         }
+        // 휴장 전 장부 종결이 일시 실패하면 runtime 그룹은 다음 tick의 재시도를
+        // 위해 보존한다. 그 사이 장외 틱이 신규 진입을 확정하지 못하게 실행만 막는다.
+        if !self.market_is_open() {
+            return;
+        }
         if !self.auto_quotes_fresh(now_epoch) {
+            self.mark_automation_feed_reset();
             if self
                 .automation
                 .lock()
@@ -2550,6 +3113,7 @@ impl Engine {
             price: quote.price.round() as u64,
             volume: quote.volume.max(0.0).round() as u64,
             at: Duration::from_micros(quote.received_at_micros),
+            epoch: quote.trade_ts,
         });
         self.sync_scenario_ledger();
         self.emit_automation_state();
@@ -3417,45 +3981,154 @@ impl Engine {
             return;
         };
         let now = now_kst_fake_epoch();
+        let mut fingerprint = decision_key.clone();
         for scenario in &snapshot.scenarios {
-            let started_at = (scenario.status == crate::types::ScenarioStatus::Confirming)
-                .then(|| now.saturating_sub((scenario.confirming_elapsed_ms / 1_000) as i64));
-            if let Err(error) = self.ledger.update_scenario_status(
-                &decision_key,
-                ledger_product(scenario.product),
-                ledger_scenario_status(scenario.status),
-                started_at,
+            write!(
+                &mut fingerprint,
+                "|{:?}:{:?}:{}:{:?}",
+                scenario.product,
+                scenario.status,
                 scenario.confirming_ticks,
-                now,
-            ) {
-                tracing::warn!("OCO 시나리오 장부 갱신 실패: {error}");
-            }
+                scenario.reference_observed_at
+            )
+            .expect("String 쓰기는 실패하지 않음");
         }
-        if snapshot
+        let decision_status = if snapshot
             .scenarios
             .iter()
             .any(|scenario| scenario.status == crate::types::ScenarioStatus::Triggered)
         {
-            let _ = self.ledger.update_decision_status(
-                &decision_key,
-                LedgerDecisionStatus::Triggered,
-                None,
-            );
-        } else if !snapshot.scenarios.is_empty()
-            && snapshot
-                .scenarios
-                .iter()
-                .all(|scenario| scenario.status == crate::types::ScenarioStatus::Expired)
-        {
-            let _ = self.ledger.update_decision_status(
-                &decision_key,
-                LedgerDecisionStatus::Expired,
-                None,
+            Some(LedgerDecisionStatus::Triggered)
+        } else if !snapshot.scenarios.is_empty() {
+            let no_active = snapshot.scenarios.iter().all(|scenario| {
+                !matches!(
+                    scenario.status,
+                    crate::types::ScenarioStatus::Armed | crate::types::ScenarioStatus::Confirming
+                )
+            });
+            if no_active {
+                let status =
+                    if snapshot.scenarios.iter().any(|scenario| {
+                        scenario.status == crate::types::ScenarioStatus::Invalidated
+                    }) {
+                        Some(LedgerDecisionStatus::Invalidated)
+                    } else if snapshot
+                        .scenarios
+                        .iter()
+                        .all(|scenario| scenario.status == crate::types::ScenarioStatus::Missed)
+                    {
+                        Some(LedgerDecisionStatus::Missed)
+                    } else if snapshot
+                        .scenarios
+                        .iter()
+                        .any(|scenario| scenario.status == crate::types::ScenarioStatus::Expired)
+                    {
+                        Some(LedgerDecisionStatus::Expired)
+                    } else {
+                        None
+                    };
+                status
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let updates: Vec<_> = snapshot
+            .scenarios
+            .iter()
+            .map(|scenario| ScenarioStatusUpdate {
+                product: ledger_product(scenario.product),
+                status: ledger_scenario_status(scenario.status),
+                confirmation_started_at: (scenario.status
+                    == crate::types::ScenarioStatus::Confirming)
+                    .then(|| now.saturating_sub((scenario.confirming_elapsed_ms / 1_000) as i64)),
+                confirmation_tick_count: scenario.confirming_ticks,
+                updated_at: now,
+                terminal_reason: scenario_terminal_reason(scenario.status),
+                reference_observed_at: scenario.reference_observed_at,
+            })
+            .collect();
+        if let Err(error) = self.ledger.update_decision_and_scenarios(
+            &decision_key,
+            decision_status,
+            None,
+            &updates,
+        ) {
+            tracing::warn!("OCO 시나리오·판단 장부 원자 갱신 실패: {error}");
+            return;
+        }
+        let history_changed = {
+            let mut previous = self.scenario_history_fingerprint.lock().unwrap();
+            if previous.as_deref() == Some(fingerprint.as_str()) {
+                false
+            } else {
+                *previous = Some(fingerprint);
+                true
+            }
+        };
+        if history_changed {
+            self.emit(
+                "llm-decision-recorded",
+                &serde_json::json!({ "decisionId": decision_key }),
             );
         }
     }
 
-    fn mark_current_group_replaced(&self) {
+    /// 이미 기록한 판단을 실행 불가능 상태로 폐기하면서 아직 활성일 수 있는
+    /// 자식 시나리오도 같은 트랜잭션에서 종결한다.
+    fn discard_recorded_decision(
+        &self,
+        decision_id: &str,
+        decision: &ValidatedDecision,
+        seeds: &[ScenarioSeed],
+        reason: &str,
+    ) {
+        let now = now_kst_fake_epoch();
+        let updates: Vec<_> = decision
+            .scenarios
+            .iter()
+            .map(|scenario| {
+                let seed = seeds
+                    .iter()
+                    .find(|seed| seed.product == scenario.product)
+                    .copied()
+                    .unwrap_or_else(|| ScenarioSeed::armed(scenario.product, None));
+                let status = match seed.status {
+                    crate::types::ScenarioStatus::Missed => LedgerScenarioStatus::Missed,
+                    crate::types::ScenarioStatus::Invalidated => LedgerScenarioStatus::Invalidated,
+                    _ => LedgerScenarioStatus::Replaced,
+                };
+                ScenarioStatusUpdate {
+                    product: ledger_product(scenario.product),
+                    status,
+                    confirmation_started_at: None,
+                    confirmation_tick_count: 0,
+                    updated_at: now,
+                    terminal_reason: scenario_terminal_reason(seed.status).or(Some(reason)),
+                    reference_observed_at: seed.reference_observed_at,
+                }
+            })
+            .collect();
+        if let Err(error) = self.ledger.update_decision_and_scenarios(
+            decision_id,
+            Some(LedgerDecisionStatus::Discarded),
+            Some(reason),
+            &updates,
+        ) {
+            tracing::error!("폐기된 LLM 판단·시나리오 장부 원자 갱신 실패: {error}");
+            return;
+        }
+        self.emit(
+            "llm-decision-recorded",
+            &serde_json::json!({
+                "decisionId": decision_id,
+                "status": LedgerDecisionStatus::Discarded.as_str(),
+            }),
+        );
+    }
+
+    fn mark_current_group_replaced(&self) -> Result<(), String> {
         let market_day = self.effective_market_day_state();
         let (decision_key, snapshot) = {
             let settings = self.settings.read().unwrap();
@@ -3473,7 +4146,7 @@ impl Engine {
             )
         };
         let Some(decision_key) = decision_key else {
-            return;
+            return Ok(());
         };
         let now = now_kst_fake_epoch();
         let active: Vec<_> = snapshot
@@ -3487,35 +4160,104 @@ impl Engine {
             })
             .collect();
         if active.is_empty() {
-            return;
+            return Ok(());
         }
-        for scenario in active {
-            let _ = self.ledger.update_scenario_status(
+        let updates: Vec<_> = active
+            .into_iter()
+            .map(|scenario| ScenarioStatusUpdate {
+                product: ledger_product(scenario.product),
+                status: LedgerScenarioStatus::Replaced,
+                confirmation_started_at: None,
+                confirmation_tick_count: 0,
+                updated_at: now,
+                terminal_reason: Some("새 LLM 판단으로 교체"),
+                reference_observed_at: scenario.reference_observed_at,
+            })
+            .collect();
+        self.ledger
+            .update_decision_and_scenarios(
                 &decision_key,
-                ledger_product(scenario.product),
-                LedgerScenarioStatus::Replaced,
+                Some(LedgerDecisionStatus::Replaced),
                 None,
-                0,
-                now,
-            );
-        }
-        let _ =
-            self.ledger
-                .update_decision_status(&decision_key, LedgerDecisionStatus::Replaced, None);
+                &updates,
+            )
+            .map_err(|error| format!("기존 LLM 판단 교체 장부 원자 갱신 실패: {error}"))?;
+        self.emit(
+            "llm-decision-recorded",
+            &serde_json::json!({
+                "decisionId": decision_key,
+                "status": LedgerDecisionStatus::Replaced.as_str(),
+            }),
+        );
+        Ok(())
     }
 
-    fn automation_tick(self: &Arc<Self>) {
+    /// 신규 진입은 즉시 막되, 장부 종결이 실패하면 원본 그룹을 Suspended 안에
+    /// 보존해 다음 scheduler tick에서 부모·자식을 다시 원자 갱신할 수 있게 한다.
+    fn suspend_automation_with_group_ledger_safety(&self, reason: impl Into<String>) {
+        let reason = reason.into();
+        match self.mark_current_group_replaced() {
+            Ok(()) => self.automation.lock().unwrap().suspend(reason),
+            Err(error) => {
+                tracing::error!("자동 시나리오 장부 종결을 보존 상태에서 재시도: {error}");
+                self.automation
+                    .lock()
+                    .unwrap()
+                    .suspend_preserving_group(format!(
+                        "{reason} (시나리오 장부 종결 재시도 중: {error})"
+                    ));
+            }
+        }
+        self.persist_automation();
+        self.emit_automation_state();
+    }
+
+    fn retry_suspended_group_ledger_repair(&self) {
+        if !self
+            .automation
+            .lock()
+            .unwrap()
+            .has_group_pending_ledger_repair()
+        {
+            return;
+        }
+        match self.mark_current_group_replaced() {
+            Ok(()) => {
+                if self.automation.lock().unwrap().finish_group_ledger_repair() {
+                    self.persist_automation();
+                    self.emit_automation_state();
+                }
+            }
+            Err(error) => {
+                tracing::error!("Suspended OCO 장부 종결 재시도 실패: {error}");
+            }
+        }
+    }
+
+    async fn automation_tick(self: &Arc<Self>) {
+        self.retry_suspended_group_ledger_repair();
         let now = now_kst_fake_epoch();
         let monotonic = self.monotonic_now();
         let market_open = self.market_is_open();
-        if !market_open {
-            self.mark_current_group_replaced();
-        }
-        let schedule_changed = {
+        let schedule_changed = if !market_open {
+            // 장부 Replaced와 runtime 그룹 제거 사이에 체결 확정이 끼지 않게
+            // feed consumer와 같은 gate에서 두 전이를 연속 수행한다.
+            let _market_guard = self.automation_market_gate.lock().await;
+            let can_pause_for_market_day = match self.mark_current_group_replaced() {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::error!("휴장 중 OCO 장부 종결 재시도 실패: {error}");
+                    false
+                }
+            };
+            if can_pause_for_market_day {
+                self.automation.lock().unwrap().pause_for_market_day()
+            } else {
+                false
+            }
+        } else {
             let mut runtime = self.automation.lock().unwrap();
-            if !market_open {
-                runtime.pause_for_market_day()
-            } else if matches!(runtime.mode(), ControlMode::Auto | ControlMode::Shadow)
+            if matches!(runtime.mode(), ControlMode::Auto | ControlMode::Shadow)
                 && runtime.position().is_none()
             {
                 let recovered = schedule::recover_decision_slot(runtime.next_decision_at(), now);
@@ -3623,30 +4365,39 @@ impl Engine {
             }
         }
 
-        let due = {
-            let runtime = self.automation.lock().unwrap();
-            runtime
-                .next_decision_at()
-                .filter(|slot| *slot <= now)
-                .map(|slot| (slot, runtime.mode()))
-        };
         if !market_open {
             return;
         }
-        let Some((slot, mode)) = due else {
-            return;
-        };
-        if !matches!(mode, ControlMode::Auto | ControlMode::Shadow) {
-            return;
-        }
-        if !self.automation.lock().unwrap().can_begin_analysis() {
-            return;
-        }
-        let next = schedule::following_slot(slot);
-        self.mark_current_group_replaced();
-        let revision = self.automation.lock().unwrap().begin_analysis(slot, next);
-        let Some(revision) = revision else {
-            return;
+        let (slot, mode, revision) = {
+            // 이전 OCO의 장부 종결과 Analyzing 전환을 시세 처리와 직렬화한다.
+            let _market_guard = self.automation_market_gate.lock().await;
+            let due = {
+                let runtime = self.automation.lock().unwrap();
+                runtime
+                    .next_decision_at()
+                    .filter(|slot| *slot <= now)
+                    .map(|slot| (slot, runtime.mode()))
+            };
+            let Some((slot, mode)) = due else {
+                return;
+            };
+            if !matches!(mode, ControlMode::Auto | ControlMode::Shadow)
+                || !self.automation.lock().unwrap().can_begin_analysis()
+            {
+                return;
+            }
+            let next = schedule::following_slot(slot);
+            if let Err(error) = self.mark_current_group_replaced() {
+                self.emit(
+                    "engine-error",
+                    &format!("기존 자동 시나리오 장부 종결 실패로 새 판단을 보류합니다: {error}"),
+                );
+                return;
+            }
+            let Some(revision) = self.automation.lock().unwrap().begin_analysis(slot, next) else {
+                return;
+            };
+            (slot, mode, revision)
         };
         // OpenAI 요청을 시작하기 전에 이번 슬롯 소비와 다음 슬롯을 반드시
         // 내구화한다. 정확한 5분 경계에서 앱이 재시작돼도 같은 슬롯을 재호출하지 않는다.
@@ -3667,49 +4418,31 @@ impl Engine {
         });
     }
 
-    async fn build_llm_input(&self) -> Result<DecisionInput, String> {
+    async fn build_llm_input(&self) -> Result<(DecisionInput, AutomationMarketMarker), String> {
         let settings = self.settings.read().unwrap().clone();
-        let bars = self
-            .candles(&settings.auto_symbols.underlying)
+        // 초기화 또는 실제 연결 공백 뒤의 REST 백필은 피드 잠금 밖에서 끝낸다.
+        // 이 반환값은 준비용일 뿐이며 실제 LLM 입력에는 아래 임계구역에서 다시
+        // 복사한 정상 캐시 스냅샷만 사용한다.
+        self.candles(&settings.auto_symbols.underlying)
             .await
             .map_err(|error| error.to_string())?;
-        let payload = chart_image::indicator_payload(&bars);
-        let indicator = |label: &str,
-                         interval_minutes: u32,
-                         timeframe: &chart_image::TimeframeIndicatorPayload|
-         -> Result<IndicatorInput, String> {
-            Ok(IndicatorInput {
-                interval_minutes,
-                current: timeframe
-                    .current_ohlcv
-                    .ok_or_else(|| format!("{label} 현재 봉 없음"))?,
-                ma5: timeframe
-                    .moving_averages
-                    .ma5
-                    .ok_or_else(|| format!("{label} MA5 부족"))?,
-                ma20: timeframe
-                    .moving_averages
-                    .ma20
-                    .ok_or_else(|| format!("{label} MA20 부족"))?,
-                ma60: timeframe
-                    .moving_averages
-                    .ma60
-                    .ok_or_else(|| format!("{label} MA60 부족"))?,
-                ma120: timeframe
-                    .moving_averages
-                    .ma120
-                    .ok_or_else(|| format!("{label} MA120 부족"))?,
-            })
-        };
-        let chart_png =
-            chart_image::render_composite_png(&bars).map_err(|error| error.to_string())?;
-        // 초기 백필·PNG 렌더가 오래 걸릴 수 있으므로 LLM에 보낼 시세는 모든
-        // 준비가 끝난 마지막 순간에 신선도를 검사하고 한 번에 복사한다.
-        let now = now_kst_fake_epoch();
-        if !self.auto_quotes_fresh(now) {
-            return Err("세 종목의 체결·호가가 모두 10초 이내가 아닙니다".into());
-        }
-        let (underlying, leverage, inverse) = {
+
+        // 봉·세 종목 호가·journal cursor·세대를 하나의 피드 임계구역에서
+        // 캡처한다. 이후 PNG 렌더 중 들어오는 틱은 marker 뒤 journal에 남으므로
+        // 응답 적용 때 정확히 재생되고, 입력 봉과 시세가 서로 다른 시점이 되지 않는다.
+        let (bars, as_of_epoch, underlying, leverage, inverse, marker) = {
+            let _market_guard = self.automation_market_gate.lock().await;
+            let now = now_kst_fake_epoch();
+            if !self.auto_quotes_fresh(now) {
+                return Err("세 종목의 체결·호가가 모두 10초 이내가 아닙니다".into());
+            }
+            let bars = self
+                .market_history
+                .healthy_snapshot(&settings.auto_symbols.underlying)
+                .await
+                .ok_or_else(|| {
+                    "LLM 입력 시점의 정상 1분봉 스냅샷을 확보할 수 없습니다".to_string()
+                })?;
             let quotes = self.quotes.read().unwrap();
             let get = |code: &str| {
                 quotes
@@ -3717,23 +4450,101 @@ impl Engine {
                     .cloned()
                     .ok_or_else(|| format!("시세 없음: {code}"))
             };
-            (
+            let (underlying, leverage, inverse) = (
                 get(&settings.auto_symbols.underlying)?,
                 get(&settings.auto_symbols.leverage)?,
                 get(&settings.auto_symbols.inverse)?,
-            )
+            );
+            let marker = self.automation_trade_journal.lock().unwrap().marker(
+                self.automation_feed_generation.load(Ordering::SeqCst),
+                underlying.trade_sequence,
+            );
+            (bars, now, underlying, leverage, inverse, marker)
         };
-        Ok(DecisionInput {
-            as_of_kst: crate::util::now_kst()
-                .format("%Y-%m-%dT%H:%M:%S+09:00")
-                .to_string(),
-            underlying: MarketQuoteInput::from(&underlying),
-            leverage: MarketQuoteInput::from(&leverage),
-            inverse: MarketQuoteInput::from(&inverse),
-            ten_minute: indicator("10분봉", 10, &payload.ten_minute)?,
-            fifteen_minute: indicator("15분봉", 15, &payload.fifteen_minute)?,
-            chart_png,
-        })
+
+        let as_of_kst = chrono::DateTime::from_timestamp(as_of_epoch, 0)
+            .ok_or_else(|| "LLM 판단 시각을 변환할 수 없습니다".to_string())?
+            .format("%Y-%m-%dT%H:%M:%S+09:00")
+            .to_string();
+        let indicators = chart_image::indicator_payload(&bars, as_of_epoch);
+        let chart_png = chart_image::render_composite_png(&bars, as_of_epoch)
+            .map_err(|error| error.to_string())?;
+        Ok((
+            DecisionInput {
+                as_of_kst,
+                underlying: MarketQuoteInput::from(&underlying),
+                leverage: MarketQuoteInput::from(&leverage),
+                inverse: MarketQuoteInput::from(&inverse),
+                indicators,
+                chart_png,
+            },
+            marker,
+        ))
+    }
+
+    /// 모델 응답을 적용하기 직전에 최신 본주 체결과 캐시된 1분봉을 다시 읽는다.
+    /// 첫 입력에서 이미 백필했으므로 정상 연결 중 추가 KIS REST 호출은 발생하지 않는다.
+    async fn latest_scenario_seeds(
+        &self,
+        decision: &ValidatedDecision,
+        input_indicators: &chart_image::IndicatorPayload,
+        market_marker: AutomationMarketMarker,
+    ) -> Result<Vec<ScenarioSeed>, String> {
+        if self.automation_feed_generation.load(Ordering::SeqCst) != market_marker.feed_generation {
+            return Err("LLM 분석 중 시세 연결이 초기화되어 판단을 폐기합니다".into());
+        }
+        let underlying_code = self
+            .settings
+            .read()
+            .unwrap()
+            .auto_symbols
+            .underlying
+            .clone();
+        let bars = self
+            .candles(&underlying_code)
+            .await
+            .map_err(|error| format!("응답 적용용 최근 1분봉 확인 실패: {error}"))?;
+        let now = now_kst_fake_epoch();
+        if !self.auto_quotes_fresh(now) {
+            return Err("응답 적용 시 세 종목의 최신 체결·호가를 확인할 수 없습니다".into());
+        }
+        let quote = self
+            .quotes
+            .read()
+            .unwrap()
+            .get(&underlying_code)
+            .cloned()
+            .ok_or_else(|| "응답 적용 시 본주 시세가 없습니다".to_string())?;
+        let current_price = quote.price.round() as u64;
+        let minimum_reference_epoch = self.automation_feed_reset_epoch.load(Ordering::SeqCst);
+        let (pre_input_reference_ticks, replay_ticks) = {
+            let journal = self.automation_trade_journal.lock().unwrap();
+            let pre_input_reference_ticks = if needs_reset_minute_tick_recovery(
+                &input_indicators.one_minute,
+                minimum_reference_epoch,
+            ) {
+                journal.since_reset_through(market_marker)?
+            } else {
+                Vec::new()
+            };
+            (pre_input_reference_ticks, journal.after(market_marker)?)
+        };
+        Ok(decision
+            .scenarios
+            .iter()
+            .map(|scenario| {
+                seed_scenario_from_latest_market(
+                    scenario,
+                    current_price,
+                    quote.trade_ts,
+                    &bars,
+                    &input_indicators.one_minute,
+                    minimum_reference_epoch,
+                    &pre_input_reference_ticks,
+                    &replay_ticks,
+                )
+            })
+            .collect())
     }
 
     /// 실패·거부·타임아웃도 다음 슬롯과 Idle 전이를 함께 저장한다. 슬롯 소비는
@@ -3757,18 +4568,17 @@ impl Engine {
         revision: u64,
         mode: ControlMode,
     ) {
-        let input = match self.build_llm_input().await {
-            Ok(input) => input,
+        let input_feed_generation = self.automation_feed_generation.load(Ordering::SeqCst);
+        let (input, market_marker) = match self.build_llm_input().await {
+            Ok(snapshot) => snapshot,
             Err(error) => {
                 self.record_failed_decision(slot, expiry, revision, mode, &error);
                 self.finish_llm_analysis_failure(revision, error);
                 return;
             }
         };
-        let snapshot_price = input.underlying.price.round() as u64;
-        let api_key = self.settings.read().unwrap().openai_api_key.clone();
-        let client = match OpenAiClient::new(api_key) {
-            Ok(client) => client,
+        let input_hash = match serialized_dynamic_input(&input) {
+            Ok(serialized) => sha256_hex(serialized.as_bytes()),
             Err(error) => {
                 let message = error.to_string();
                 self.record_failed_decision(slot, expiry, revision, mode, &message);
@@ -3776,10 +4586,63 @@ impl Engine {
                 return;
             }
         };
+        let chart_hash = sha256_hex(&input.chart_png);
+        if market_marker.feed_generation != input_feed_generation
+            || self.automation_feed_generation.load(Ordering::SeqCst) != input_feed_generation
+        {
+            let message = "LLM 입력 준비 중 시세 연결이 초기화되어 판단 요청을 생략했습니다";
+            self.record_failed_decision_with_telemetry(
+                slot,
+                expiry,
+                revision,
+                mode,
+                message,
+                None,
+                TokenUsage::default(),
+                0,
+                Some(&input_hash),
+                Some(&chart_hash),
+            );
+            self.finish_llm_analysis_failure(revision, message);
+            return;
+        }
+        let snapshot_price = input.underlying.price.round() as u64;
+        let api_key = self.settings.read().unwrap().openai_api_key.clone();
+        let client = match OpenAiClient::new(api_key) {
+            Ok(client) => client,
+            Err(error) => {
+                let message = error.to_string();
+                self.record_failed_decision_with_telemetry(
+                    slot,
+                    expiry,
+                    revision,
+                    mode,
+                    &message,
+                    None,
+                    TokenUsage::default(),
+                    0,
+                    Some(&input_hash),
+                    Some(&chart_hash),
+                );
+                self.finish_llm_analysis_failure(revision, message);
+                return;
+            }
+        };
         let seconds = expiry.saturating_sub(now_kst_fake_epoch());
         if seconds <= 0 {
             let message = "다음 5분 경계 전에 판단 입력 준비가 끝나지 않았습니다";
-            self.record_failed_decision(slot, expiry, revision, mode, message);
+            self.record_failed_decision_with_telemetry(
+                slot,
+                expiry,
+                revision,
+                mode,
+                message,
+                None,
+                TokenUsage::default(),
+                0,
+                Some(&input_hash),
+                Some(&chart_hash),
+            );
             self.finish_llm_analysis_failure(revision, message);
             return;
         }
@@ -3799,6 +4662,8 @@ impl Engine {
                     error.response_id.as_deref(),
                     error.usage,
                     error.latency_ms,
+                    Some(&input_hash),
+                    Some(&chart_hash),
                 );
                 self.finish_llm_analysis_failure(revision, message);
                 return;
@@ -3819,52 +4684,151 @@ impl Engine {
                     None,
                     TokenUsage::default(),
                     latency_ms,
+                    Some(&input_hash),
+                    Some(&chart_hash),
                 );
                 self.finish_llm_analysis_failure(revision, message);
                 return;
             }
         };
 
-        let current_matches = {
+        let feed_unchanged =
+            self.automation_feed_generation.load(Ordering::SeqCst) == input_feed_generation;
+        let mut current_matches = feed_unchanged && {
             let runtime = self.automation.lock().unwrap();
             runtime.revision() == revision
                 && runtime.phase() == crate::types::AutomationPhase::Analyzing
                 && runtime.mode() == mode
                 && now_kst_fake_epoch() < expiry
         };
-        let validated = match validate_decision(snapshot_price, &result.decision.scenarios) {
+        let validated = match validate_decision(snapshot_price, &result.decision) {
             Ok(validated) => validated,
             Err(error) => {
                 let message = format!("LLM 결정 의미 검증 실패: {error:?}");
-                self.record_failed_decision_with_telemetry(
-                    slot,
-                    expiry,
-                    revision,
-                    mode,
-                    &message,
-                    Some(&result.response_id),
-                    result.usage,
-                    result.latency_ms,
-                );
+                let status = if current_matches {
+                    LedgerDecisionStatus::Invalid
+                } else {
+                    LedgerDecisionStatus::Discarded
+                };
+                let decision = NewDecision {
+                    decision_id: result.response_id.clone(),
+                    session_id: self
+                        .automation
+                        .lock()
+                        .unwrap()
+                        .session_id()
+                        .map(str::to_owned),
+                    control_mode: ledger_control_mode(mode),
+                    revision: revision.try_into().unwrap_or(i64::MAX),
+                    as_of_ts: slot,
+                    expires_at: expiry,
+                    underlying_price: snapshot_price as f64,
+                    status,
+                    model: MODEL.into(),
+                    prompt_version: PROMPT_VERSION.into(),
+                    input_tokens: result.usage.input_tokens,
+                    cached_input_tokens: result.usage.cached_input_tokens,
+                    cache_write_tokens: result.usage.cache_write_tokens,
+                    output_tokens: result.usage.output_tokens,
+                    reasoning_tokens: result.usage.reasoning_tokens,
+                    latency_ms: result.latency_ms,
+                    input_hash: Some(input_hash),
+                    chart_hash: Some(chart_hash),
+                    market_regime: Some(ledger_market_regime(result.decision.market_regime)),
+                    decision_summary_ko: Some(result.decision.decision_summary_ko.clone()),
+                    error: Some(message.clone()),
+                    created_at: now_kst_fake_epoch(),
+                };
+                if let Err(ledger_error) = self.ledger.record_decision(&decision, &[]) {
+                    tracing::error!("무효 LLM 판단 장부 기록 실패: {ledger_error}");
+                } else {
+                    self.emit(
+                        "llm-decision-recorded",
+                        &serde_json::json!({
+                            "decisionId": decision.decision_id,
+                            "status": decision.status.as_str(),
+                        }),
+                    );
+                }
                 self.finish_llm_analysis_failure(revision, message);
                 return;
             }
         };
-        let decision_status = if !current_matches {
-            LedgerDecisionStatus::Discarded
-        } else if validated.scenarios.is_empty() {
-            LedgerDecisionStatus::Skipped
-        } else {
-            LedgerDecisionStatus::Armed
-        };
+        let mut discard_reason = (!current_matches).then(|| {
+            if !feed_unchanged {
+                "LLM 분석 중 시세 연결이 초기화되어 이전 기준선 판단을 폐기".to_string()
+            } else {
+                "상태 revision 또는 판단 슬롯 만료로 폐기".to_string()
+            }
+        });
+        let mut seeds = Vec::new();
+        if current_matches && !validated.scenarios.is_empty() {
+            match self
+                .latest_scenario_seeds(&validated, &input.indicators, market_marker)
+                .await
+            {
+                Ok(latest) => seeds = latest,
+                Err(error) => {
+                    current_matches = false;
+                    discard_reason = Some(error);
+                }
+            }
+        }
+        if current_matches {
+            let runtime = self.automation.lock().unwrap();
+            current_matches = runtime.revision() == revision
+                && runtime.phase() == crate::types::AutomationPhase::Analyzing
+                && runtime.mode() == mode
+                && now_kst_fake_epoch() < expiry
+                && self.automation_feed_generation.load(Ordering::SeqCst) == input_feed_generation;
+            if !current_matches {
+                discard_reason = Some("최신 시세 재검증 중 상태 또는 판단 슬롯이 변경됨".into());
+            }
+        }
+        let decision_status = initial_decision_status(current_matches, &validated, &seeds);
+        // 실행 가능한 판단은 장부에 먼저 안전한 비활성 상태로 준비한 뒤, 최종
+        // 피드 배리어·seed·revision 검사를 통과한 트랜잭션에서만 Armed로 바꾼다.
+        // 중간 DB 오류나 프로세스 종료가 있어도 장부에 유령 Armed가 남지 않는다.
+        let staged_activation = current_matches && decision_status == LedgerDecisionStatus::Armed;
         let scenarios: Vec<NewDecisionScenario> = validated
             .scenarios
             .iter()
-            .map(|scenario| NewDecisionScenario {
-                product: ledger_product(scenario.product),
-                trigger_price: scenario.trigger_price,
-                target_return_pct: scenario.target_return_pct,
-                status: LedgerScenarioStatus::Armed,
+            .map(|scenario| {
+                let seed = seeds
+                    .iter()
+                    .find(|seed| seed.product == scenario.product)
+                    .copied()
+                    .unwrap_or_else(|| ScenarioSeed::armed(scenario.product, None));
+                let scenario_status = if staged_activation
+                    && matches!(
+                        seed.status,
+                        crate::types::ScenarioStatus::Armed
+                            | crate::types::ScenarioStatus::Confirming
+                    ) {
+                    LedgerScenarioStatus::Replaced
+                } else if current_matches {
+                    ledger_scenario_status(seed.status)
+                } else {
+                    LedgerScenarioStatus::Replaced
+                };
+                let terminal_reason = if current_matches {
+                    scenario_terminal_reason(seed.status).map(str::to_owned)
+                } else {
+                    discard_reason.clone()
+                };
+                NewDecisionScenario {
+                    product: ledger_product(scenario.product),
+                    setup_type: Some(ledger_setup_type(scenario.setup_type)),
+                    reference_price: Some(scenario.reference_price),
+                    confirmation_price: Some(scenario.confirmation_price),
+                    invalidation_price: Some(scenario.invalidation_price),
+                    trigger_price: scenario.trigger_price,
+                    target_return_pct: scenario.target_return_pct,
+                    rationale_ko: Some(scenario.rationale_ko.clone()),
+                    status: scenario_status,
+                    reference_observed_at: seed.reference_observed_at,
+                    terminal_reason,
+                }
             })
             .chain(
                 validated
@@ -3872,9 +4836,19 @@ impl Engine {
                     .iter()
                     .map(|scenario| NewDecisionScenario {
                         product: ledger_product(scenario.product),
+                        setup_type: Some(ledger_setup_type(scenario.setup_type)),
+                        reference_price: Some(scenario.reference_price),
+                        confirmation_price: Some(scenario.confirmation_price),
+                        invalidation_price: Some(scenario.invalidation_price),
                         trigger_price: scenario.trigger_price,
                         target_return_pct: scenario.target_return_pct,
+                        rationale_ko: Some(scenario.rationale_ko.clone()),
                         status: LedgerScenarioStatus::Invalid,
+                        reference_observed_at: None,
+                        terminal_reason: Some(format!(
+                            "의미 검증 실패: {}",
+                            scenario_invalid_reason_ko(scenario.reason)
+                        )),
                     }),
             )
             .collect();
@@ -3892,7 +4866,11 @@ impl Engine {
             as_of_ts: slot,
             expires_at: expiry,
             underlying_price: snapshot_price as f64,
-            status: decision_status,
+            status: if staged_activation {
+                LedgerDecisionStatus::Discarded
+            } else {
+                decision_status
+            },
             model: MODEL.into(),
             prompt_version: PROMPT_VERSION.into(),
             input_tokens: result.usage.input_tokens,
@@ -3901,9 +4879,14 @@ impl Engine {
             output_tokens: result.usage.output_tokens,
             reasoning_tokens: result.usage.reasoning_tokens,
             latency_ms: result.latency_ms,
-            input_hash: None,
-            chart_hash: None,
-            error: (!current_matches).then(|| "상태 revision 또는 슬롯 만료로 폐기".into()),
+            input_hash: Some(input_hash),
+            chart_hash: Some(chart_hash),
+            market_regime: Some(ledger_market_regime(validated.market_regime)),
+            decision_summary_ko: Some(validated.decision_summary_ko.clone()),
+            error: discard_reason.clone().or_else(|| {
+                (decision_status == LedgerDecisionStatus::Invalid)
+                    .then(|| "모든 시나리오가 의미 검증에 실패함".into())
+            }),
             created_at: now_kst_fake_epoch(),
         };
         let row_id = match self.ledger.record_decision(&decision, &scenarios) {
@@ -3915,50 +4898,208 @@ impl Engine {
             }
         };
         if !current_matches {
+            self.emit(
+                "llm-decision-recorded",
+                &serde_json::json!({
+                    "decisionId": decision.decision_id,
+                    "status": decision.status.as_str(),
+                }),
+            );
+        }
+        if !current_matches {
+            self.finish_llm_analysis_failure(
+                revision,
+                discard_reason.unwrap_or_else(|| "LLM 판단 적용 조건이 변경되었습니다".into()),
+            );
             return;
         }
 
-        // 응답은 경계 전에 도착했더라도 장부 저장 중 다음 슬롯로 넘어갈 수 있다.
-        // 실제 OCO 무장 직전에 한 번 더 벽시계 만료를 확인해 지난 판단이 주문으로
-        // 이어지는 아주 좁은 경쟁 구간까지 닫는다.
-        let accepted_at_epoch = now_kst_fake_epoch();
-        if accepted_at_epoch >= expiry {
-            let message = "LLM 판단 장부 저장 중 다음 5분 경계를 넘어 폐기되었습니다";
-            let _ = self.ledger.update_decision_status(
-                &decision.decision_id,
-                LedgerDecisionStatus::Discarded,
-                Some(message),
-            );
-            if self
-                .automation
-                .lock()
-                .unwrap()
-                .fail_analysis(revision, message)
-            {
-                self.persist_automation();
-                self.emit_automation_state();
+        if !validated.scenarios.is_empty() {
+            if let Err(error) = self.drain_automation_feed_queue(expiry).await {
+                self.discard_recorded_decision(&decision.decision_id, &validated, &seeds, &error);
+                self.finish_llm_analysis_failure(revision, error);
+                return;
             }
+        }
+
+        // 이 잠금 뒤에는 새 체결·연결 이벤트가 끼어들 수 없다. 입력 cursor 이후
+        // 틱을 전부 재생한 상태에서 generation/expiry/revision 확인과 OCO 무장을
+        // 연속 수행해 응답 지연 구간의 C/I 재통과와 TOCTOU를 모두 차단한다.
+        let market_guard = self.automation_market_gate.lock().await;
+        if self.automation_feed_generation.load(Ordering::SeqCst) != market_marker.feed_generation {
+            let message = "LLM 판단 무장 직전 시세 연결이 초기화되어 폐기되었습니다";
+            self.discard_recorded_decision(&decision.decision_id, &validated, &seeds, message);
+            drop(market_guard);
+            self.finish_llm_analysis_failure(revision, message);
             return;
         }
+
+        if !validated.scenarios.is_empty() {
+            let latest = match self
+                .latest_scenario_seeds(&validated, &input.indicators, market_marker)
+                .await
+            {
+                Ok(latest) => latest,
+                Err(error) => {
+                    self.discard_recorded_decision(
+                        &decision.decision_id,
+                        &validated,
+                        &seeds,
+                        &error,
+                    );
+                    drop(market_guard);
+                    self.finish_llm_analysis_failure(revision, error);
+                    return;
+                }
+            };
+            for latest_seed in latest {
+                if let Some(previous) = seeds
+                    .iter_mut()
+                    .find(|seed| seed.product == latest_seed.product)
+                {
+                    *previous = merge_scenario_seed(*previous, latest_seed);
+                }
+            }
+        }
+
+        let last_trade_sequence = if validated.scenarios.is_empty() {
+            None
+        } else {
+            match self
+                .automation_trade_journal
+                .lock()
+                .unwrap()
+                .after(market_marker)
+            {
+                Ok(replayed) => replayed
+                    .last()
+                    .map(|tick| tick.sequence)
+                    .or((market_marker.trade_sequence > 0).then_some(market_marker.trade_sequence)),
+                Err(error) => {
+                    self.discard_recorded_decision(
+                        &decision.decision_id,
+                        &validated,
+                        &seeds,
+                        &error,
+                    );
+                    drop(market_guard);
+                    self.finish_llm_analysis_failure(revision, error);
+                    return;
+                }
+            }
+        };
+
+        // runtime mutex를 얻은 뒤의 밀리초 벽시각 하나만 만료 검사와 남은 수명
+        // 계산에 함께 쓴다. 단조 시각을 먼저 찍어 두 샘플 사이 지연은 수명을
+        // 보수적으로 줄이게 하고, mutex 대기나 초 단위 절삭으로 연장되지 않게 한다.
+        let mut runtime = self.automation.lock().unwrap();
         let armed_at = self.monotonic_now();
-        let remaining = expiry.saturating_sub(accepted_at_epoch);
-        let accepted = self.automation.lock().unwrap().accept_decision(
+        let final_accepted_at_millis = now_kst_fake_epoch_millis();
+        let final_accepted_at_epoch = final_accepted_at_millis.div_euclid(1_000);
+        let expiry_millis = expiry.saturating_mul(1_000);
+        let state_still_matches = runtime.revision() == revision
+            && runtime.phase() == crate::types::AutomationPhase::Analyzing
+            && runtime.mode() == mode
+            && final_accepted_at_millis < expiry_millis
+            && self.automation_feed_generation.load(Ordering::SeqCst)
+                == market_marker.feed_generation;
+        if !state_still_matches {
+            drop(runtime);
+            let message = "LLM 판단 무장 직전 상태·시세 세대 또는 판단 슬롯이 변경되었습니다";
+            self.discard_recorded_decision(&decision.decision_id, &validated, &seeds, message);
+            drop(market_guard);
+            self.finish_llm_analysis_failure(revision, message);
+            return;
+        }
+        let remaining_millis = expiry_millis.saturating_sub(final_accepted_at_millis);
+        let expires_at = armed_at + Duration::from_millis(remaining_millis as u64);
+
+        // 장부를 Armed로 바꾸기 전에 동일 인자로 OCO 생성 가능성을 확인한다.
+        // 이후 runtime.accept_decision은 같은 mutex 아래 같은 입력을 사용한다.
+        if !validated.scenarios.is_empty()
+            && OcoGroup::arm(
+                row_id,
+                revision,
+                &validated,
+                &seeds,
+                last_trade_sequence,
+                armed_at,
+                expires_at,
+            )
+            .is_err()
+        {
+            drop(runtime);
+            let message = "응답 적용 시 OCO 그룹 사전 검증 실패";
+            self.discard_recorded_decision(&decision.decision_id, &validated, &seeds, message);
+            drop(market_guard);
+            self.finish_llm_analysis_failure(revision, message);
+            return;
+        }
+
+        let refreshed_status = initial_decision_status(true, &validated, &seeds);
+        let updates: Vec<_> = seeds
+            .iter()
+            .map(|seed| ScenarioStatusUpdate {
+                product: ledger_product(seed.product),
+                status: ledger_scenario_status(seed.status),
+                confirmation_started_at: None,
+                confirmation_tick_count: 0,
+                updated_at: final_accepted_at_epoch,
+                terminal_reason: scenario_terminal_reason(seed.status),
+                reference_observed_at: seed.reference_observed_at,
+            })
+            .collect();
+        if let Err(error) = self.ledger.update_decision_and_scenarios(
+            &decision.decision_id,
+            Some(refreshed_status),
+            None,
+            &updates,
+        ) {
+            drop(runtime);
+            let message = format!("최종 LLM 시나리오 장부 갱신 실패: {error}");
+            self.discard_recorded_decision(&decision.decision_id, &validated, &seeds, &message);
+            drop(market_guard);
+            self.finish_llm_analysis_failure(revision, message);
+            return;
+        }
+        if self.monotonic_now() >= expires_at {
+            drop(runtime);
+            let message = "최종 장부 갱신 중 판단 슬롯이 만료되어 OCO를 무장하지 않습니다";
+            self.discard_recorded_decision(&decision.decision_id, &validated, &seeds, message);
+            drop(market_guard);
+            self.finish_llm_analysis_failure(revision, message);
+            return;
+        }
+
+        let accepted = runtime.accept_decision(
             revision,
             row_id,
-            result.response_id,
+            result.response_id.clone(),
             &validated,
+            automation_decision_status(refreshed_status),
+            &seeds,
+            last_trade_sequence,
             row_id,
             armed_at,
-            armed_at + Duration::from_secs(remaining as u64),
+            expires_at,
             expiry,
         );
+        drop(runtime);
         if !accepted {
-            let _ = self.ledger.update_decision_status(
-                &decision.decision_id,
-                LedgerDecisionStatus::Discarded,
-                Some("응답 적용 시 revision 변경"),
-            );
+            let message = "응답 적용 시 OCO 그룹 생성 또는 revision 검증 실패";
+            self.discard_recorded_decision(&decision.decision_id, &validated, &seeds, message);
+            drop(market_guard);
+            self.finish_llm_analysis_failure(revision, message);
+            return;
         }
+        drop(market_guard);
+        self.emit(
+            "llm-decision-recorded",
+            &serde_json::json!({
+                "decisionId": decision.decision_id,
+                "status": refreshed_status.as_str(),
+            }),
+        );
         self.persist_automation();
         self.emit_automation_state();
     }
@@ -3980,6 +5121,8 @@ impl Engine {
             None,
             TokenUsage::default(),
             0,
+            None,
+            None,
         );
     }
 
@@ -3994,6 +5137,8 @@ impl Engine {
         response_id: Option<&str>,
         usage: TokenUsage,
         latency_ms: u64,
+        input_hash: Option<&str>,
+        chart_hash: Option<&str>,
     ) {
         let underlying_price = self
             .settings
@@ -4031,13 +5176,23 @@ impl Engine {
             output_tokens: usage.output_tokens,
             reasoning_tokens: usage.reasoning_tokens,
             latency_ms,
-            input_hash: None,
-            chart_hash: None,
+            input_hash: input_hash.map(str::to_owned),
+            chart_hash: chart_hash.map(str::to_owned),
+            market_regime: None,
+            decision_summary_ko: None,
             error: Some(error.to_string()),
             created_at: now_kst_fake_epoch(),
         };
         if let Err(ledger_error) = self.ledger.record_decision(&decision, &[]) {
             tracing::error!("LLM 실패 장부 기록 실패: {ledger_error}");
+        } else {
+            self.emit(
+                "llm-decision-recorded",
+                &serde_json::json!({
+                    "decisionId": decision.decision_id,
+                    "status": decision.status.as_str(),
+                }),
+            );
         }
     }
 
@@ -7473,7 +8628,9 @@ impl Engine {
         {
             return Err("OpenAI API 키를 먼저 설정하세요".into());
         }
-        self.mark_current_group_replaced();
+        self.mark_current_group_replaced().map_err(|error| {
+            format!("기존 자동 시나리오 종결 실패로 모드를 유지합니다: {error}")
+        })?;
 
         // 진행 중인 주문 actor가 종결된 뒤에만 모드를 바꿔 주문 소유권이 섞이지 않게 한다.
         let _actor = self.order_actor.lock().await;
@@ -8109,6 +9266,7 @@ impl Engine {
         }
         match self.broker.snapshot(code).await {
             Ok(q) => {
+                let _market_guard = self.automation_market_gate.lock().await;
                 self.quotes
                     .write()
                     .unwrap()
@@ -8773,6 +9931,373 @@ mod tests {
         crate::util::kst_str_to_fake_epoch(&date, "100000").unwrap()
     }
 
+    fn test_reversal_decision() -> ValidatedDecision {
+        validate_decision(
+            185_000,
+            &crate::types::ModelDecision {
+                market_regime: MarketRegime::Range,
+                decision_summary_ko: "지지 반응 시험".into(),
+                scenarios: vec![crate::types::ModelScenario {
+                    product: ProductKind::Leverage,
+                    setup_type: SetupType::Reversal,
+                    reference_price: 184_800,
+                    confirmation_price: 185_200,
+                    invalidation_price: 184_600,
+                    target_return_pct: 0.3,
+                    rationale_ko: "반복 지지 뒤 거래량 회복".into(),
+                }],
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn 응답적용_seed는_입력뒤_정확한_체결을_순서대로_재생한다() {
+        let decision = test_reversal_decision();
+        let scenario = &decision.scenarios[0];
+        let bars = vec![
+            Candle {
+                time: 120,
+                open: 185_000.0,
+                high: 185_100.0,
+                low: 184_700.0,
+                close: 185_000.0,
+                volume: 100.0,
+            },
+            Candle {
+                time: 180,
+                open: 185_000.0,
+                high: 185_100.0,
+                low: 184_900.0,
+                close: 185_000.0,
+                volume: 100.0,
+            },
+        ];
+        let input_indicators = chart_image::indicator_payload(&bars, 210);
+
+        let before_new_touch = seed_scenario_from_latest_market(
+            scenario,
+            185_000,
+            210,
+            &bars,
+            &input_indicators.one_minute,
+            150,
+            &[],
+            &[],
+        );
+        assert_eq!(before_new_touch.status, crate::types::ScenarioStatus::Armed);
+        assert_eq!(before_new_touch.reference_observed_at, None);
+
+        // reset epoch가 분 경계로 절삭돼도 그 bucket 전체를 신뢰하지 않는다.
+        let exact_boundary_without_tick = seed_scenario_from_latest_market(
+            scenario,
+            185_000,
+            210,
+            &bars,
+            &input_indicators.one_minute,
+            120,
+            &[],
+            &[],
+        );
+        assert_eq!(exact_boundary_without_tick.reference_observed_at, None);
+
+        let mut sixteen_bars_without_recent_touch = vec![Candle {
+            time: 1,
+            open: 185_000.0,
+            high: 185_100.0,
+            low: 184_700.0,
+            close: 185_000.0,
+            volume: 100.0,
+        }];
+        sixteen_bars_without_recent_touch.extend((2..=17).map(|time| Candle {
+            time,
+            open: 185_000.0,
+            high: 185_100.0,
+            low: 184_900.0,
+            close: 185_000.0,
+            volume: 100.0,
+        }));
+        assert_eq!(
+            reference_observed_at(scenario, &sixteen_bars_without_recent_touch, 0),
+            None
+        );
+
+        let tick = |sequence: u64, epoch: i64, price: u64| TradeTick {
+            sequence,
+            price,
+            volume: 1,
+            at: Duration::from_secs(sequence),
+            epoch,
+        };
+        assert!(needs_reset_minute_tick_recovery(
+            &input_indicators.one_minute,
+            150
+        ));
+        assert!(needs_reset_minute_tick_recovery(
+            &input_indicators.one_minute,
+            120
+        ));
+        let exact_boundary_post_reset_touch = [tick(1, 120, 184_800)];
+        let exact_boundary_recovered = seed_scenario_from_latest_market(
+            scenario,
+            185_000,
+            210,
+            &bars,
+            &input_indicators.one_minute,
+            120,
+            &exact_boundary_post_reset_touch,
+            &[],
+        );
+        assert_eq!(exact_boundary_recovered.reference_observed_at, Some(120));
+
+        let post_reset_pre_input_touch = [tick(1, 160, 184_800)];
+        let recovered_same_minute_touch = seed_scenario_from_latest_market(
+            scenario,
+            185_000,
+            210,
+            &bars,
+            &input_indicators.one_minute,
+            150,
+            &post_reset_pre_input_touch,
+            &[],
+        );
+        assert_eq!(recovered_same_minute_touch.reference_observed_at, Some(160));
+        assert_eq!(
+            recovered_same_minute_touch.status,
+            crate::types::ScenarioStatus::Armed
+        );
+
+        let touched = [tick(1, 220, 184_800)];
+        let after_new_touch = seed_scenario_from_latest_market(
+            scenario,
+            185_000,
+            230,
+            &bars,
+            &input_indicators.one_minute,
+            150,
+            &[],
+            &touched,
+        );
+        assert_eq!(after_new_touch.reference_observed_at, Some(220));
+
+        let touched_then_confirmed = [tick(1, 220, 184_800), tick(2, 221, 185_300)];
+        let missed = seed_scenario_from_latest_market(
+            scenario,
+            185_000,
+            230,
+            &bars,
+            &input_indicators.one_minute,
+            150,
+            &[],
+            &touched_then_confirmed,
+        );
+        assert_eq!(missed.status, crate::types::ScenarioStatus::Missed);
+
+        let touched_confirmed_then_invalidated = [
+            tick(1, 220, 184_800),
+            tick(2, 221, 185_300),
+            tick(3, 222, 184_500),
+        ];
+        let recovered_invalidated = seed_scenario_from_latest_market(
+            scenario,
+            185_000,
+            230,
+            &bars,
+            &input_indicators.one_minute,
+            150,
+            &[],
+            &touched_confirmed_then_invalidated,
+        );
+        assert_eq!(
+            recovered_invalidated.status,
+            crate::types::ScenarioStatus::Invalidated
+        );
+
+        let invalidated = seed_scenario_from_latest_market(
+            scenario,
+            184_500,
+            232,
+            &bars,
+            &input_indicators.one_minute,
+            150,
+            &[],
+            &[],
+        );
+        assert_eq!(
+            invalidated.status,
+            crate::types::ScenarioStatus::Invalidated
+        );
+
+        // 입력 형성봉의 기존 고가가 이미 C 위여도 cursor 이후 C 재통과를 놓치지 않는다.
+        let continuation = validate_decision(
+            185_000,
+            &crate::types::ModelDecision {
+                market_regime: MarketRegime::Uptrend,
+                decision_summary_ko: "재통과 확인".into(),
+                scenarios: vec![crate::types::ModelScenario {
+                    product: ProductKind::Leverage,
+                    setup_type: SetupType::Continuation,
+                    reference_price: 185_100,
+                    confirmation_price: 185_300,
+                    invalidation_price: 184_500,
+                    target_return_pct: 0.3,
+                    rationale_ko: "입력 뒤 확인가 재통과".into(),
+                }],
+            },
+        )
+        .unwrap();
+        let mut high_already_above = bars.clone();
+        high_already_above[1].high = 185_400.0;
+        let continuation_input = chart_image::indicator_payload(&high_already_above, 210);
+        let crossed_and_recovered = [tick(4, 223, 185_300), tick(5, 224, 185_000)];
+        let recovered_missed = seed_scenario_from_latest_market(
+            &continuation.scenarios[0],
+            185_000,
+            230,
+            &high_already_above,
+            &continuation_input.one_minute,
+            150,
+            &[],
+            &crossed_and_recovered,
+        );
+        assert_eq!(
+            recovered_missed.status,
+            crate::types::ScenarioStatus::Missed
+        );
+    }
+
+    #[test]
+    fn 체결_journal은_입력순번_이하를_제외하고_유실시_안전폐기한다() {
+        let mut journal = AutomationTradeJournal::default();
+        let marker = journal.marker(3, 100);
+        for (sequence, price) in [(100, 185_300), (99, 184_500), (101, 185_300)] {
+            journal.push(TradeTick {
+                sequence,
+                price,
+                volume: 1,
+                at: Duration::from_secs(sequence),
+                epoch: 1_000 + sequence as i64,
+            });
+        }
+        let replayed = journal.after(marker).unwrap();
+        assert_eq!(
+            replayed
+                .iter()
+                .map(|tick| tick.sequence)
+                .collect::<Vec<_>>(),
+            vec![101]
+        );
+
+        let mut overflowed = AutomationTradeJournal::default();
+        let old_marker = overflowed.marker(3, 0);
+        for sequence in 1..=(AUTOMATION_TRADE_JOURNAL_CAPACITY as u64 + 1) {
+            overflowed.push(TradeTick {
+                sequence,
+                price: 185_000,
+                volume: 1,
+                at: Duration::from_secs(sequence),
+                epoch: 1_000 + sequence as i64,
+            });
+        }
+        assert!(overflowed.after(old_marker).is_err());
+
+        let mut reconnected = AutomationTradeJournal::default();
+        reconnected.push(TradeTick {
+            sequence: 900,
+            price: 184_700,
+            volume: 1,
+            at: Duration::from_secs(1),
+            epoch: 1_000,
+        });
+        reconnected.mark_reset();
+        reconnected.push(TradeTick {
+            sequence: 1,
+            price: 184_800,
+            volume: 1,
+            at: Duration::from_secs(2),
+            epoch: 1_010,
+        });
+        let reconnect_marker = reconnected.marker(4, 1);
+        assert_eq!(
+            reconnected
+                .since_reset_through(reconnect_marker)
+                .unwrap()
+                .iter()
+                .map(|tick| tick.sequence)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn 모델출력_분류는_skip_invalid_missed_invalidated를_구분한다() {
+        let skip = validate_decision(
+            185_000,
+            &crate::types::ModelDecision {
+                market_regime: MarketRegime::Unclear,
+                decision_summary_ko: "시간축 충돌".into(),
+                scenarios: vec![],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            initial_decision_status(true, &skip, &[]),
+            LedgerDecisionStatus::Skipped
+        );
+
+        let invalid = validate_decision(
+            185_000,
+            &crate::types::ModelDecision {
+                market_regime: MarketRegime::Range,
+                decision_summary_ko: "잘못된 가격 순서".into(),
+                scenarios: vec![crate::types::ModelScenario {
+                    product: ProductKind::Leverage,
+                    setup_type: SetupType::Continuation,
+                    reference_price: 184_900,
+                    confirmation_price: 184_800,
+                    invalidation_price: 184_700,
+                    target_return_pct: 0.3,
+                    rationale_ko: "의도적인 오류".into(),
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            initial_decision_status(true, &invalid, &[]),
+            LedgerDecisionStatus::Invalid
+        );
+
+        let reversal = test_reversal_decision();
+        assert_eq!(
+            initial_decision_status(
+                true,
+                &reversal,
+                &[ScenarioSeed::missed(ProductKind::Leverage, Some(100))]
+            ),
+            LedgerDecisionStatus::Missed
+        );
+        assert_eq!(
+            initial_decision_status(
+                true,
+                &reversal,
+                &[ScenarioSeed::invalidated(ProductKind::Leverage, Some(100))]
+            ),
+            LedgerDecisionStatus::Invalidated
+        );
+        assert_eq!(
+            initial_decision_status(false, &reversal, &[]),
+            LedgerDecisionStatus::Discarded
+        );
+    }
+
+    #[test]
+    fn 장부_해시는_sha256_소문자_16진수다() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
     fn test_engine(broker: Arc<dyn Broker>, settings: Settings) -> Arc<Engine> {
         test_engine_with_emit(broker, settings, None)
     }
@@ -8800,6 +10325,9 @@ mod tests {
             stop_loss_lock: Mutex::new(HashMap::new()),
             market_history: MarketHistory::new(),
             automation: Mutex::new(AutomationRuntime::new(PersistedAutomation::default(), None)),
+            automation_market_gate: tokio::sync::Mutex::new(()),
+            automation_trade_journal: Mutex::new(AutomationTradeJournal::default()),
+            automation_feed_tx: Mutex::new(None),
             market_day: RwLock::new(PersistedMarketDayState {
                 date: market_date_info(test_automation_now()).unwrap().0,
                 status: MarketDayStatus::Open,
@@ -8809,11 +10337,15 @@ mod tests {
             market_day_refresh_pending: AtomicBool::new(false),
             shadow: Mutex::new(None),
             ledger,
+            scenario_history_fingerprint: Mutex::new(None),
             order_actor: tokio::sync::Mutex::new(()),
             fill_ingest_lock: Mutex::new(()),
             fill_reconcile_pending: Mutex::new(HashMap::new()),
             trade_sequence: AtomicU64::new(0),
             connected: AtomicBool::new(true),
+            automation_feed_seen_connection: AtomicBool::new(true),
+            automation_feed_generation: AtomicU64::new(0),
+            automation_feed_reset_epoch: AtomicI64::new(0),
             auto_flatten_pending: AtomicBool::new(false),
             entry_reconcile_pending: AtomicBool::new(false),
             exit_reconcile_pending: AtomicBool::new(false),
@@ -8987,17 +10519,140 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn 호가이벤트는_llm용_마지막_체결량을_캐시에_보존한다() {
+        let settings = Settings::default();
+        let engine = test_engine(Arc::new(MockBroker::new(&settings)), settings);
+        seed_shadow_quotes(&engine, 10_000, 10_000);
+        engine
+            .quotes
+            .write()
+            .unwrap()
+            .get_mut("000660")
+            .unwrap()
+            .volume = 321.0;
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(FeedEvent::Book {
+            code: "000660".into(),
+            ask1: 185_100.0,
+            bid1: 185_000.0,
+            ask1_qty: 2_000,
+            bid1_qty: 1_500,
+            ts: test_automation_now(),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        consume_feed(Arc::clone(&engine), rx).await;
+
+        let cached = engine
+            .quotes
+            .read()
+            .unwrap()
+            .get("000660")
+            .cloned()
+            .unwrap();
+        assert_eq!(cached.volume, 321.0);
+        assert_eq!(MarketQuoteInput::from(&cached).last_trade_volume, 321.0);
+    }
+
+    #[tokio::test]
+    async fn 피드_fifo_배리어는_앞선_체결의_journal_반영까지_기다린다() {
+        let settings = Settings::default();
+        let engine = test_engine(Arc::new(MockBroker::new(&settings)), settings);
+        let marker = engine
+            .automation_trade_journal
+            .lock()
+            .unwrap()
+            .marker(engine.automation_feed_generation.load(Ordering::SeqCst), 0);
+        let (tx, rx) = mpsc::channel(4);
+        *engine.automation_feed_tx.lock().unwrap() = Some(tx.clone());
+        let consumer = tokio::spawn(consume_feed(Arc::clone(&engine), rx));
+        let now = now_kst_fake_epoch();
+        tx.send(FeedEvent::Quote(Quote {
+            code: "000660".into(),
+            price: 185_300.0,
+            change_rate: 0.0,
+            ask1: 185_300.0,
+            bid1: 185_200.0,
+            ask1_qty: 1_000,
+            bid1_qty: 1_000,
+            volume: 7.0,
+            trade_sequence: 42,
+            received_at_micros: 1,
+            trade_ts: now,
+            book_ts: now,
+        }))
+        .await
+        .unwrap();
+
+        engine
+            .drain_automation_feed_queue(now.saturating_add(30))
+            .await
+            .unwrap();
+
+        let replayed = engine
+            .automation_trade_journal
+            .lock()
+            .unwrap()
+            .after(marker)
+            .unwrap();
+        assert_eq!(
+            replayed
+                .iter()
+                .map(|tick| tick.sequence)
+                .collect::<Vec<_>>(),
+            vec![42]
+        );
+        consumer.abort();
+    }
+
+    #[tokio::test]
+    async fn 최초연결은_피드세대를_유지하고_재연결만_초기화한다() {
+        let settings = Settings::default();
+        let engine = test_engine(Arc::new(MockBroker::new(&settings)), settings);
+        seed_shadow_quotes(&engine, 10_000, 10_000);
+        engine
+            .automation_feed_seen_connection
+            .store(false, Ordering::SeqCst);
+        engine.automation_feed_generation.store(0, Ordering::SeqCst);
+        engine
+            .automation_feed_reset_epoch
+            .store(0, Ordering::SeqCst);
+        let (tx, rx) = mpsc::channel(3);
+        tx.send(FeedEvent::Conn(true)).await.unwrap();
+        tx.send(FeedEvent::Conn(false)).await.unwrap();
+        tx.send(FeedEvent::Conn(true)).await.unwrap();
+        drop(tx);
+
+        consume_feed(Arc::clone(&engine), rx).await;
+
+        assert_eq!(engine.automation_feed_generation.load(Ordering::SeqCst), 2);
+        assert!(engine.automation_feed_reset_epoch.load(Ordering::SeqCst) > 0);
+        assert!(!engine.auto_quotes_fresh(test_automation_now()));
+    }
+
     fn arm_shadow_trigger(engine: &Engine) -> TriggeredScenario {
         let decision = validate_decision(
             185_000,
-            &[crate::types::ModelScenario {
-                product: ProductKind::Leverage,
-                trigger_price: 185_100,
-                target_return_pct: 0.3,
-            }],
+            &crate::types::ModelDecision {
+                market_regime: MarketRegime::Uptrend,
+                decision_summary_ko: "상승 추세 돌파 시험".into(),
+                scenarios: vec![crate::types::ModelScenario {
+                    product: ProductKind::Leverage,
+                    setup_type: SetupType::Continuation,
+                    reference_price: 185_100,
+                    confirmation_price: 185_300,
+                    invalidation_price: 184_800,
+                    target_return_pct: 0.3,
+                    rationale_ko: "거래량을 동반한 상단 압축".into(),
+                }],
+            },
         )
         .unwrap();
-        let applied_trigger = decision.scenarios[0].trigger_price;
+        let scenario = &decision.scenarios[0];
+        let applied_trigger = scenario.trigger_price;
         let now = engine.automation_now();
         let start = engine.monotonic_now();
         let mut runtime = engine.automation.lock().unwrap();
@@ -9026,22 +10681,35 @@ mod tests {
                     latency_ms: 0,
                     input_hash: None,
                     chart_hash: None,
+                    market_regime: Some(LedgerMarketRegime::Uptrend),
+                    decision_summary_ko: Some("상승 추세 돌파 시험".into()),
                     error: None,
                     created_at: now,
                 },
                 &[NewDecisionScenario {
                     product: LedgerProductKind::Leverage,
+                    setup_type: Some(LedgerSetupType::Continuation),
+                    reference_price: Some(scenario.reference_price),
+                    confirmation_price: Some(scenario.confirmation_price),
+                    invalidation_price: Some(scenario.invalidation_price),
                     trigger_price: applied_trigger,
                     target_return_pct: 0.3,
+                    rationale_ko: Some(scenario.rationale_ko.clone()),
                     status: LedgerScenarioStatus::Armed,
+                    reference_observed_at: None,
+                    terminal_reason: None,
                 }],
             )
             .unwrap();
+        let seeds = [ScenarioSeed::armed(ProductKind::Leverage, None)];
         assert!(runtime.accept_decision(
             revision,
             row_id,
             decision_id,
             &decision,
+            AutomationDecisionStatus::Armed,
+            &seeds,
+            None,
             row_id,
             start,
             start + Duration::from_secs(300),
@@ -9054,6 +10722,7 @@ mod tests {
                 price: applied_trigger,
                 volume: 1,
                 at: start + Duration::from_secs(second),
+                epoch: now + second as i64,
             });
             if triggered.is_some() {
                 break;
@@ -9063,19 +10732,34 @@ mod tests {
     }
 
     fn arm_auto_dual_trigger(engine: &Engine) -> TriggeredScenario {
-        let scenarios = [
-            crate::types::ModelScenario {
-                product: ProductKind::Leverage,
-                trigger_price: 185_100,
-                target_return_pct: 0.3,
+        let decision = validate_decision(
+            185_000,
+            &crate::types::ModelDecision {
+                market_regime: MarketRegime::Transition,
+                decision_summary_ko: "양방향 추세 확인 시험".into(),
+                scenarios: vec![
+                    crate::types::ModelScenario {
+                        product: ProductKind::Leverage,
+                        setup_type: SetupType::Continuation,
+                        reference_price: 185_100,
+                        confirmation_price: 185_300,
+                        invalidation_price: 184_800,
+                        target_return_pct: 0.3,
+                        rationale_ko: "상단 확인".into(),
+                    },
+                    crate::types::ModelScenario {
+                        product: ProductKind::Inverse,
+                        setup_type: SetupType::Continuation,
+                        reference_price: 184_900,
+                        confirmation_price: 184_700,
+                        invalidation_price: 185_500,
+                        target_return_pct: 0.2,
+                        rationale_ko: "하단 확인".into(),
+                    },
+                ],
             },
-            crate::types::ModelScenario {
-                product: ProductKind::Inverse,
-                trigger_price: 184_900,
-                target_return_pct: 0.2,
-            },
-        ];
-        let decision = validate_decision(185_000, &scenarios).unwrap();
+        )
+        .unwrap();
         let leverage_trigger = decision.scenarios[0].trigger_price;
         let inverse_trigger = decision.scenarios[1].trigger_price;
         let now = engine.automation_now();
@@ -9087,15 +10771,29 @@ mod tests {
         let rows = [
             NewDecisionScenario {
                 product: LedgerProductKind::Leverage,
+                setup_type: Some(LedgerSetupType::Continuation),
+                reference_price: Some(decision.scenarios[0].reference_price),
+                confirmation_price: Some(decision.scenarios[0].confirmation_price),
+                invalidation_price: Some(decision.scenarios[0].invalidation_price),
                 trigger_price: leverage_trigger,
                 target_return_pct: 0.3,
+                rationale_ko: Some(decision.scenarios[0].rationale_ko.clone()),
                 status: LedgerScenarioStatus::Armed,
+                reference_observed_at: None,
+                terminal_reason: None,
             },
             NewDecisionScenario {
                 product: LedgerProductKind::Inverse,
+                setup_type: Some(LedgerSetupType::Continuation),
+                reference_price: Some(decision.scenarios[1].reference_price),
+                confirmation_price: Some(decision.scenarios[1].confirmation_price),
+                invalidation_price: Some(decision.scenarios[1].invalidation_price),
                 trigger_price: inverse_trigger,
                 target_return_pct: 0.2,
+                rationale_ko: Some(decision.scenarios[1].rationale_ko.clone()),
                 status: LedgerScenarioStatus::Armed,
+                reference_observed_at: None,
+                terminal_reason: None,
             },
         ];
         let row_id = engine
@@ -9120,6 +10818,8 @@ mod tests {
                     latency_ms: 0,
                     input_hash: None,
                     chart_hash: None,
+                    market_regime: Some(LedgerMarketRegime::Transition),
+                    decision_summary_ko: Some("양방향 추세 확인 시험".into()),
                     error: None,
                     created_at: now,
                 },
@@ -9131,6 +10831,12 @@ mod tests {
             row_id,
             decision_id,
             &decision,
+            AutomationDecisionStatus::Armed,
+            &[
+                ScenarioSeed::armed(ProductKind::Leverage, None),
+                ScenarioSeed::armed(ProductKind::Inverse, None),
+            ],
+            None,
             row_id,
             start,
             start + Duration::from_secs(300),
@@ -9142,6 +10848,7 @@ mod tests {
                 price: leverage_trigger,
                 volume: 1,
                 at: start + Duration::from_secs(second),
+                epoch: now + second as i64,
             }) {
                 return triggered;
             }
@@ -10273,7 +11980,7 @@ mod tests {
 
         // 비동기 청산 POST는 actor에서 멈추고 우선순위 상태 전이만 검증한다.
         let actor = engine.order_actor.lock().await;
-        engine.automation_tick();
+        engine.automation_tick().await;
         let runtime = engine.automation.lock().unwrap();
         assert_eq!(runtime.phase(), crate::types::AutomationPhase::ExitPending);
         assert_eq!(runtime.exit_reason(), Some("market_close"));

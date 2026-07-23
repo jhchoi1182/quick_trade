@@ -10,34 +10,44 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::types::{Candle, ModelDecision, ModelScenario, ProductKind, Quote};
+use crate::chart_image::{IndicatorPayload, TimeframeIndicatorPayload};
+use crate::types::{MarketRegime, ModelDecision, ModelScenario, ProductKind, Quote, SetupType};
 
 pub const MODEL: &str = "gpt-5.6-sol";
-pub const PROMPT_VERSION: &str = "sk-hynix-oco-v3";
+pub const PROMPT_VERSION: &str = "sk-hynix-oco-v4";
 const RESPONSES_URL: &str = "https://api.openai.com/v1/responses";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(240);
 
 /// 프롬프트 캐시의 고정 접두사가 되므로 동적 값을 추가하지 않는다.
 pub const SYSTEM_PROMPT: &str = concat!(
-    "You are a scalping signal generator for leveraged and 2x inverse ETFs linked to ",
-    "SK hynix (000660). Treat every invocation independently and use only the provided ",
-    "current market quotes and 10- and 15-minute candles. Do not consider past decisions, ",
-    "cumulative profit and loss, or consecutive losses. In both sideways and trending markets, ",
-    "provide 0 to 2 scenarios only when there is a clear short-term edge; do not force a ",
-    "weakly supported scenario in the opposite direction. For LEVERAGE, triggerPrice must be ",
-    "above the underlying stock's current price and represent an upward breakout. For INVERSE, ",
-    "triggerPrice must be below the underlying stock's current price and represent a downward ",
-    "breakdown. Set triggerPrice to the technical reference level visible on the chart, without ",
-    "pre-applying any false-breakout buffer. The executor applies a 0.1% upward buffer for ",
-    "LEVERAGE or a 0.1% downward buffer for INVERSE, normalizes the result to a valid tick price, ",
-    "and executes only the first scenario confirmed for both 3 seconds and 3 ticks. If both ",
-    "directions are valid, provide both. targetReturnPct is the simple target return relative to ",
-    "the selected ETF's actual average fill price. It must be between 0.2% and 2.0% in 0.1% ",
-    "increments. Use 0.2% or 0.3% as the default candidates, and increase the target only when ",
-    "there is clearly enough room. Account for the approximately +2x or -2x characteristics ",
-    "of the products and each ETF's own quote and order book; the program does not multiply the ",
-    "target by two again. The executor separately enforces a -0.3% stop loss, an exit 10 minutes ",
-    "after the first fill, and an exit at 15:15. Return only the specified JSON."
+    "You are an expert discretionary intraday scalper for leveraged and 2x inverse ETFs linked ",
+    "to SK hynix (000660). Treat each invocation independently and use only the supplied market ",
+    "payload and chart. First determine regime and usable room to the next opposing level from ",
+    "the 15- and 5-minute context. Then use the 3- and 1-minute views for entry timing. Judge ",
+    "price-volume interaction as a whole: repeated tests of a level, wick response, volume ",
+    "exhaustion or expansion, compression, and whether the next candles follow through. A forming ",
+    "candle is partial; never compare its raw volume directly with a completed candle. Use its ",
+    "formingProgressPct only to put partial volume in context. Consider CONTINUATION and REVERSAL ",
+    "setups equally. CONTINUATION means an upward breakout for LEVERAGE or a downward breakdown ",
+    "for INVERSE. REVERSAL means a defended support rebound for LEVERAGE or a rejected resistance ",
+    "decline for INVERSE. All referencePrice, confirmationPrice, and invalidationPrice values are ",
+    "prices of the underlying stock, not ETF prices. Let S be the supplied underlying price, R the ",
+    "reference price, C the confirmation price, and I the invalidation price. Required ordering is ",
+    "LEVERAGE CONTINUATION I<S<R<C; INVERSE CONTINUATION C<R<S<I; LEVERAGE REVERSAL I<R<S<C; ",
+    "INVERSE REVERSAL C<S<R<I. C must be at least 10 basis points beyond R in the entry direction. ",
+    "C is the final model-selected confirmation level; the executor adds no percentage buffer. ",
+    "Return no scenario for a range midpoint, conflicting timeframes, an already extended move, ",
+    "poor room to the next opposing level, weak evidence, or inadequate ETF liquidity. Do not ",
+    "force both directions. Return at most one scenario per product and only the strongest valid ",
+    "candidates. asOfEpoch, tradeTs, and bookTs share one seconds scale; use them only to judge ",
+    "freshness. ETF quotes and level-1 books are for execution feasibility and liquidity only, ",
+    "not for inferring market direction. Do not use or infer past decisions, trades, PnL, loss ",
+    "streaks, indices, news, disclosures, or deeper order-book levels. targetReturnPct is the ETF ",
+    "return target from actual fill, between 0.2 and 2.0 in 0.1 increments; account for the ",
+    "product's approximately +2x or -2x exposure without multiplying the target again. Prefer ",
+    "0.2 or 0.3 unless the chart clearly offers more room. The executor separately applies a ",
+    "-0.3% stop and exits 10 minutes after first fill or at 15:15. Write decisionSummaryKo and ",
+    "rationaleKo in Korean. Return only the specified JSON."
 );
 
 #[derive(Debug, Clone, Serialize)]
@@ -51,6 +61,9 @@ pub struct MarketQuoteInput {
     pub ask1_qty: u64,
     pub bid1_qty: u64,
     pub spread: f64,
+    pub last_trade_volume: f64,
+    pub trade_ts: i64,
+    pub book_ts: i64,
 }
 
 impl From<&Quote> for MarketQuoteInput {
@@ -64,19 +77,11 @@ impl From<&Quote> for MarketQuoteInput {
             ask1_qty: quote.ask1_qty,
             bid1_qty: quote.bid1_qty,
             spread: quote.ask1 - quote.bid1,
+            last_trade_volume: quote.volume,
+            trade_ts: quote.trade_ts,
+            book_ts: quote.book_ts,
         }
     }
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct IndicatorInput {
-    pub interval_minutes: u32,
-    pub current: Candle,
-    pub ma5: f64,
-    pub ma20: f64,
-    pub ma60: f64,
-    pub ma120: f64,
 }
 
 /// 한 번의 독립적인 LLM 판단에 허용된 동적 입력만 담는다.
@@ -86,8 +91,7 @@ pub struct DecisionInput {
     pub underlying: MarketQuoteInput,
     pub leverage: MarketQuoteInput,
     pub inverse: MarketQuoteInput,
-    pub ten_minute: IndicatorInput,
-    pub fifteen_minute: IndicatorInput,
+    pub indicators: IndicatorPayload,
     pub chart_png: Vec<u8>,
 }
 
@@ -255,23 +259,39 @@ fn elapsed_ms(started: Instant) -> u64 {
     started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
 }
 
-fn build_request_body(input: &DecisionInput) -> Result<Value, OpenAiError> {
-    validate_input(input)?;
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QuoteInputs<'a> {
+    sk_hynix: &'a MarketQuoteInput,
+    leverage_etf: &'a MarketQuoteInput,
+    inverse_etf: &'a MarketQuoteInput,
+}
 
-    let dynamic_input = json!({
-        "asOfKst": input.as_of_kst,
-        "quotes": {
-            "skHynix": input.underlying,
-            "leverageEtf": input.leverage,
-            "inverseEtf": input.inverse,
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DynamicDecisionInput<'a> {
+    as_of_kst: &'a str,
+    quotes: QuoteInputs<'a>,
+    indicators: &'a IndicatorPayload,
+}
+
+/// 장부 해시와 실제 API 본문이 같은 바이트를 사용하도록 동적 텍스트 직렬화를 한곳에 둔다.
+pub(crate) fn serialized_dynamic_input(input: &DecisionInput) -> Result<String, OpenAiError> {
+    validate_input(input)?;
+    serde_json::to_string(&DynamicDecisionInput {
+        as_of_kst: &input.as_of_kst,
+        quotes: QuoteInputs {
+            sk_hynix: &input.underlying,
+            leverage_etf: &input.leverage,
+            inverse_etf: &input.inverse,
         },
-        "indicators": {
-            "tenMinute": input.ten_minute,
-            "fifteenMinute": input.fifteen_minute,
-        },
-    });
-    let dynamic_text = serde_json::to_string(&dynamic_input)
-        .map_err(|error| OpenAiError::InvalidInput(error.to_string()))?;
+        indicators: &input.indicators,
+    })
+    .map_err(|error| OpenAiError::InvalidInput(error.to_string()))
+}
+
+fn build_request_body(input: &DecisionInput) -> Result<Value, OpenAiError> {
+    let dynamic_text = serialized_dynamic_input(input)?;
     let chart_data_url = format!(
         "data:image/png;base64,{}",
         BASE64_STANDARD.encode(&input.chart_png)
@@ -298,7 +318,7 @@ fn build_request_body(input: &DecisionInput) -> Result<Value, OpenAiError> {
                 "role": "user",
                 "content": [
                     { "type": "input_text", "text": dynamic_text },
-                    { "type": "input_image", "image_url": chart_data_url, "detail": "high" }
+                    { "type": "input_image", "image_url": chart_data_url, "detail": "original" }
                 ]
             }
         ]
@@ -313,6 +333,15 @@ fn decision_json_schema() -> Value {
         "schema": {
             "type": "object",
             "properties": {
+                "marketRegime": {
+                    "type": "string",
+                    "enum": ["UPTREND", "DOWNTREND", "RANGE", "TRANSITION", "UNCLEAR"]
+                },
+                "decisionSummaryKo": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 160
+                },
                 "scenarios": {
                     "type": "array",
                     "minItems": 0,
@@ -324,7 +353,19 @@ fn decision_json_schema() -> Value {
                                 "type": "string",
                                 "enum": ["LEVERAGE", "INVERSE"]
                             },
-                            "triggerPrice": {
+                            "setupType": {
+                                "type": "string",
+                                "enum": ["CONTINUATION", "REVERSAL"]
+                            },
+                            "referencePrice": {
+                                "type": "integer",
+                                "exclusiveMinimum": 0
+                            },
+                            "confirmationPrice": {
+                                "type": "integer",
+                                "exclusiveMinimum": 0
+                            },
+                            "invalidationPrice": {
                                 "type": "integer",
                                 "exclusiveMinimum": 0
                             },
@@ -333,14 +374,27 @@ fn decision_json_schema() -> Value {
                                 "minimum": 0.2,
                                 "maximum": 2.0,
                                 "multipleOf": 0.1
+                            },
+                            "rationaleKo": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 120
                             }
                         },
-                        "required": ["product", "triggerPrice", "targetReturnPct"],
+                        "required": [
+                            "product",
+                            "setupType",
+                            "referencePrice",
+                            "confirmationPrice",
+                            "invalidationPrice",
+                            "targetReturnPct",
+                            "rationaleKo"
+                        ],
                         "additionalProperties": false
                     }
                 }
             },
-            "required": ["scenarios"],
+            "required": ["marketRegime", "decisionSummaryKo", "scenarios"],
             "additionalProperties": false
         }
     })
@@ -353,8 +407,14 @@ fn validate_input(input: &DecisionInput) -> Result<(), OpenAiError> {
     validate_quote("SK하이닉스", &input.underlying)?;
     validate_quote("레버리지 ETF", &input.leverage)?;
     validate_quote("곱버스 ETF", &input.inverse)?;
-    validate_indicator("10분봉", &input.ten_minute, 10)?;
-    validate_indicator("15분봉", &input.fifteen_minute, 15)?;
+    if input.indicators.as_of_epoch <= 0 {
+        return Err(OpenAiError::InvalidInput("지표 기준시각이 0 이하임".into()));
+    }
+    validate_day(&input.indicators)?;
+    validate_indicator("1분봉", &input.indicators.one_minute, 1)?;
+    validate_indicator("3분봉", &input.indicators.three_minute, 3)?;
+    validate_indicator("5분봉", &input.indicators.five_minute, 5)?;
+    validate_indicator("15분봉", &input.indicators.fifteen_minute, 15)?;
 
     const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
     if !input.chart_png.starts_with(PNG_SIGNATURE) {
@@ -372,6 +432,7 @@ fn validate_quote(label: &str, quote: &MarketQuoteInput) -> Result<(), OpenAiErr
         quote.ask1,
         quote.bid1,
         quote.spread,
+        quote.last_trade_volume,
     ];
     if quote.code.trim().is_empty() || numeric.iter().any(|value| !value.is_finite()) {
         return Err(OpenAiError::InvalidInput(format!(
@@ -383,12 +444,49 @@ fn validate_quote(label: &str, quote: &MarketQuoteInput) -> Result<(), OpenAiErr
             "{label} 체결가·1호가가 0 이하임"
         )));
     }
+    if quote.ask1 < quote.bid1
+        || quote.spread < 0.0
+        || quote.last_trade_volume < 0.0
+        || quote.trade_ts <= 0
+        || quote.book_ts <= 0
+    {
+        return Err(OpenAiError::InvalidInput(format!(
+            "{label} 호가·체결량·시각이 올바르지 않음"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_day(indicators: &IndicatorPayload) -> Result<(), OpenAiError> {
+    let day = &indicators.day;
+    let values = [
+        ("시가", day.open),
+        ("고가", day.high),
+        ("저가", day.low),
+        ("HLC3 거래량가중평균", day.hlc3_volume_weighted_average),
+    ];
+    for (label, value) in values {
+        if let Some(value) = value {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(OpenAiError::InvalidInput(format!(
+                    "당일 {label}가 올바르지 않음"
+                )));
+            }
+        }
+    }
+    if let (Some(high), Some(low)) = (day.high, day.low) {
+        if high < low {
+            return Err(OpenAiError::InvalidInput(
+                "당일 고가가 저가보다 낮음".into(),
+            ));
+        }
+    }
     Ok(())
 }
 
 fn validate_indicator(
     label: &str,
-    indicator: &IndicatorInput,
+    indicator: &TimeframeIndicatorPayload,
     expected_interval: u32,
 ) -> Result<(), OpenAiError> {
     if indicator.interval_minutes != expected_interval {
@@ -397,39 +495,90 @@ fn validate_indicator(
             indicator.interval_minutes
         )));
     }
-    let candle = indicator.current;
+    if indicator.completed_candles.len() > 30 {
+        return Err(OpenAiError::InvalidInput(format!(
+            "{label} 완성봉이 30개를 초과함"
+        )));
+    }
+    let mut previous_time = None;
+    for candle in indicator
+        .completed_candles
+        .iter()
+        .chain(indicator.forming_candle.iter())
+    {
+        validate_candle(label, candle)?;
+        if let Some(previous) = previous_time {
+            if candle.time <= previous {
+                return Err(OpenAiError::InvalidInput(format!(
+                    "{label} 봉 시각이 오름차순이 아님"
+                )));
+            }
+        }
+        previous_time = Some(candle.time);
+    }
+    match (indicator.forming_candle, indicator.forming_progress_pct) {
+        (Some(_), Some(progress)) if progress.is_finite() && (0.0..=100.0).contains(&progress) => {}
+        (None, None) => {}
+        _ => {
+            return Err(OpenAiError::InvalidInput(format!(
+                "{label} 형성봉과 진행률 조합이 올바르지 않음"
+            )));
+        }
+    }
+    for (name, value, allow_zero) in [
+        ("MA5", indicator.moving_averages.ma5, false),
+        ("MA20", indicator.moving_averages.ma20, false),
+        ("MA60", indicator.moving_averages.ma60, false),
+        ("MA120", indicator.moving_averages.ma120, false),
+        ("평균거래량5", indicator.average_volumes.volume5, true),
+        ("평균거래량20", indicator.average_volumes.volume20, true),
+    ] {
+        if let Some(value) = value {
+            let invalid = !value.is_finite()
+                || if allow_zero {
+                    value < 0.0
+                } else {
+                    value <= 0.0
+                };
+            if invalid {
+                return Err(OpenAiError::InvalidInput(format!(
+                    "{label} {name}이 올바르지 않음"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_candle(label: &str, candle: &crate::types::Candle) -> Result<(), OpenAiError> {
     let numeric = [
         candle.open,
         candle.high,
         candle.low,
         candle.close,
         candle.volume,
-        indicator.ma5,
-        indicator.ma20,
-        indicator.ma60,
-        indicator.ma120,
     ];
-    if numeric.iter().any(|value| !value.is_finite())
+    if candle.time <= 0
+        || numeric.iter().any(|value| !value.is_finite())
         || candle.open <= 0.0
         || candle.high <= 0.0
         || candle.low <= 0.0
         || candle.close <= 0.0
         || candle.volume < 0.0
-        || indicator.ma5 <= 0.0
-        || indicator.ma20 <= 0.0
-        || indicator.ma60 <= 0.0
-        || indicator.ma120 <= 0.0
+        || candle.high < candle.low
     {
         return Err(OpenAiError::InvalidInput(format!(
-            "{label} OHLCV 또는 이동평균이 올바르지 않음"
+            "{label} OHLCV가 올바르지 않음"
         )));
     }
     Ok(())
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct StrictDecision {
+    market_regime: MarketRegime,
+    decision_summary_ko: String,
     scenarios: Vec<StrictScenario>,
 }
 
@@ -437,8 +586,12 @@ struct StrictDecision {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct StrictScenario {
     product: ProductKind,
-    trigger_price: u64,
+    setup_type: SetupType,
+    reference_price: u64,
+    confirmation_price: u64,
+    invalidation_price: u64,
     target_return_pct: f64,
+    rationale_ko: String,
 }
 
 fn parse_response_value(value: &Value, latency_ms: u64) -> Result<DecisionResult, DecisionFailure> {
@@ -508,21 +661,42 @@ fn parse_response_value_inner(
 
     let strict: StrictDecision = serde_json::from_str(&output_text)
         .map_err(|error| OpenAiError::InvalidResponse(format!("결정 JSON 계약 위반: {error}")))?;
+    validate_text_length("decisionSummaryKo", &strict.decision_summary_ko, 160)?;
     if strict.scenarios.len() > 2 {
         return Err(OpenAiError::InvalidResponse(
             "시나리오가 2개를 초과함".into(),
         ));
     }
+    if strict.scenarios.len() == 2 && strict.scenarios[0].product == strict.scenarios[1].product {
+        return Err(OpenAiError::InvalidResponse(
+            "같은 상품의 시나리오가 중복됨".into(),
+        ));
+    }
     let mut scenarios = Vec::with_capacity(strict.scenarios.len());
     for scenario in strict.scenarios {
-        // strict schema가 정상 적용된 API 응답에서는 범위·단위가 이미 보장된다.
-        // 그래도 방어적으로 잘못된 값이 들어오면 여기서 결정 전체를 버리지 않고
-        // OCO 의미 검증으로 넘겨 해당 시나리오만 invalid 처리한다. 전체 무효는
-        // 최대 개수·중복 상품처럼 결정 자체가 모호한 경우에만 맡긴다.
+        validate_text_length("rationaleKo", &scenario.rationale_ko, 120)?;
+        if scenario.reference_price == 0
+            || scenario.confirmation_price == 0
+            || scenario.invalidation_price == 0
+        {
+            return Err(OpenAiError::InvalidResponse("시나리오 가격이 0임".into()));
+        }
+        if !scenario.target_return_pct.is_finite()
+            || !(0.2..=2.0).contains(&scenario.target_return_pct)
+            || !is_tenth_step(scenario.target_return_pct)
+        {
+            return Err(OpenAiError::InvalidResponse(
+                "targetReturnPct 범위 또는 단위가 올바르지 않음".into(),
+            ));
+        }
         scenarios.push(ModelScenario {
             product: scenario.product,
-            trigger_price: scenario.trigger_price,
+            setup_type: scenario.setup_type,
+            reference_price: scenario.reference_price,
+            confirmation_price: scenario.confirmation_price,
+            invalidation_price: scenario.invalidation_price,
             target_return_pct: scenario.target_return_pct,
+            rationale_ko: scenario.rationale_ko,
         });
     }
 
@@ -553,10 +727,28 @@ fn parse_response_value_inner(
 
     Ok(DecisionResult {
         response_id,
-        decision: ModelDecision { scenarios },
+        decision: ModelDecision {
+            market_regime: strict.market_regime,
+            decision_summary_ko: strict.decision_summary_ko,
+            scenarios,
+        },
         usage,
         latency_ms,
     })
+}
+
+fn validate_text_length(label: &str, value: &str, max_chars: usize) -> Result<(), OpenAiError> {
+    let length = value.chars().count();
+    if value.trim().is_empty() || length > max_chars {
+        return Err(OpenAiError::InvalidResponse(format!(
+            "{label} 길이가 1~{max_chars}자가 아님"
+        )));
+    }
+    Ok(())
+}
+
+fn is_tenth_step(value: f64) -> bool {
+    ((value * 10.0).round() - value * 10.0).abs() < 1e-9
 }
 
 fn response_id_from_value(value: &Value) -> Option<String> {
@@ -657,16 +849,25 @@ fn http_status_error(status: StatusCode, body: &str) -> OpenAiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::Candle;
 
-    fn sample_candle() -> Candle {
-        Candle {
-            time: 1_753_152_600,
-            open: 184_000.0,
-            high: 185_500.0,
-            low: 183_500.0,
-            close: 185_000.0,
-            volume: 123_456.0,
-        }
+    const SAMPLE_AS_OF: i64 = 1_784_715_330;
+
+    fn sample_bars() -> Vec<Candle> {
+        let current_minute = SAMPLE_AS_OF.div_euclid(60) * 60;
+        (0..1_802)
+            .map(|index| {
+                let drift = index as f64 * 4.0;
+                Candle {
+                    time: current_minute - (1_801 - index) as i64 * 60,
+                    open: 177_000.0 + drift,
+                    high: 177_200.0 + drift,
+                    low: 176_800.0 + drift,
+                    close: 177_050.0 + drift,
+                    volume: 100_000.0 + index as f64 * 10.0,
+                }
+            })
+            .collect()
     }
 
     fn sample_quote(code: &str, price: f64) -> MarketQuoteInput {
@@ -679,35 +880,28 @@ mod tests {
             ask1_qty: 1_200,
             bid1_qty: 900,
             spread: 10.0,
-        }
-    }
-
-    fn sample_indicator(interval_minutes: u32) -> IndicatorInput {
-        IndicatorInput {
-            interval_minutes,
-            current: sample_candle(),
-            ma5: 184_800.0,
-            ma20: 183_500.0,
-            ma60: 180_000.0,
-            ma120: 175_000.0,
+            last_trade_volume: 125.0,
+            trade_ts: SAMPLE_AS_OF,
+            book_ts: SAMPLE_AS_OF,
         }
     }
 
     fn sample_input() -> DecisionInput {
+        let bars = sample_bars();
         DecisionInput {
-            as_of_kst: "2026-07-22T10:15:00+09:00".into(),
+            as_of_kst: "2026-07-22T10:15:30+09:00".into(),
             underlying: sample_quote("000660", 185_000.0),
             leverage: sample_quote("0193T0", 15_000.0),
             inverse: sample_quote("0197X0", 8_000.0),
-            ten_minute: sample_indicator(10),
-            fifteen_minute: sample_indicator(15),
-            chart_png: b"\x89PNG\r\n\x1a\nchart".to_vec(),
+            indicators: crate::chart_image::indicator_payload(&bars, SAMPLE_AS_OF),
+            chart_png: crate::chart_image::render_composite_png(&bars, SAMPLE_AS_OF).unwrap(),
         }
     }
 
     #[test]
     fn responses_api_요청_계약이_고정된다() {
-        let body = build_request_body(&sample_input()).unwrap();
+        let sample = sample_input();
+        let body = build_request_body(&sample).unwrap();
 
         assert_eq!(body["model"], MODEL);
         assert_eq!(body["reasoning"]["effort"], "max");
@@ -726,6 +920,15 @@ mod tests {
                 ["additionalProperties"],
             false
         );
+        assert_eq!(
+            body["text"]["format"]["schema"]["properties"]["decisionSummaryKo"]["maxLength"],
+            160
+        );
+        assert_eq!(
+            body["text"]["format"]["schema"]["properties"]["scenarios"]["items"]["properties"]
+                ["rationaleKo"]["maxLength"],
+            120
+        );
         assert!(body.get("tools").is_none());
         assert!(body.get("previous_response_id").is_none());
         assert!(body.get("prompt_cache_options").is_none());
@@ -733,7 +936,7 @@ mod tests {
         let input = body["input"].as_array().unwrap();
         assert_eq!(input.len(), 2);
         assert_eq!(input[0]["content"][0]["text"], SYSTEM_PROMPT);
-        assert_eq!(PROMPT_VERSION, "sk-hynix-oco-v3");
+        assert_eq!(PROMPT_VERSION, "sk-hynix-oco-v4");
         assert!(SYSTEM_PROMPT.is_ascii());
         let user_content = input[1]["content"].as_array().unwrap();
         assert_eq!(
@@ -743,7 +946,7 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(user_content[1]["detail"], "high");
+        assert_eq!(user_content[1]["detail"], "original");
         assert!(user_content[1]["image_url"]
             .as_str()
             .unwrap()
@@ -752,7 +955,22 @@ mod tests {
         let dynamic: Value =
             serde_json::from_str(user_content[0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(dynamic["quotes"]["skHynix"]["code"], "000660");
-        assert_eq!(dynamic["indicators"]["tenMinute"]["intervalMinutes"], 10);
+        assert_eq!(dynamic["quotes"]["skHynix"]["lastTradeVolume"], 125.0);
+        assert_eq!(dynamic["quotes"]["skHynix"]["tradeTs"], SAMPLE_AS_OF);
+        assert_eq!(dynamic["indicators"]["oneMinute"]["intervalMinutes"], 1);
+        assert_eq!(
+            dynamic["indicators"]["oneMinute"]["completedCandles"]
+                .as_array()
+                .unwrap()
+                .len(),
+            30
+        );
+        assert!(dynamic["indicators"]["day"]["hlc3VolumeWeightedAverage"].is_number());
+
+        assert_eq!(
+            serialized_dynamic_input(&sample).unwrap(),
+            serialized_dynamic_input(&sample).unwrap()
+        );
     }
 
     #[test]
@@ -765,7 +983,7 @@ mod tests {
                 "status": "completed",
                 "content": [{
                     "type": "output_text",
-                    "text": "{\"scenarios\":[{\"product\":\"LEVERAGE\",\"triggerPrice\":186000,\"targetReturnPct\":0.3},{\"product\":\"INVERSE\",\"triggerPrice\":183500,\"targetReturnPct\":0.2}]}"
+                    "text": "{\"marketRegime\":\"RANGE\",\"decisionSummaryKo\":\"상단과 하단의 반응을 각각 대기\",\"scenarios\":[{\"product\":\"LEVERAGE\",\"setupType\":\"REVERSAL\",\"referencePrice\":184000,\"confirmationPrice\":185300,\"invalidationPrice\":183500,\"targetReturnPct\":0.3,\"rationaleKo\":\"지지선 반복 방어 뒤 거래량이 회복됨\"},{\"product\":\"INVERSE\",\"setupType\":\"REVERSAL\",\"referencePrice\":186000,\"confirmationPrice\":184700,\"invalidationPrice\":186500,\"targetReturnPct\":0.2,\"rationaleKo\":\"저항 재시험에서 윗꼬리와 거래량 소진\"}]}"
                 }]
             }],
             "usage": {
@@ -782,8 +1000,14 @@ mod tests {
         let result = parse_response_value(&response, 1_234).unwrap();
         assert_eq!(result.response_id, "resp_123");
         assert_eq!(result.latency_ms, 1_234);
+        assert_eq!(result.decision.market_regime, MarketRegime::Range);
+        assert_eq!(
+            result.decision.decision_summary_ko,
+            "상단과 하단의 반응을 각각 대기"
+        );
         assert_eq!(result.decision.scenarios.len(), 2);
         assert_eq!(result.decision.scenarios[0].product, ProductKind::Leverage);
+        assert_eq!(result.decision.scenarios[0].setup_type, SetupType::Reversal);
         assert_eq!(result.decision.scenarios[1].product, ProductKind::Inverse);
         assert_eq!(result.usage.input_tokens, 1_800);
         assert_eq!(result.usage.cached_input_tokens, 900);
@@ -794,9 +1018,12 @@ mod tests {
     #[test]
     fn strict_응답은_0개와_1개_시나리오도_허용한다() {
         for (json_text, expected_count) in [
-            (r#"{"scenarios":[]}"#, 0usize),
             (
-                r#"{"scenarios":[{"product":"LEVERAGE","triggerPrice":186000,"targetReturnPct":0.3}]}"#,
+                r#"{"marketRegime":"UNCLEAR","decisionSummaryKo":"시간축 충돌로 대기","scenarios":[]}"#,
+                0usize,
+            ),
+            (
+                r#"{"marketRegime":"UPTREND","decisionSummaryKo":"눌림 방어 후 재상승 확인 대기","scenarios":[{"product":"LEVERAGE","setupType":"CONTINUATION","referencePrice":186000,"confirmationPrice":186200,"invalidationPrice":184500,"targetReturnPct":0.3,"rationaleKo":"압축 뒤 거래량 확대 돌파를 대기"}]}"#,
                 1usize,
             ),
         ] {
@@ -827,7 +1054,7 @@ mod tests {
                 "status": "completed",
                 "content": [{
                     "type": "output_text",
-                    "text": "{\"scenarios\":[{\"product\":\"LEVERAGE\",\"triggerPrice\":0,\"targetReturnPct\":0.25},{\"product\":\"INVERSE\",\"triggerPrice\":183500,\"targetReturnPct\":0.2}]}"
+                    "text": "{\"marketRegime\":\"RANGE\",\"decisionSummaryKo\":\"한쪽만 가격 순서가 유효함\",\"scenarios\":[{\"product\":\"LEVERAGE\",\"setupType\":\"CONTINUATION\",\"referencePrice\":186000,\"confirmationPrice\":185500,\"invalidationPrice\":184000,\"targetReturnPct\":0.3,\"rationaleKo\":\"확인가 방향이 잘못된 의도적 테스트\"},{\"product\":\"INVERSE\",\"setupType\":\"CONTINUATION\",\"referencePrice\":184000,\"confirmationPrice\":183500,\"invalidationPrice\":186000,\"targetReturnPct\":0.2,\"rationaleKo\":\"하락 이탈과 거래량 확대\"}]}"
                 }]
             }],
             "usage": { "input_tokens": 1, "output_tokens": 1 }
@@ -835,7 +1062,7 @@ mod tests {
 
         let parsed = parse_response_value(&response, 1).unwrap();
         let validated =
-            crate::automation::oco::validate_decision(185_000, &parsed.decision.scenarios).unwrap();
+            crate::automation::oco::validate_decision(185_000, &parsed.decision).unwrap();
 
         assert_eq!(validated.scenarios.len(), 1);
         assert_eq!(validated.scenarios[0].product, ProductKind::Inverse);
@@ -925,13 +1152,80 @@ mod tests {
                 "type": "message",
                 "content": [{
                     "type": "output_text",
-                    "text": "{\"scenarios\":[],\"explanation\":\"매수\"}"
+                    "text": "{\"marketRegime\":\"UNCLEAR\",\"decisionSummaryKo\":\"대기\",\"scenarios\":[],\"explanation\":\"매수\"}"
                 }]
             }],
             "usage": { "input_tokens": 1, "output_tokens": 1 }
         });
         assert!(matches!(
             parse_response_value(&extra, 10).unwrap_err().error,
+            OpenAiError::InvalidResponse(_)
+        ));
+
+        let scenario_extra = json!({
+            "id": "resp_scenario_extra",
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "content": [{
+                    "type": "output_text",
+                    "text": "{\"marketRegime\":\"UPTREND\",\"decisionSummaryKo\":\"돌파 대기\",\"scenarios\":[{\"product\":\"LEVERAGE\",\"setupType\":\"CONTINUATION\",\"referencePrice\":186000,\"confirmationPrice\":186200,\"invalidationPrice\":184000,\"targetReturnPct\":0.3,\"rationaleKo\":\"거래량 확대\",\"confidence\":0.9}]}"
+                }]
+            }],
+            "usage": { "input_tokens": 1, "output_tokens": 1 }
+        });
+        assert!(matches!(
+            parse_response_value(&scenario_extra, 10).unwrap_err().error,
+            OpenAiError::InvalidResponse(_)
+        ));
+    }
+
+    #[test]
+    fn 문자열_길이와_상품_중복을_방어적으로_거부한다() {
+        let too_long = "가".repeat(161);
+        let response = |text: String| {
+            json!({
+                "id": "resp_contract_error",
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "content": [{ "type": "output_text", "text": text }]
+                }],
+                "usage": { "input_tokens": 1, "output_tokens": 1 }
+            })
+        };
+        let long_summary = response(format!(
+            "{{\"marketRegime\":\"UNCLEAR\",\"decisionSummaryKo\":\"{too_long}\",\"scenarios\":[]}}"
+        ));
+        assert!(matches!(
+            parse_response_value(&long_summary, 1).unwrap_err().error,
+            OpenAiError::InvalidResponse(_)
+        ));
+
+        let long_rationale = "나".repeat(121);
+        let rationale_response = response(format!(
+            "{{\"marketRegime\":\"UPTREND\",\"decisionSummaryKo\":\"돌파 대기\",\"scenarios\":[{{\"product\":\"LEVERAGE\",\"setupType\":\"CONTINUATION\",\"referencePrice\":186000,\"confirmationPrice\":186200,\"invalidationPrice\":184000,\"targetReturnPct\":0.3,\"rationaleKo\":\"{long_rationale}\"}}]}}"
+        ));
+        assert!(matches!(
+            parse_response_value(&rationale_response, 1)
+                .unwrap_err()
+                .error,
+            OpenAiError::InvalidResponse(_)
+        ));
+
+        let invalid_target = response(
+            r#"{"marketRegime":"UPTREND","decisionSummaryKo":"목표 단위 테스트","scenarios":[{"product":"LEVERAGE","setupType":"CONTINUATION","referencePrice":186000,"confirmationPrice":186200,"invalidationPrice":184000,"targetReturnPct":0.25,"rationaleKo":"잘못된 목표 단위"}]}"#.into(),
+        );
+        assert!(matches!(
+            parse_response_value(&invalid_target, 1).unwrap_err().error,
+            OpenAiError::InvalidResponse(_)
+        ));
+
+        let duplicate = response(
+            r#"{"marketRegime":"UPTREND","decisionSummaryKo":"중복 상품 테스트","scenarios":[{"product":"LEVERAGE","setupType":"CONTINUATION","referencePrice":186000,"confirmationPrice":186200,"invalidationPrice":184000,"targetReturnPct":0.3,"rationaleKo":"첫 후보"},{"product":"LEVERAGE","setupType":"REVERSAL","referencePrice":184000,"confirmationPrice":185300,"invalidationPrice":183500,"targetReturnPct":0.3,"rationaleKo":"중복 후보"}]}"#.into(),
+        );
+        assert!(matches!(
+            parse_response_value(&duplicate, 1).unwrap_err().error,
             OpenAiError::InvalidResponse(_)
         ));
     }
@@ -972,5 +1266,195 @@ mod tests {
         assert_eq!(failure.usage.output_tokens, 9);
         assert_eq!(failure.usage.reasoning_tokens, 8);
         assert_eq!(failure.latency_ms, 987);
+    }
+
+    #[derive(Clone, Copy)]
+    enum 평가기대값 {
+        시나리오(ProductKind, SetupType),
+        대기,
+    }
+
+    struct 평가픽스처 {
+        이름: &'static str,
+        입력: DecisionInput,
+        기대값: 평가기대값,
+    }
+
+    #[derive(Clone, Copy)]
+    enum 평가패턴 {
+        저항반락,
+        지지반등,
+        상승돌파,
+        하락이탈,
+        박스중단,
+        형성봉거래량착시,
+    }
+
+    fn 평가용_분봉(패턴: 평가패턴) -> Vec<Candle> {
+        let current_minute = SAMPLE_AS_OF.div_euclid(60) * 60;
+        (0_usize..1_802)
+            .map(|index| {
+                let recent = index.saturating_sub(1_682) as f64;
+                let (price, volume): (f64, f64) = if index < 1_682 {
+                    (180_000.0 + index as f64 * 2.5, 90_000.0)
+                } else {
+                    match 패턴 {
+                        평가패턴::저항반락 => {
+                            let wave = (recent / 12.0).sin().abs();
+                            (
+                                184_250.0 + wave * 700.0 - (recent - 95.0).max(0.0) * 9.0,
+                                180_000.0 - recent * 700.0,
+                            )
+                        }
+                        평가패턴::지지반등 => {
+                            let wave = (recent / 12.0).sin().abs();
+                            (
+                                185_050.0 - wave * 700.0 + (recent - 95.0).max(0.0) * 9.0,
+                                120_000.0 + recent * 600.0,
+                            )
+                        }
+                        평가패턴::상승돌파 => {
+                            let breakout = (recent - 105.0).max(0.0);
+                            (
+                                184_500.0 + (recent / 5.0).sin() * 120.0 + breakout * 55.0,
+                                80_000.0 + breakout * 18_000.0,
+                            )
+                        }
+                        평가패턴::하락이탈 => {
+                            let breakdown = (recent - 105.0).max(0.0);
+                            (
+                                185_500.0 + (recent / 5.0).sin() * 120.0 - breakdown * 55.0,
+                                80_000.0 + breakdown * 18_000.0,
+                            )
+                        }
+                        평가패턴::박스중단 => {
+                            (185_000.0 + (recent / 4.0).sin() * 550.0, 100_000.0)
+                        }
+                        평가패턴::형성봉거래량착시 => (
+                            185_000.0 + (recent / 4.0).sin() * 180.0,
+                            if index == 1_801 { 95_000.0 } else { 100_000.0 },
+                        ),
+                    }
+                };
+                Candle {
+                    time: current_minute - (1_801 - index) as i64 * 60,
+                    open: price - 20.0,
+                    high: price + 90.0,
+                    low: price - 90.0,
+                    close: price,
+                    volume: volume.max(1_000.0),
+                }
+            })
+            .collect()
+    }
+
+    fn 평가픽스처들() -> Vec<평가픽스처> {
+        let specs = [
+            (
+                "저항 반복·거래량 감소",
+                평가패턴::저항반락,
+                평가기대값::시나리오(ProductKind::Inverse, SetupType::Reversal),
+            ),
+            (
+                "지지 반복 방어",
+                평가패턴::지지반등,
+                평가기대값::시나리오(ProductKind::Leverage, SetupType::Reversal),
+            ),
+            (
+                "거래량 동반 상승 돌파",
+                평가패턴::상승돌파,
+                평가기대값::시나리오(ProductKind::Leverage, SetupType::Continuation),
+            ),
+            (
+                "거래량 동반 하락 이탈",
+                평가패턴::하락이탈,
+                평가기대값::시나리오(ProductKind::Inverse, SetupType::Continuation),
+            ),
+            ("박스 중단", 평가패턴::박스중단, 평가기대값::대기),
+            (
+                "형성 중 봉 거래량 오판 방지",
+                평가패턴::형성봉거래량착시,
+                평가기대값::대기,
+            ),
+        ];
+        specs
+            .into_iter()
+            .map(|(이름, 패턴, 기대값)| {
+                let bars = 평가용_분봉(패턴);
+                let underlying_price = bars.last().unwrap().close;
+                평가픽스처 {
+                    이름,
+                    기대값,
+                    입력: DecisionInput {
+                        as_of_kst: "2026-07-22T10:15:30+09:00".into(),
+                        underlying: sample_quote("000660", underlying_price),
+                        leverage: sample_quote("0193T0", 15_000.0),
+                        inverse: sample_quote("0197X0", 8_000.0),
+                        indicators: crate::chart_image::indicator_payload(&bars, SAMPLE_AS_OF),
+                        chart_png: crate::chart_image::render_composite_png(&bars, SAMPLE_AS_OF)
+                            .unwrap(),
+                    },
+                }
+            })
+            .collect()
+    }
+
+    fn 평가일치(결정: &ModelDecision, 기대값: 평가기대값) -> bool {
+        match 기대값 {
+            평가기대값::대기 => 결정.scenarios.is_empty(),
+            평가기대값::시나리오(product, setup_type) => 결정
+                .scenarios
+                .iter()
+                .any(|scenario| scenario.product == product && scenario.setup_type == setup_type),
+        }
+    }
+
+    /// 실제 주문 경로와 무관한 수동 평가다.
+    /// `cargo test llm_v4_평가 -- --ignored --nocapture`로만 API를 호출한다.
+    #[tokio::test]
+    #[ignore = "OPENAI_API_KEY와 명시적인 평가 실행이 필요함"]
+    async fn llm_v4_평가_픽스처별_3회중_2회_이상_일치한다() {
+        let api_key = std::env::var("OPENAI_API_KEY").expect(
+            "OPENAI_API_KEY가 없습니다. opt-in LLM 평가를 실행하려면 키를 환경변수로 제공하세요.",
+        );
+        let client = OpenAiClient::new(api_key).unwrap();
+        for fixture in 평가픽스처들() {
+            let mut matched = 0;
+            for run in 1..=3 {
+                let result = client
+                    .decide(&fixture.입력)
+                    .await
+                    .unwrap_or_else(|failure| {
+                        panic!("{} {run}회차 API 실패: {failure}", fixture.이름)
+                    });
+                let validated = crate::automation::oco::validate_decision(
+                    fixture.입력.underlying.price.round() as u64,
+                    &result.decision,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("{} {run}회차 결정 검증 실패: {error:?}", fixture.이름)
+                });
+                assert!(
+                    validated.rejected.is_empty(),
+                    "{} {run}회차 가격 의미 검증 실패: {:?}",
+                    fixture.이름,
+                    validated.rejected
+                );
+                if 평가일치(&result.decision, fixture.기대값) {
+                    matched += 1;
+                }
+                eprintln!(
+                    "{} {run}회차: {:?} / {}",
+                    fixture.이름,
+                    result.decision.market_regime,
+                    result.decision.decision_summary_ko
+                );
+            }
+            assert!(
+                matched >= 2,
+                "{}: 기대 결과 일치가 3회 중 {matched}회",
+                fixture.이름
+            );
+        }
     }
 }

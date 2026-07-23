@@ -4,10 +4,13 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use super::oco::{OcoGroup, TickOutcome, TradeTick, TriggeredScenario, ValidatedDecision};
+use super::oco::{
+    OcoGroup, ScenarioSeed, TickOutcome, TradeTick, TriggeredScenario, ValidatedDecision,
+};
 use crate::types::{
-    AutoSymbols, AutomationPhase, AutomationPositionInfo, AutomationScenarioInfo,
-    AutomationSnapshot, ControlMode, MarketDayStatus, ProductKind,
+    AutoSymbols, AutomationDecisionStatus, AutomationPhase, AutomationPositionInfo,
+    AutomationScenarioInfo, AutomationSnapshot, ControlMode, MarketDayStatus, MarketRegime,
+    ProductKind, ScenarioStatus,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +69,44 @@ fn exit_reason_priority(reason: &str) -> u8 {
     }
 }
 
+fn decision_status_for_group(group: &OcoGroup) -> AutomationDecisionStatus {
+    if group.winner().is_some() {
+        return AutomationDecisionStatus::Triggered;
+    }
+    if group.has_active_scenarios() {
+        return AutomationDecisionStatus::Armed;
+    }
+    if group
+        .scenarios()
+        .iter()
+        .any(|state| state.status == ScenarioStatus::Invalidated)
+    {
+        return AutomationDecisionStatus::Invalidated;
+    }
+    if group
+        .scenarios()
+        .iter()
+        .all(|state| state.status == ScenarioStatus::Missed)
+    {
+        return AutomationDecisionStatus::Missed;
+    }
+    if group
+        .scenarios()
+        .iter()
+        .any(|state| state.status == ScenarioStatus::Expired)
+    {
+        return AutomationDecisionStatus::Expired;
+    }
+    if group
+        .scenarios()
+        .iter()
+        .any(|state| state.status == ScenarioStatus::Triggered)
+    {
+        return AutomationDecisionStatus::Triggered;
+    }
+    AutomationDecisionStatus::Replaced
+}
+
 /// 실전 Auto 진입 POST 전부터 목표 주문의 소유권이 확정될 때까지 유지하는 복구 표식.
 /// 주문 세부값은 장부의 `orders`가 소스 오브 트루스이며, 여기에는 계좌 수량 귀속과
 /// 목표 주문 재구성에 꼭 필요한 값만 중복 저장한다.
@@ -119,6 +160,9 @@ pub struct AutomationRuntime {
     last_decision_slot: Option<i64>,
     decision_row_id: Option<i64>,
     decision_key: Option<String>,
+    decision_status: Option<AutomationDecisionStatus>,
+    market_regime: Option<MarketRegime>,
+    decision_summary_ko: Option<String>,
     group: Option<OcoGroup>,
     group_expires_epoch: Option<i64>,
     position: Option<OwnedPosition>,
@@ -148,6 +192,9 @@ impl AutomationRuntime {
             last_decision_slot: saved.last_decision_slot,
             decision_row_id: None,
             decision_key: None,
+            decision_status: None,
+            market_regime: None,
+            decision_summary_ko: None,
             group: None,
             group_expires_epoch: None,
             position: saved.position,
@@ -422,6 +469,29 @@ impl AutomationRuntime {
         self.revision = self.revision.saturating_add(1);
     }
 
+    /// 안전상 즉시 신규 진입을 막아야 하지만 기존 OCO 장부 종결이 실패한 경우,
+    /// 그룹을 메모리에 남겨 다음 재시도에서 정확한 자식 상태를 복구할 수 있게 한다.
+    /// Suspended 단계에서는 `on_trade_tick`이 그룹을 실행하지 않는다.
+    pub fn suspend_preserving_group(&mut self, reason: impl Into<String>) {
+        self.phase = AutomationPhase::Suspended;
+        self.error = Some(reason.into());
+        self.revision = self.revision.saturating_add(1);
+    }
+
+    pub fn has_group_pending_ledger_repair(&self) -> bool {
+        self.phase == AutomationPhase::Suspended && self.group.is_some()
+    }
+
+    /// 보존한 그룹의 장부 종결이 성공한 뒤 메모리 그룹만 제거한다.
+    pub fn finish_group_ledger_repair(&mut self) -> bool {
+        if !self.has_group_pending_ledger_repair() {
+            return false;
+        }
+        self.replace_group();
+        self.revision = self.revision.saturating_add(1);
+        true
+    }
+
     /// 새 모드 설정만 원자적으로 반영한다. 실주식 인계·섀도 청산은 호출자가 먼저 끝낸다.
     pub fn set_mode_after_cleanup(
         &mut self,
@@ -434,6 +504,9 @@ impl AutomationRuntime {
         self.next_decision_at = next_decision_at;
         self.decision_row_id = None;
         self.decision_key = None;
+        self.decision_status = None;
+        self.market_regime = None;
+        self.decision_summary_ko = None;
         self.pending_entry = None;
         self.shadow_cash = if mode == ControlMode::Shadow {
             shadow_cash
@@ -492,6 +565,9 @@ impl AutomationRuntime {
         self.last_decision_slot = Some(decision_slot);
         self.decision_row_id = None;
         self.decision_key = None;
+        self.decision_status = None;
+        self.market_regime = None;
+        self.decision_summary_ko = None;
         self.error = None;
         Some(self.revision)
     }
@@ -511,6 +587,7 @@ impl AutomationRuntime {
             return false;
         }
         self.phase = AutomationPhase::Idle;
+        self.decision_status = Some(AutomationDecisionStatus::Error);
         self.error = Some(message.into());
         true
     }
@@ -522,6 +599,9 @@ impl AutomationRuntime {
         decision_row_id: i64,
         decision_key: String,
         decision: &ValidatedDecision,
+        decision_status: AutomationDecisionStatus,
+        seeds: &[ScenarioSeed],
+        last_trade_sequence: Option<u64>,
         group_id: i64,
         armed_at: Duration,
         expires_at: Duration,
@@ -532,21 +612,40 @@ impl AutomationRuntime {
         }
         self.decision_row_id = Some(decision_row_id);
         self.decision_key = Some(decision_key);
+        self.decision_status = Some(decision_status);
+        self.market_regime = Some(decision.market_regime);
+        self.decision_summary_ko = Some(decision.decision_summary_ko.clone());
         self.group_expires_epoch = Some(expires_epoch);
         if decision.scenarios.is_empty() {
             self.group = None;
             self.phase = AutomationPhase::Idle;
             return true;
         }
-        let Ok(group) = OcoGroup::arm(group_id, expected_revision, decision, armed_at, expires_at)
-        else {
+        let Ok(group) = OcoGroup::arm(
+            group_id,
+            expected_revision,
+            decision,
+            seeds,
+            last_trade_sequence,
+            armed_at,
+            expires_at,
+        ) else {
             self.group = None;
             self.phase = AutomationPhase::Idle;
+            self.decision_status = Some(AutomationDecisionStatus::Error);
             self.error = Some("OCO 그룹 생성 실패".into());
             return false;
         };
+        let has_active_scenarios = group.has_active_scenarios();
+        if !has_active_scenarios {
+            self.decision_status = Some(decision_status_for_group(&group));
+        }
         self.group = Some(group);
-        self.phase = AutomationPhase::ArmedOco;
+        self.phase = if has_active_scenarios {
+            AutomationPhase::ArmedOco
+        } else {
+            AutomationPhase::Idle
+        };
         self.error = None;
         true
     }
@@ -560,27 +659,48 @@ impl AutomationRuntime {
             TickOutcome::Triggered(triggered) => {
                 // 상태 전환과 winner 결정은 같은 mutex 임계구역에서 일어난다.
                 self.phase = AutomationPhase::EntryPending;
+                self.decision_status = Some(AutomationDecisionStatus::Triggered);
                 self.revision = self.revision.saturating_add(1);
                 Some(triggered)
             }
             TickOutcome::Expired => {
                 self.phase = AutomationPhase::Idle;
+                self.decision_status = Some(decision_status_for_group(group));
+                self.revision = self.revision.saturating_add(1);
                 None
             }
-            TickOutcome::Updated | TickOutcome::Ignored => None,
+            TickOutcome::Updated => {
+                if !group.has_active_scenarios() {
+                    self.phase = AutomationPhase::Idle;
+                    self.decision_status = Some(decision_status_for_group(group));
+                    self.revision = self.revision.saturating_add(1);
+                }
+                None
+            }
+            TickOutcome::Ignored => None,
         }
     }
 
     pub fn reset_confirmation(&mut self, at: Duration) -> bool {
-        self.group
-            .as_mut()
-            .is_some_and(|group| group.reset_for_reconnect(at) > 0)
+        let Some(group) = self.group.as_mut() else {
+            return false;
+        };
+        let changed = group.reset_for_reconnect(at) > 0;
+        if changed && !group.has_active_scenarios() {
+            self.phase = AutomationPhase::Idle;
+            self.decision_status = Some(decision_status_for_group(group));
+            self.revision = self.revision.saturating_add(1);
+        }
+        changed
     }
 
     pub fn expire_group(&mut self, at: Duration) -> bool {
         let changed = self.group.as_mut().is_some_and(|group| group.expire(at));
         if changed {
             self.phase = AutomationPhase::Idle;
+            if let Some(group) = &self.group {
+                self.decision_status = Some(decision_status_for_group(group));
+            }
             self.revision = self.revision.saturating_add(1);
         }
         changed
@@ -821,8 +941,14 @@ impl AutomationRuntime {
                         id: group.group_id().saturating_mul(10) + index as i64,
                         product: state.scenario.product,
                         code: state.scenario.product.code(symbols).to_string(),
+                        setup_type: state.scenario.setup_type,
+                        reference_price: state.scenario.reference_price,
+                        confirmation_price: state.scenario.confirmation_price,
                         trigger_price: state.scenario.trigger_price,
+                        invalidation_price: state.scenario.invalidation_price,
                         target_return_pct: state.scenario.target_return_pct,
+                        rationale_ko: state.scenario.rationale_ko.clone(),
+                        reference_observed_at: state.reference_observed_at,
                         status: state.status,
                         confirming_ticks: u32::from(state.confirming_ticks),
                         confirming_elapsed_ms: group
@@ -862,6 +988,9 @@ impl AutomationRuntime {
             next_decision_at: self.next_decision_at,
             decision_id: self.decision_row_id,
             group_id: self.group.as_ref().map(OcoGroup::group_id),
+            decision_status: self.decision_status,
+            market_regime: self.market_regime,
+            decision_summary_ko: self.decision_summary_ko.clone(),
             scenarios,
             position,
             shadow_cash: self.shadow_cash,
@@ -874,6 +1003,7 @@ impl AutomationRuntime {
     fn replace_group(&mut self) {
         if let Some(group) = &mut self.group {
             group.replace();
+            self.decision_status = Some(decision_status_for_group(group));
         }
         self.group = None;
         self.group_expires_epoch = None;
@@ -1009,5 +1139,385 @@ mod tests {
                 .and_then(|position| position.pending_exit_reason.as_deref()),
             Some("market_close")
         );
+    }
+
+    fn reversal_decision() -> ValidatedDecision {
+        super::super::oco::validate_decision(
+            185_000,
+            &crate::types::ModelDecision {
+                market_regime: MarketRegime::Range,
+                decision_summary_ko: "저항 재시험 뒤 반락 후보".into(),
+                scenarios: vec![crate::types::ModelScenario {
+                    product: ProductKind::Inverse,
+                    setup_type: crate::types::SetupType::Reversal,
+                    reference_price: 185_200,
+                    confirmation_price: 184_800,
+                    invalidation_price: 185_400,
+                    target_return_pct: 0.3,
+                    rationale_ko: "반복 저항 시험과 거래량 감소".into(),
+                }],
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn terminal_seed와_판단설명은_idle_snapshot에_보존된다() {
+        let mut runtime = AutomationRuntime::new(PersistedAutomation::default(), None);
+        runtime.mode = ControlMode::Shadow;
+        let revision = runtime.begin_analysis(1_000, Some(1_300)).unwrap();
+        let decision = reversal_decision();
+
+        assert!(runtime.accept_decision(
+            revision,
+            17,
+            "decision-17".into(),
+            &decision,
+            AutomationDecisionStatus::Missed,
+            &[ScenarioSeed::missed(ProductKind::Inverse, Some(999))],
+            None,
+            17,
+            Duration::from_secs(10),
+            Duration::from_secs(310),
+            1_300,
+        ));
+        assert_eq!(runtime.phase(), AutomationPhase::Idle);
+
+        let snapshot = runtime.snapshot(
+            "runtime",
+            1,
+            &AutoSymbols::default(),
+            Duration::from_secs(11),
+            MarketDayStatus::Open,
+            None,
+        );
+        assert_eq!(snapshot.market_regime, Some(MarketRegime::Range));
+        assert_eq!(
+            snapshot.decision_status,
+            Some(AutomationDecisionStatus::Missed)
+        );
+        assert_eq!(
+            snapshot.decision_summary_ko.as_deref(),
+            Some("저항 재시험 뒤 반락 후보")
+        );
+        assert_eq!(snapshot.scenarios.len(), 1);
+        let scenario = &snapshot.scenarios[0];
+        assert_eq!(scenario.status, crate::types::ScenarioStatus::Missed);
+        assert_eq!(scenario.setup_type, crate::types::SetupType::Reversal);
+        assert_eq!(scenario.reference_price, 185_200);
+        assert_eq!(scenario.confirmation_price, 184_800);
+        assert_eq!(scenario.trigger_price, 184_800);
+        assert_eq!(scenario.invalidation_price, 185_400);
+        assert_eq!(scenario.reference_observed_at, Some(999));
+        assert_eq!(scenario.rationale_ko, "반복 저항 시험과 거래량 감소");
+    }
+
+    #[test]
+    fn 장부종결_실패_suspend는_그룹을_실행없이_보존하고_재시도후_제거한다() {
+        let mut runtime = AutomationRuntime::new(PersistedAutomation::default(), None);
+        runtime.mode = ControlMode::Shadow;
+        let revision = runtime.begin_analysis(1_000, Some(1_300)).unwrap();
+        let decision = reversal_decision();
+        assert!(runtime.accept_decision(
+            revision,
+            20,
+            "decision-20".into(),
+            &decision,
+            AutomationDecisionStatus::Armed,
+            &[],
+            None,
+            20,
+            Duration::from_secs(10),
+            Duration::from_secs(310),
+            1_300,
+        ));
+
+        runtime.suspend_preserving_group("장부 종결 재시도");
+        assert!(runtime.has_group_pending_ledger_repair());
+        assert!(runtime
+            .on_trade_tick(TradeTick {
+                sequence: 1,
+                price: 184_800,
+                volume: 1,
+                at: Duration::from_secs(20),
+                epoch: 1_020,
+            })
+            .is_none());
+        assert!(runtime.finish_group_ledger_repair());
+        assert!(!runtime.has_group_pending_ledger_repair());
+        assert_eq!(runtime.phase(), AutomationPhase::Suspended);
+    }
+
+    #[test]
+    fn skip도_국면과_판단요약을_snapshot에_남긴다() {
+        let mut runtime = AutomationRuntime::new(PersistedAutomation::default(), None);
+        runtime.mode = ControlMode::Shadow;
+        let revision = runtime.begin_analysis(1_000, Some(1_300)).unwrap();
+        let decision = super::super::oco::validate_decision(
+            185_000,
+            &crate::types::ModelDecision {
+                market_regime: MarketRegime::Unclear,
+                decision_summary_ko: "시간축 충돌과 목표 공간 부족으로 관망".into(),
+                scenarios: vec![],
+            },
+        )
+        .unwrap();
+
+        assert!(runtime.accept_decision(
+            revision,
+            19,
+            "decision-19".into(),
+            &decision,
+            AutomationDecisionStatus::Skipped,
+            &[],
+            None,
+            19,
+            Duration::from_secs(10),
+            Duration::from_secs(310),
+            1_300,
+        ));
+        let snapshot = runtime.snapshot(
+            "runtime",
+            1,
+            &AutoSymbols::default(),
+            Duration::from_secs(11),
+            MarketDayStatus::Open,
+            None,
+        );
+        assert_eq!(runtime.phase(), AutomationPhase::Idle);
+        assert_eq!(snapshot.market_regime, Some(MarketRegime::Unclear));
+        assert_eq!(
+            snapshot.decision_status,
+            Some(AutomationDecisionStatus::Skipped)
+        );
+        assert_eq!(
+            snapshot.decision_summary_ko.as_deref(),
+            Some("시간축 충돌과 목표 공간 부족으로 관망")
+        );
+        assert!(snapshot.scenarios.is_empty());
+    }
+
+    #[test]
+    fn 전부_의미검증에_실패한_판단은_skip과_구분한다() {
+        let mut runtime = AutomationRuntime::new(PersistedAutomation::default(), None);
+        runtime.mode = ControlMode::Shadow;
+        let revision = runtime.begin_analysis(1_000, Some(1_300)).unwrap();
+        let decision = super::super::oco::validate_decision(
+            185_000,
+            &crate::types::ModelDecision {
+                market_regime: MarketRegime::Range,
+                decision_summary_ko: "가격 순서가 잘못된 후보".into(),
+                scenarios: vec![crate::types::ModelScenario {
+                    product: ProductKind::Inverse,
+                    setup_type: crate::types::SetupType::Reversal,
+                    reference_price: 184_900,
+                    confirmation_price: 185_200,
+                    invalidation_price: 184_700,
+                    target_return_pct: 0.3,
+                    rationale_ko: "잘못된 가격 순서".into(),
+                }],
+            },
+        )
+        .unwrap();
+        assert!(decision.scenarios.is_empty());
+        assert!(!decision.rejected.is_empty());
+
+        assert!(runtime.accept_decision(
+            revision,
+            21,
+            "decision-21".into(),
+            &decision,
+            AutomationDecisionStatus::Invalid,
+            &[],
+            None,
+            21,
+            Duration::from_secs(10),
+            Duration::from_secs(310),
+            1_300,
+        ));
+        let snapshot = runtime.snapshot(
+            "runtime",
+            1,
+            &AutoSymbols::default(),
+            Duration::from_secs(11),
+            MarketDayStatus::Open,
+            None,
+        );
+        assert_eq!(runtime.phase(), AutomationPhase::Idle);
+        assert_eq!(
+            snapshot.decision_status,
+            Some(AutomationDecisionStatus::Invalid)
+        );
+        assert!(snapshot.scenarios.is_empty());
+    }
+
+    #[test]
+    fn 마지막_active가_무효화되면_runtime은_idle로_내려간다() {
+        let mut runtime = AutomationRuntime::new(PersistedAutomation::default(), None);
+        runtime.mode = ControlMode::Shadow;
+        let revision = runtime.begin_analysis(1_000, Some(1_300)).unwrap();
+        let decision = reversal_decision();
+        assert!(runtime.accept_decision(
+            revision,
+            18,
+            "decision-18".into(),
+            &decision,
+            AutomationDecisionStatus::Armed,
+            &[],
+            None,
+            18,
+            Duration::from_secs(10),
+            Duration::from_secs(310),
+            1_300,
+        ));
+
+        assert!(runtime
+            .on_trade_tick(TradeTick {
+                sequence: 1,
+                price: 185_400,
+                volume: 1,
+                at: Duration::from_secs(11),
+                epoch: 1_001,
+            })
+            .is_none());
+        assert_eq!(runtime.phase(), AutomationPhase::Idle);
+        let snapshot = runtime.snapshot(
+            "runtime",
+            1,
+            &AutoSymbols::default(),
+            Duration::from_secs(11),
+            MarketDayStatus::Open,
+            None,
+        );
+        assert_eq!(
+            snapshot.scenarios[0].status,
+            crate::types::ScenarioStatus::Invalidated
+        );
+        assert_eq!(
+            snapshot.decision_status,
+            Some(AutomationDecisionStatus::Invalidated)
+        );
+    }
+
+    #[test]
+    fn 재연결_reset이_만료경계와_겹쳐도_runtime이_고착되지_않는다() {
+        let mut runtime = AutomationRuntime::new(PersistedAutomation::default(), None);
+        runtime.mode = ControlMode::Shadow;
+        let revision = runtime.begin_analysis(1_000, Some(1_300)).unwrap();
+        let decision = reversal_decision();
+        assert!(runtime.accept_decision(
+            revision,
+            20,
+            "decision-20".into(),
+            &decision,
+            AutomationDecisionStatus::Armed,
+            &[],
+            None,
+            20,
+            Duration::from_secs(10),
+            Duration::from_secs(310),
+            1_300,
+        ));
+
+        assert!(runtime.reset_confirmation(Duration::from_secs(310)));
+        assert_eq!(runtime.phase(), AutomationPhase::Idle);
+        let snapshot = runtime.snapshot(
+            "runtime",
+            1,
+            &AutoSymbols::default(),
+            Duration::from_secs(310),
+            MarketDayStatus::Open,
+            None,
+        );
+        assert_eq!(
+            snapshot.scenarios[0].status,
+            crate::types::ScenarioStatus::Expired
+        );
+        assert_eq!(
+            snapshot.decision_status,
+            Some(AutomationDecisionStatus::Expired)
+        );
+    }
+
+    #[test]
+    fn 한쪽_무효화뒤_반대쪽이_만료되어도_부모는_무효화를_우선한다() {
+        let mut runtime = AutomationRuntime::new(PersistedAutomation::default(), None);
+        runtime.mode = ControlMode::Shadow;
+        let revision = runtime.begin_analysis(1_000, Some(1_300)).unwrap();
+        let decision = super::super::oco::validate_decision(
+            185_000,
+            &crate::types::ModelDecision {
+                market_regime: MarketRegime::Transition,
+                decision_summary_ko: "양방향 후보 중 한쪽 무효화".into(),
+                scenarios: vec![
+                    crate::types::ModelScenario {
+                        product: ProductKind::Leverage,
+                        setup_type: crate::types::SetupType::Continuation,
+                        reference_price: 185_200,
+                        confirmation_price: 185_400,
+                        invalidation_price: 184_600,
+                        target_return_pct: 0.3,
+                        rationale_ko: "상단 돌파 대기".into(),
+                    },
+                    crate::types::ModelScenario {
+                        product: ProductKind::Inverse,
+                        setup_type: crate::types::SetupType::Reversal,
+                        reference_price: 185_200,
+                        confirmation_price: 184_800,
+                        invalidation_price: 185_400,
+                        target_return_pct: 0.3,
+                        rationale_ko: "저항 반락 대기".into(),
+                    },
+                ],
+            },
+        )
+        .unwrap();
+
+        assert!(runtime.accept_decision(
+            revision,
+            22,
+            "decision-22".into(),
+            &decision,
+            AutomationDecisionStatus::Armed,
+            &[
+                ScenarioSeed::armed(ProductKind::Leverage, None),
+                ScenarioSeed::invalidated(ProductKind::Inverse, Some(990)),
+            ],
+            None,
+            22,
+            Duration::from_secs(10),
+            Duration::from_secs(310),
+            1_300,
+        ));
+        assert!(runtime
+            .on_trade_tick(TradeTick {
+                sequence: 1,
+                price: 185_000,
+                volume: 1,
+                at: Duration::from_secs(310),
+                epoch: 1_300,
+            })
+            .is_none());
+
+        let snapshot = runtime.snapshot(
+            "runtime",
+            1,
+            &AutoSymbols::default(),
+            Duration::from_secs(310),
+            MarketDayStatus::Open,
+            None,
+        );
+        assert_eq!(
+            snapshot.decision_status,
+            Some(AutomationDecisionStatus::Invalidated)
+        );
+        assert!(snapshot
+            .scenarios
+            .iter()
+            .any(|scenario| scenario.status == ScenarioStatus::Expired));
+        assert!(snapshot
+            .scenarios
+            .iter()
+            .any(|scenario| scenario.status == ScenarioStatus::Invalidated));
     }
 }

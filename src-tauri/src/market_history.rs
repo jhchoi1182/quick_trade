@@ -98,10 +98,17 @@ impl MarketHistory {
         Ok(Arc::clone(&entry.bars))
     }
 
-    /// 정상 상태의 현재 스냅샷. 초기화 전이나 공백 표시 뒤에는 `None`이다.
+    /// 정상 상태의 현재 불변 스냅샷. 초기화 전이나 공백 표시 뒤에는 `None`이다.
+    ///
+    /// 호출자는 이 메서드가 브로커를 호출하지 않는다는 점을 이용해 피드 직렬화
+    /// 구간에서도 봉·호가·체결 커서를 같은 논리 시점에 복사할 수 있다.
+    pub(crate) async fn healthy_snapshot(&self, code: &str) -> Option<Arc<Vec<Candle>>> {
+        self.healthy(code).await
+    }
+
     #[cfg(test)]
     pub async fn cached(&self, code: &str) -> Option<Arc<Vec<Candle>>> {
-        self.healthy(code).await
+        self.healthy_snapshot(code).await
     }
 
     /// 실시간 체결 한 건을 해당 종목의 1분봉에 반영한다.
@@ -388,6 +395,24 @@ mod tests {
         assert_eq!(bars[1].time, 180);
         assert_eq!(bars[1].close, 107.0);
         assert_eq!(bars[1].volume, 2.0);
+    }
+
+    #[tokio::test]
+    async fn healthy_snapshot은_이후_실시간_체결에도_불변이다() {
+        let history = MarketHistory::new();
+        history
+            .get_or_fetch("000660", || async { Ok(vec![candle(120, 100.0, 10.0)]) })
+            .await
+            .unwrap();
+        let captured = history.healthy_snapshot("000660").await.unwrap();
+
+        assert!(history.apply_trade(&quote(125, 110.0, 3.0)).await);
+
+        assert_eq!(captured[0].close, 100.0);
+        assert_eq!(captured[0].volume, 10.0);
+        let latest = history.healthy_snapshot("000660").await.unwrap();
+        assert_eq!(latest[0].close, 110.0);
+        assert_eq!(latest[0].volume, 13.0);
     }
 
     #[tokio::test]
