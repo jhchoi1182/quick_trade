@@ -17,6 +17,13 @@ pub const MODEL: &str = "gpt-5.6-sol";
 pub const PROMPT_VERSION: &str = "sk-hynix-oco-v4";
 const RESPONSES_URL: &str = "https://api.openai.com/v1/responses";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(240);
+/// Responses API의 이 한도는 추론 토큰과 가시 출력 토큰을 합쳐서 센다.
+/// `reasoning.effort`가 `max`라 추론 몫이 수천 토큰에 이를 수 있고, 한도를 넘기면
+/// 응답이 `incomplete(max_output_tokens)`로 잘려 그 슬롯의 판단이 통째로 버려진다.
+/// (추론 토큰 요금은 그대로 청구되므로 잘림은 순손실이다.)
+/// 구조화 출력 자체는 시나리오 2개 기준 1천 토큰 미만이므로 여유를 크게 둔다.
+/// 실제 요청 수명은 상위 엔진의 판단 슬롯 만료와 HTTP 240초 제한 중 먼저 닿는 값이다.
+const MAX_OUTPUT_TOKENS: u32 = 32_768;
 
 /// 프롬프트 캐시의 고정 접두사가 되므로 동적 값을 추가하지 않는다.
 pub const SYSTEM_PROMPT: &str = concat!(
@@ -308,7 +315,7 @@ fn build_request_body(input: &DecisionInput) -> Result<Value, OpenAiError> {
             "verbosity": "low",
             "format": decision_json_schema()
         },
-        "max_output_tokens": 4096,
+        "max_output_tokens": MAX_OUTPUT_TOKENS,
         "input": [
             {
                 "role": "system",
@@ -908,7 +915,7 @@ mod tests {
         assert_eq!(body["reasoning"]["context"], "current_turn");
         assert_eq!(body["store"], false);
         assert_eq!(body["text"]["verbosity"], "low");
-        assert_eq!(body["max_output_tokens"], 4096);
+        assert_eq!(body["max_output_tokens"], MAX_OUTPUT_TOKENS);
         assert_eq!(body["text"]["format"]["type"], "json_schema");
         assert_eq!(body["text"]["format"]["strict"], true);
         assert_eq!(
