@@ -98,6 +98,37 @@ impl TokenManager {
         Ok(token)
     }
 
+    /// KIS가 만료됐다고 거부한 토큰만 메모리·디스크 캐시에서 폐기한다.
+    ///
+    /// 동시 요청 하나가 이미 새 토큰을 발급한 뒤 늦게 도착한 옛 응답이 새 토큰을
+    /// 지우지 않도록, 실제 요청에 사용한 bearer와 현재 캐시가 일치할 때만 지운다.
+    pub async fn invalidate_rejected(&self, rejected_bearer: &str) -> bool {
+        let mut guard = self.cached.lock().await;
+        if guard
+            .as_ref()
+            .is_some_and(|token| token.access_token != rejected_bearer)
+        {
+            return false;
+        }
+
+        let memory_matched = guard
+            .as_ref()
+            .is_some_and(|token| token.access_token == rejected_bearer);
+        if memory_matched {
+            *guard = None;
+        }
+
+        let disk_matched = self
+            .load_from_disk()
+            .is_some_and(|token| token.access_token == rejected_bearer);
+        if disk_matched {
+            if let Err(error) = std::fs::remove_file(&self.path) {
+                tracing::warn!("만료된 KIS 토큰 캐시 삭제 실패: {error}");
+            }
+        }
+        memory_matched || disk_matched
+    }
+
     fn load_from_disk(&self) -> Option<CachedToken> {
         let raw = std::fs::read_to_string(&self.path).ok()?;
         serde_json::from_str(&raw).ok()
@@ -151,5 +182,72 @@ mod tests {
     fn fingerprint_is_stable_and_key_specific() {
         assert_eq!(app_key_fingerprint("abc"), app_key_fingerprint("abc"));
         assert_ne!(app_key_fingerprint("abc"), app_key_fingerprint("abd"));
+    }
+
+    fn 테스트_토큰_관리자(path: PathBuf) -> TokenManager {
+        TokenManager::new(
+            reqwest::Client::new(),
+            "https://example.test".into(),
+            "app-key".into(),
+            "app-secret".into(),
+            path,
+        )
+    }
+
+    fn 테스트_토큰(value: &str) -> CachedToken {
+        CachedToken {
+            access_token: value.into(),
+            expires_at: chrono::Utc::now().timestamp() + 86_400,
+            base: "https://example.test".into(),
+            app_key_fingerprint: app_key_fingerprint("app-key"),
+        }
+    }
+
+    #[tokio::test]
+    async fn 서버가_거부한_토큰만_메모리와_디스크에서_폐기한다() {
+        let path = std::env::temp_dir().join(format!(
+            "easy-scalping-token-invalidate-{}.json",
+            std::process::id()
+        ));
+        let manager = 테스트_토큰_관리자(path.clone());
+        let expired = 테스트_토큰("expired-token");
+        manager.save_to_disk(&expired);
+        *manager.cached.lock().await = Some(expired);
+
+        assert!(manager.invalidate_rejected("expired-token").await);
+        assert!(manager.cached.lock().await.is_none());
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn 늦게_도착한_옛_만료_응답은_새_토큰을_폐기하지_않는다() {
+        let path = std::env::temp_dir().join(format!(
+            "easy-scalping-token-stale-response-{}.json",
+            std::process::id()
+        ));
+        let manager = 테스트_토큰_관리자(path.clone());
+        let current = 테스트_토큰("new-token");
+        manager.save_to_disk(&current);
+        *manager.cached.lock().await = Some(current);
+
+        assert!(!manager.invalidate_rejected("expired-token").await);
+        assert_eq!(
+            manager
+                .cached
+                .lock()
+                .await
+                .as_ref()
+                .map(|token| token.access_token.as_str()),
+            Some("new-token")
+        );
+        assert_eq!(
+            manager
+                .load_from_disk()
+                .as_ref()
+                .map(|token| token.access_token.as_str()),
+            Some("new-token")
+        );
+
+        let _ = std::fs::remove_file(path);
     }
 }

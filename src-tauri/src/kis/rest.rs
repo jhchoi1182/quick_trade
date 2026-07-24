@@ -82,6 +82,20 @@ pub fn is_rate_limit_error(msg: &str) -> bool {
     msg.contains("EGW00201") || msg.contains("초당 거래건수")
 }
 
+/// KIS 접근토큰 만료 응답 판정.
+///
+/// 운영 응답은 보통 HTTP 500 본문의 `msg_cd=EGW00123`,
+/// `msg1=기간이 만료된 token 입니다.` 형태다.
+pub fn is_token_expired_error(msg: &str) -> bool {
+    let normalized = msg.to_ascii_lowercase();
+    normalized.contains("egw00123")
+        || normalized.contains("만료된 token")
+        || normalized.contains("token이 만료")
+        || normalized.contains("token 이 만료")
+        || normalized.contains("token has expired")
+        || normalized.contains("expired token")
+}
+
 pub struct KisRest {
     http: reqwest::Client,
     pub base: String,
@@ -145,7 +159,8 @@ impl KisRest {
         params: &[(&str, String)],
         tr_cont: Option<&str>,
     ) -> AppResult<RestPage> {
-        let mut attempt = 0u32;
+        let mut rate_limit_attempt = 0u32;
+        let mut token_refresh_attempted = false;
         loop {
             self.limiter.acquire().await;
             let bearer = self.token.bearer().await?;
@@ -173,14 +188,21 @@ impl KisRest {
                 tr_cont: response_cont,
             });
             match &result {
-                Err(AppError::Kis(msg)) if is_rate_limit_error(msg) && attempt < 4 => {
+                Err(AppError::Kis(msg))
+                    if is_token_expired_error(msg) && !token_refresh_attempted =>
+                {
+                    token_refresh_attempted = true;
+                    self.token.invalidate_rejected(&bearer).await;
+                    tracing::warn!("KIS 접근토큰 만료({tr_id}) — 캐시 폐기 후 조회를 한 번 재시도");
+                }
+                Err(AppError::Kis(msg)) if is_rate_limit_error(msg) && rate_limit_attempt < 4 => {
                     // 지수 백오프: 0.5s → 1s → 2s → 4s (읽기 전용이라 재시도 안전).
                     // 개별 태스크가 아니라 공유 리미터를 미뤄 다른 POST도 보호한다.
-                    let delay = Duration::from_millis(500u64 << attempt);
-                    attempt += 1;
+                    let delay = Duration::from_millis(500u64 << rate_limit_attempt);
+                    rate_limit_attempt += 1;
                     self.limiter.defer_for(delay).await;
                     tracing::warn!(
-                        "KIS 유량 초과({tr_id}) — {attempt}번째 재시도 ({delay:?} 대기)"
+                        "KIS 유량 초과({tr_id}) — {rate_limit_attempt}번째 재시도 ({delay:?} 대기)"
                     );
                 }
                 _ => return result,
@@ -189,20 +211,36 @@ impl KisRest {
     }
 
     pub async fn post(&self, path: &str, tr_id: &str, body: &Value) -> AppResult<Value> {
-        self.limiter.acquire().await;
-        let bearer = self.token.bearer().await?;
-        let resp = self
-            .http
-            .post(format!("{}{}", self.base, path))
-            .json(body)
-            .header("authorization", format!("Bearer {bearer}"))
-            .header("appkey", &self.app_key)
-            .header("appsecret", &self.app_secret)
-            .header("tr_id", tr_id)
-            .header("custtype", "P")
-            .send()
-            .await?;
-        let result = Self::into_json(resp).await;
+        let mut token_refresh_attempted = false;
+        let result = loop {
+            self.limiter.acquire().await;
+            let bearer = self.token.bearer().await?;
+            let resp = self
+                .http
+                .post(format!("{}{}", self.base, path))
+                .json(body)
+                .header("authorization", format!("Bearer {bearer}"))
+                .header("appkey", &self.app_key)
+                .header("appsecret", &self.app_secret)
+                .header("tr_id", tr_id)
+                .header("custtype", "P")
+                .send()
+                .await?;
+            let result = Self::into_json(resp).await;
+            if matches!(
+                &result,
+                Err(AppError::Kis(message))
+                    if is_token_expired_error(message) && !token_refresh_attempted
+            ) {
+                // 인증 단계에서 명시적으로 거부된 요청은 KIS 주문 시스템에 접수되지
+                // 않았으므로 같은 POST를 새 토큰으로 한 번만 다시 보내도 이중 주문이 없다.
+                token_refresh_attempted = true;
+                self.token.invalidate_rejected(&bearer).await;
+                tracing::warn!("KIS 접근토큰 만료({tr_id}) — 캐시 폐기 후 POST를 한 번 재시도");
+                continue;
+            }
+            break result;
+        };
         if matches!(&result, Err(AppError::Kis(message)) if is_rate_limit_error(message)) {
             // 주문 POST는 이중 주문 위험 때문에 다시 보내지 않는다. 다만 뒤따르는
             // 체결·미체결 조정까지 연달아 유량 초과가 나지 않게 전역 쿨다운한다.
@@ -284,6 +322,17 @@ mod tests {
         assert!(is_rate_limit_error("EGW00201"));
         assert!(!is_rate_limit_error("주문가능금액이 부족합니다"));
         assert!(!is_rate_limit_error("모의투자 장종료"));
+    }
+
+    #[test]
+    fn token_expired_error_detection() {
+        assert!(is_token_expired_error(
+            "HTTP 500 Internal Server Error: 기간이 만료된 token 입니다."
+        ));
+        assert!(is_token_expired_error("EGW00123"));
+        assert!(is_token_expired_error("expired token"));
+        assert!(!is_token_expired_error("접근토큰 발급 실패"));
+        assert!(!is_token_expired_error("APP KEY가 유효하지 않습니다"));
     }
 
     #[test]
