@@ -178,7 +178,6 @@ impl Broker for KisBroker {
         codes: Vec<String>,
         tx: mpsc::Sender<FeedEvent>,
     ) -> AppResult<Vec<JoinHandle<()>>> {
-        let approval_key = self.rest.token.ws_approval_key().await?;
         let mut trade_codes: Vec<String> = self
             .settings
             .trade_symbols
@@ -200,7 +199,7 @@ impl Broker for KisBroker {
         };
         let cfg = ws::WsConfig {
             url: self.rest.ws_url().to_string(),
-            approval_key,
+            approval: self.rest.token.approval_issuer(),
             subs: build_subs(&codes, &trade_codes),
             notice,
         };

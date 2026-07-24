@@ -8,6 +8,7 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
 use crate::error::{AppError, AppResult};
+use crate::kis::auth::ApprovalKeyIssuer;
 use crate::kis::crypto::aes_cbc_decrypt;
 use crate::types::{FeedEvent, FillEvent, Quote, Side};
 use crate::util::{kst_str_to_fake_epoch, now_kst};
@@ -31,7 +32,9 @@ struct SubscribeAck {
 
 pub struct WsConfig {
     pub url: String,
-    pub approval_key: String,
+    /// 접속키 발급자. 무효화된 키 재사용으로 구독이 전부 거절되는 사태를 막기 위해
+    /// 재접속 시도마다 새 키를 발급한다.
+    pub approval: ApprovalKeyIssuer,
     /// 실시간 구독 목록: (tr_id, tr_key). 체결가/호가 TR을 종목별로 지정한다 —
     /// 통합(H0UN~)이 시세를 안 주는 종목(신형 코드 ETF/ETN)은 KRX 단독(H0ST~)으로 구독해야 한다.
     pub subs: Vec<(String, String)>,
@@ -104,43 +107,64 @@ where
     Ok(())
 }
 
+/// 데이터 프레임을 파싱해 채널로 전달한다.
+/// `None` = 수신 채널이 닫힘(엔진 종료), `Some(n)` = 전달한 이벤트 수.
 async fn forward_data_frame(
     txt: &str,
     aes_key_iv: &Option<(String, String)>,
     tx: &mpsc::Sender<FeedEvent>,
-) -> bool {
-    for event in parse_data_frame(txt, aes_key_iv) {
+) -> Option<usize> {
+    let events = parse_data_frame(txt, aes_key_iv);
+    let count = events.len();
+    for event in events {
         if tx.send(event).await.is_err() {
-            return false;
+            return None;
         }
     }
-    true
+    Some(count)
+}
+
+/// 구독 확인 진행 상태. 거절도 pending에서 제거해
+/// 전부-거절 시 타임아웃을 기다리지 않고 즉시 판정한다.
+struct SubscriptionConfirmation {
+    pending: HashSet<SubscriptionId>,
+    succeeded: usize,
+    /// "tr_id/tr_key: msg1" 형식
+    rejected: Vec<String>,
+    /// 확인 중 실시간 데이터 프레임 수신 여부 — ack가 유실돼도 접속키가 살아있다는 증거
+    saw_data: bool,
+}
+
+/// 이미 구독된 상태에 대한 거절은 데이터가 흐르고 있다는 뜻이므로 성공으로 취급한다.
+fn is_already_subscribed(msg: &str) -> bool {
+    msg.to_ascii_uppercase().contains("ALREADY IN SUBSCRIBE")
 }
 
 fn apply_subscribe_ack(
-    pending: &mut HashSet<SubscriptionId>,
+    state: &mut SubscriptionConfirmation,
     aes_key_iv: &mut Option<(String, String)>,
     ack: SubscribeAck,
-) -> AppResult<()> {
-    if !ack.success {
-        return Err(AppError::Kis(format!(
-            "웹소켓 구독 실패({}/{}): {}",
-            ack.tr_id, ack.tr_key, ack.message
-        )));
-    }
-
+) {
     let subscription = (ack.tr_id.clone(), ack.tr_key.clone());
-    if !pending.remove(&subscription) {
-        tracing::warn!(
-            "요청 목록에 없는 웹소켓 구독 성공 응답: {}/{}",
-            ack.tr_id,
-            ack.tr_key
-        );
+    if ack.success || is_already_subscribed(&ack.message) {
+        if !state.pending.remove(&subscription) {
+            tracing::warn!(
+                "요청 목록에 없는 웹소켓 구독 성공 응답: {}/{}",
+                ack.tr_id,
+                ack.tr_key
+            );
+        }
+        // ack의 tr_key가 요청과 어긋나도 접속키가 살아있다는 증거이므로 성공으로 센다.
+        state.succeeded += 1;
+        if let Some(keys) = ack.aes_key_iv {
+            *aes_key_iv = Some(keys);
+        }
+    } else {
+        state.pending.remove(&subscription);
+        let detail = format!("{}/{}: {}", ack.tr_id, ack.tr_key, ack.message);
+        tracing::warn!("웹소켓 구독 거절: {detail}");
+        state.rejected.push(detail);
     }
-    if let Some(keys) = ack.aes_key_iv {
-        *aes_key_iv = Some(keys);
-    }
-    Ok(())
 }
 
 fn pending_subscriptions(pending: &HashSet<SubscriptionId>) -> String {
@@ -164,9 +188,14 @@ where
     R: Stream<Item = Result<Message, WsError>> + Unpin,
     W: Sink<Message, Error = WsError> + Unpin,
 {
-    let mut pending: HashSet<SubscriptionId> = subscriptions.iter().cloned().collect();
+    let mut state = SubscriptionConfirmation {
+        pending: subscriptions.iter().cloned().collect(),
+        succeeded: 0,
+        rejected: Vec::new(),
+        saw_data: false,
+    };
     let confirmation = async {
-        while !pending.is_empty() {
+        while !state.pending.is_empty() {
             if tx.is_closed() {
                 return Ok(());
             }
@@ -185,10 +214,14 @@ where
                                 .await
                                 .map_err(ws_err)?;
                         } else if let Some(ack) = subscribe_ack(txt) {
-                            apply_subscribe_ack(&mut pending, aes_key_iv, ack)?;
+                            apply_subscribe_ack(&mut state, aes_key_iv, ack);
                         }
-                    } else if !forward_data_frame(txt, aes_key_iv, tx).await {
-                        return Ok(());
+                    } else {
+                        // 인식된 시세 이벤트가 실제로 나왔을 때만 접속키 생존 증거로 인정한다
+                        match forward_data_frame(txt, aes_key_iv, tx).await {
+                            Some(count) => state.saw_data |= count > 0,
+                            None => return Ok(()),
+                        }
                     }
                 }
                 Message::Ping(payload) => {
@@ -205,19 +238,48 @@ where
         Ok(())
     };
 
-    match tokio::time::timeout(timeout, confirmation).await {
-        Ok(result) => result?,
-        Err(_) => {
+    // 소켓이 죽은 경우(Close/스트림 종료)는 성공 수와 무관하게 그대로 전파한다.
+    let timed_out = match tokio::time::timeout(timeout, confirmation).await {
+        Ok(result) => {
+            result?;
+            false
+        }
+        Err(_) => true,
+    };
+    if tx.is_closed() {
+        return Ok(());
+    }
+    // 성공 ack도 데이터 프레임도 전혀 없으면 접속키가 죽었다고 보고
+    // Err → 재접속(새 키 발급)을 유도한다. 부분 실패는 연결을 유지하고
+    // 종목별 시세 누락은 자동매매 신선도 검사가 정확한 사유로 감지한다.
+    if !subscriptions.is_empty() && state.succeeded == 0 && !state.saw_data {
+        if timed_out {
             return Err(AppError::Kis(format!(
-                "웹소켓 필수 구독 확인 시간 초과({}초): {}",
+                "웹소켓 필수 구독 확인 시간 초과({}초) — 성공 0건, 거절: [{}], 미확인: [{}]",
                 timeout.as_secs_f64(),
-                pending_subscriptions(&pending)
+                state.rejected.join(", "),
+                pending_subscriptions(&state.pending)
             )));
         }
+        return Err(AppError::Kis(format!(
+            "웹소켓 구독이 모두 거절됐습니다: {}",
+            state.rejected.join(", ")
+        )));
     }
-    if !tx.is_closed() {
-        let _ = tx.send(FeedEvent::Conn(true)).await;
+    if !state.rejected.is_empty() {
+        tracing::warn!(
+            "일부 웹소켓 구독 거절(연결은 유지): {}",
+            state.rejected.join(", ")
+        );
     }
+    if timed_out && !state.pending.is_empty() {
+        tracing::warn!(
+            "웹소켓 구독 {}건 미확인(연결은 유지) — 시세 누락은 종목별 신선도 검사가 감지: {}",
+            state.pending.len(),
+            pending_subscriptions(&state.pending)
+        );
+    }
+    let _ = tx.send(FeedEvent::Conn(true)).await;
     Ok(())
 }
 
@@ -227,8 +289,10 @@ async fn run_once(cfg: &WsConfig, tx: &mpsc::Sender<FeedEvent>) -> AppResult<()>
         .map_err(|e| AppError::Kis(format!("웹소켓 연결 실패: {e}")))?;
     let (mut write, mut read) = ws.split();
 
+    // 소켓 연결 성공 후에 발급해, WS 서버가 죽어 있는 시간대에 무의미한 발급 호출을 반복하지 않는다.
+    let approval_key = cfg.approval.issue().await?;
     let subscriptions = required_subscriptions(cfg);
-    send_subscriptions(&mut write, &cfg.approval_key, &subscriptions).await?;
+    send_subscriptions(&mut write, &approval_key, &subscriptions).await?;
     let mut aes_key_iv: Option<(String, String)> = None;
     confirm_subscriptions(
         &mut read,
@@ -258,17 +322,21 @@ async fn run_once(cfg: &WsConfig, tx: &mpsc::Sender<FeedEvent>) -> AppResult<()>
                             .await
                             .map_err(ws_err)?;
                     } else if let Some(ack) = subscribe_ack(txt) {
-                        if !ack.success {
-                            return Err(AppError::Kis(format!(
-                                "웹소켓 구독 실패({}/{}): {}",
-                                ack.tr_id, ack.tr_key, ack.message
-                            )));
-                        }
-                        if let Some(keys) = ack.aes_key_iv {
-                            aes_key_iv = Some(keys);
+                        if ack.success || is_already_subscribed(&ack.message) {
+                            if let Some(keys) = ack.aes_key_iv {
+                                aes_key_iv = Some(keys);
+                            }
+                        } else {
+                            // 지연 도착한 거절 ack가 살아있는 연결을 통째로 끊지 않게 한다
+                            tracing::warn!(
+                                "웹소켓 구독 거절 무시({}/{}): {} — 연결 유지",
+                                ack.tr_id,
+                                ack.tr_key,
+                                ack.message
+                            );
                         }
                     }
-                } else if !forward_data_frame(txt, &aes_key_iv, tx).await {
+                } else if forward_data_frame(txt, &aes_key_iv, tx).await.is_none() {
                     return Ok(());
                 }
             }
@@ -769,7 +837,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 구독거절은_tr과_종목을_포함해_연결실패가_된다() {
+    async fn 전부_거절되면_tr과_종목과_사유를_포함해_연결실패가_된다() {
         let subscriptions = vec![("H0STASP0".into(), "0193T0".into())];
         let mut read = futures_util::stream::iter(vec![Ok(ack_message(
             "H0STASP0",
@@ -799,19 +867,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 확인되지_않은_필수구독은_시간초과와_미확인목록을_남긴다() {
+    async fn 일부_거절돼도_성공이_있으면_연결된다() {
+        let subscriptions = vec![
+            ("H0STCNT0".into(), "000660".into()),
+            ("H0STASP0".into(), "0193T0".into()),
+        ];
+        let messages = vec![
+            Ok(ack_message("H0STCNT0", "000660", "0", "SUBSCRIBE SUCCESS")),
+            Ok(ack_message("H0STASP0", "0193T0", "9", "TOO MANY REQUESTS")),
+        ];
+        let mut read = futures_util::stream::iter(messages);
+        let mut write = RecordingSink::default();
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut aes = None;
+
+        confirm_subscriptions(
+            &mut read,
+            &mut write,
+            &tx,
+            &subscriptions,
+            &mut aes,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(rx.recv().await, Some(FeedEvent::Conn(true))));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn 성공이_하나도_없는_시간초과는_미확인목록과_함께_실패한다() {
         let subscriptions = vec![
             ("H0STCNT0".into(), "000660".into()),
             ("H0STASP0".into(), "0197X0".into()),
         ];
-        let messages = vec![Ok(ack_message(
-            "H0STCNT0",
-            "000660",
-            "0",
-            "SUBSCRIBE SUCCESS",
-        ))];
-        let mut read = futures_util::stream::iter(messages)
-            .chain(futures_util::stream::pending::<Result<Message, WsError>>());
+        let mut read = futures_util::stream::pending::<Result<Message, WsError>>();
         let mut write = RecordingSink::default();
         let (tx, mut rx) = mpsc::channel(1);
         let mut aes = None;
@@ -829,7 +920,100 @@ mod tests {
         .to_string();
 
         assert!(error.contains("시간 초과"), "{error}");
+        assert!(error.contains("H0STCNT0/000660"), "{error}");
         assert!(error.contains("H0STASP0/0197X0"), "{error}");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn 성공이_하나라도_있으면_시간초과여도_연결된다() {
+        let subscriptions = vec![
+            ("H0STCNT0".into(), "000660".into()),
+            ("H0STASP0".into(), "0197X0".into()),
+        ];
+        let messages = vec![Ok(ack_message(
+            "H0STCNT0",
+            "000660",
+            "0",
+            "SUBSCRIBE SUCCESS",
+        ))];
+        let mut read = futures_util::stream::iter(messages)
+            .chain(futures_util::stream::pending::<Result<Message, WsError>>());
+        let mut write = RecordingSink::default();
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut aes = None;
+
+        confirm_subscriptions(
+            &mut read,
+            &mut write,
+            &tx,
+            &subscriptions,
+            &mut aes,
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(rx.recv().await, Some(FeedEvent::Conn(true))));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn 이미_구독중_거절은_성공으로_취급한다() {
+        let subscriptions = vec![("H0STCNT0".into(), "000660".into())];
+        let mut read = futures_util::stream::iter(vec![Ok(ack_message(
+            "H0STCNT0",
+            "000660",
+            "1",
+            "ALREADY IN SUBSCRIBE",
+        ))]);
+        let mut write = RecordingSink::default();
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut aes = None;
+
+        confirm_subscriptions(
+            &mut read,
+            &mut write,
+            &tx,
+            &subscriptions,
+            &mut aes,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(rx.recv().await, Some(FeedEvent::Conn(true))));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn 데이터프레임만_흐르면_ack없이_시간초과여도_연결된다() {
+        let subscriptions = vec![("H0STCNT0".into(), "000660".into())];
+        let mut fields = vec!["0"; 46];
+        fields[0] = "000660";
+        fields[1] = "100001";
+        fields[2] = "185000";
+        fields[12] = "10";
+        let data = Message::Text(format!("0|H0STCNT0|001|{}", fields.join("^")).into());
+        let mut read = futures_util::stream::iter(vec![Ok(data)])
+            .chain(futures_util::stream::pending::<Result<Message, WsError>>());
+        let mut write = RecordingSink::default();
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut aes = None;
+
+        confirm_subscriptions(
+            &mut read,
+            &mut write,
+            &tx,
+            &subscriptions,
+            &mut aes,
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(rx.recv().await, Some(FeedEvent::Quote(_))));
+        assert!(matches!(rx.recv().await, Some(FeedEvent::Conn(true))));
         assert!(rx.try_recv().is_err());
     }
 }

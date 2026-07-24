@@ -143,8 +143,29 @@ impl TokenManager {
         }
     }
 
-    /// 웹소켓 접속키 발급
-    pub async fn ws_approval_key(&self) -> AppResult<String> {
+    /// 웹소켓 접속키 발급자 생성. 재접속 태스크가 소유할 수 있게 자격을 복제해 담는다.
+    pub fn approval_issuer(&self) -> ApprovalKeyIssuer {
+        ApprovalKeyIssuer {
+            http: self.http.clone(),
+            base: self.base.clone(),
+            app_key: self.app_key.clone(),
+            app_secret: self.app_secret.clone(),
+        }
+    }
+}
+
+/// 웹소켓 접속키 발급자. 재접속 시도마다 새 키를 발급해,
+/// 무효화된 키로 전 구독이 거절되는 영구 재접속 루프를 막는다.
+#[derive(Clone)]
+pub struct ApprovalKeyIssuer {
+    http: reqwest::Client,
+    base: String,
+    app_key: String,
+    app_secret: String,
+}
+
+impl ApprovalKeyIssuer {
+    pub async fn issue(&self) -> AppResult<String> {
         let body = serde_json::json!({
             "grant_type": "client_credentials",
             "appkey": self.app_key,
