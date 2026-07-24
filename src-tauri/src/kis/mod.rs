@@ -177,6 +177,7 @@ impl Broker for KisBroker {
         &self,
         codes: Vec<String>,
         tx: mpsc::Sender<FeedEvent>,
+        reconnect: std::sync::Arc<tokio::sync::Notify>,
     ) -> AppResult<Vec<JoinHandle<()>>> {
         let mut trade_codes: Vec<String> = self
             .settings
@@ -202,6 +203,7 @@ impl Broker for KisBroker {
             approval: self.rest.token.approval_issuer(),
             subs: build_subs(&codes, &trade_codes),
             notice,
+            reconnect,
         };
         Ok(vec![ws::spawn_ws(cfg, tx)])
     }

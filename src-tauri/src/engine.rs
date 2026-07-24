@@ -59,6 +59,12 @@ const STOP_LOSS_RELOCK: std::time::Duration = std::time::Duration::from_secs(5);
 const QUOTE_FRESH_SECS: i64 = 10;
 /// 스냅샷 실패 시 이 초수 이내의 캐시는 최후 수단으로 허용
 const QUOTE_STALE_LIMIT_SECS: i64 = 60;
+/// 자동매매 종목의 체결·호가 중 한쪽 스트림만 죽은(미수신) 상태가 이 시간 지속되면
+/// 피드 감시견이 웹소켓 전체 재접속을 요청한다. 반대쪽 스트림이 신선할 때만
+/// 판정하므로 시장이 조용한 것과 구독이 죽은 것을 혼동하지 않는다.
+const FEED_HALF_DEAD_RECONNECT_SECS: i64 = 60;
+/// 감시견 재접속 요청의 최소 간격 — 재접속 백필 버스트가 유량을 치지 않게 제한.
+const FEED_WATCHDOG_MIN_GAP_SECS: i64 = 300;
 const ACCOUNT_REFRESH_SECS: u64 = 30;
 const AUTOMATION_STATE_KEY: &str = "automation_runtime_v1";
 const AUTOMATION_BUNDLE_STATE_KEY: &str = "automation_runtime_bundle_v2";
@@ -427,6 +433,12 @@ pub struct Engine {
     automation_feed_generation: AtomicU64,
     /// 반전 seed는 이 시각 이후에 새로 관측된 기준선 시험만 인정한다.
     automation_feed_reset_epoch: AtomicI64,
+    /// 피드 감시견이 WS 태스크에 전체 재접속을 요청하는 신호.
+    feed_reconnect: Arc<tokio::sync::Notify>,
+    /// 한쪽 스트림만 죽은 상태가 처음 관측된 fake epoch. 0 = 정상.
+    feed_half_dead_since: AtomicI64,
+    /// 감시견이 마지막으로 재접속을 요청한 fake epoch.
+    feed_watchdog_last_fired: AtomicI64,
     auto_flatten_pending: AtomicBool,
     entry_reconcile_pending: AtomicBool,
     exit_reconcile_pending: AtomicBool,
@@ -629,6 +641,9 @@ pub async fn start(
         automation_feed_seen_connection: AtomicBool::new(false),
         automation_feed_generation: AtomicU64::new(0),
         automation_feed_reset_epoch: AtomicI64::new(0),
+        feed_reconnect: Arc::new(tokio::sync::Notify::new()),
+        feed_half_dead_since: AtomicI64::new(0),
+        feed_watchdog_last_fired: AtomicI64::new(0),
         auto_flatten_pending: AtomicBool::new(false),
         entry_reconcile_pending: AtomicBool::new(false),
         exit_reconcile_pending: AtomicBool::new(false),
@@ -696,7 +711,13 @@ pub async fn start(
 
     let (tx, rx) = mpsc::channel::<FeedEvent>(512);
     *engine.automation_feed_tx.lock().unwrap() = Some(tx.clone());
-    let mut tasks = broker.start_feed(settings.all_codes(), tx).await?;
+    let mut tasks = broker
+        .start_feed(
+            settings.all_codes(),
+            tx,
+            Arc::clone(&engine.feed_reconnect),
+        )
+        .await?;
 
     tasks.push(tokio::spawn(consume_feed(Arc::clone(&engine), rx)));
     tasks.push(tokio::spawn(periodic_refresh(Arc::clone(&engine))));
@@ -711,11 +732,20 @@ pub async fn start(
         .iter()
         .map(|s| s.code.clone())
         .collect();
-    let seed_codes: Vec<String> = settings
+    let mut seed_codes: Vec<String> = settings
         .trade_symbols
         .iter()
         .map(|s| s.code.clone())
         .collect();
+    // 자동매매 3종목(특히 trade_symbols에 없는 본주)은 신선도 검사가 현재가·호가를
+    // 요구하므로 같이 시드한다.
+    seed_codes.extend([
+        settings.auto_symbols.underlying.clone(),
+        settings.auto_symbols.leverage.clone(),
+        settings.auto_symbols.inverse.clone(),
+    ]);
+    seed_codes.sort();
+    seed_codes.dedup();
     tasks.push(tokio::spawn(async move {
         // 매매 종목 시세 1회 시드: 첫 틱 도착 전에도 수익률 기준가가 있고,
         // 기준 Quote 부재로 Book 이벤트가 버려지는 공백도 없앤다 (폴링 아님)
@@ -733,8 +763,9 @@ pub async fn start(
 }
 
 async fn consume_feed(engine: Arc<Engine>, mut rx: mpsc::Receiver<FeedEvent>) {
-    // 실가동 검증용: 종목별 첫 틱 로그로 구독이 실제 시세를 내려주는지 즉시 판별
+    // 실가동 검증용: 종목별 첫 틱·첫 호가 로그로 구독이 실제 시세를 내려주는지 즉시 판별
     let mut first_tick_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut first_book_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     while let Some(ev) = rx.recv().await {
         match ev {
             FeedEvent::Quote(mut q) => {
@@ -811,18 +842,38 @@ async fn consume_feed(engine: Arc<Engine>, mut rx: mpsc::Receiver<FeedEvent>) {
                 ts,
             } => {
                 let _market_guard = engine.automation_market_gate.lock().await;
+                if first_book_seen.insert(code.clone()) {
+                    tracing::info!("실시간 호가 첫 수신: {}", code);
+                }
                 let (merged, book_gap) = {
                     let mut map = engine.quotes.write().unwrap();
-                    let mut book_gap = false;
-                    let merged = map.get_mut(&code).map(|q| {
-                        book_gap = q.book_ts > 0 && ts.saturating_sub(q.book_ts) > QUOTE_FRESH_SECS;
-                        q.ask1 = ask1;
-                        q.bid1 = bid1;
-                        q.ask1_qty = ask1_qty;
-                        q.bid1_qty = bid1_qty;
-                        q.book_ts = ts;
-                        // 캐시에는 마지막 체결량을 남겨 LLM 입력에 전달하고, 호가
-                        // 이벤트 복사본만 volume=0으로 표시해 차트 중복 반영을 막는다.
+                    // 첫 체결보다 호가가 먼저 도착해도 book_ts를 잃지 않도록
+                    // 엔트리를 만들어 병합한다. 체결 전(가격 0)에는 캐시만 채우고
+                    // 프론트·자동매매로는 내보내지 않는다.
+                    let q = map.entry(code.clone()).or_insert_with(|| Quote {
+                        code: code.clone(),
+                        price: 0.0,
+                        change_rate: 0.0,
+                        ask1: 0.0,
+                        bid1: 0.0,
+                        ask1_qty: 0,
+                        bid1_qty: 0,
+                        volume: 0.0,
+                        trade_sequence: 0,
+                        received_at_micros: 0,
+                        trade_ts: 0,
+                        book_ts: 0,
+                    });
+                    let book_gap =
+                        q.book_ts > 0 && ts.saturating_sub(q.book_ts) > QUOTE_FRESH_SECS;
+                    q.ask1 = ask1;
+                    q.bid1 = bid1;
+                    q.ask1_qty = ask1_qty;
+                    q.bid1_qty = bid1_qty;
+                    q.book_ts = ts;
+                    // 캐시에는 마지막 체결량을 남겨 LLM 입력에 전달하고, 호가
+                    // 이벤트 복사본만 volume=0으로 표시해 차트 중복 반영을 막는다.
+                    let merged = (q.price > 0.0).then(|| {
                         let mut emitted = q.clone();
                         emitted.volume = 0.0;
                         emitted
@@ -3102,6 +3153,67 @@ impl Engine {
             .fetch_add(1, Ordering::SeqCst);
     }
 
+    /// 자동매매 종목 중 체결·호가 한쪽 스트림만 완전히 죽은(미수신) 종목을 찾는다.
+    /// 반대쪽 스트림이 신선할 때만 half-dead로 본다 — 시장이 조용한 것과
+    /// 구독이 죽은 것을 구분하는 기준이다. (예: 000660 체결은 흐르는데 호가는
+    /// ack만 성공하고 데이터가 전혀 안 오는 상태)
+    fn automation_feed_half_dead(&self, now: i64) -> Option<String> {
+        if !self.connected.load(Ordering::SeqCst) {
+            return None;
+        }
+        let settings = self.settings.read().unwrap();
+        let symbols = [
+            settings.auto_symbols.underlying.as_str(),
+            settings.auto_symbols.leverage.as_str(),
+            settings.auto_symbols.inverse.as_str(),
+        ];
+        let quotes = self.quotes.read().unwrap();
+        for code in symbols {
+            let Some(quote) = quotes.get(code) else {
+                continue;
+            };
+            let trade_fresh =
+                quote.trade_ts > 0 && now.saturating_sub(quote.trade_ts) <= QUOTE_FRESH_SECS;
+            let book_fresh =
+                quote.book_ts > 0 && now.saturating_sub(quote.book_ts) <= QUOTE_FRESH_SECS;
+            if trade_fresh && quote.book_ts <= 0 {
+                return Some(format!("{code} 체결은 수신 중이나 호가 미수신"));
+            }
+            if book_fresh && quote.trade_ts <= 0 {
+                return Some(format!("{code} 호가는 수신 중이나 체결 미수신"));
+            }
+        }
+        None
+    }
+
+    /// 피드 감시견 1초 판정. half-dead가 지속되면 WS 태스크에 전체 재접속
+    /// (새 접속키·전체 재구독)을 요청한다. 재구독 30초 루프로도 회복되지 않는
+    /// "ack 성공·데이터 무송신" 구독의 유일한 회복 경로다.
+    fn feed_watchdog_tick(&self, now: i64) {
+        let Some(reason) = self.automation_feed_half_dead(now) else {
+            self.feed_half_dead_since.store(0, Ordering::SeqCst);
+            return;
+        };
+        let since = self.feed_half_dead_since.load(Ordering::SeqCst);
+        if since == 0 {
+            self.feed_half_dead_since.store(now, Ordering::SeqCst);
+            return;
+        }
+        if now.saturating_sub(since) < FEED_HALF_DEAD_RECONNECT_SECS {
+            return;
+        }
+        let last_fired = self.feed_watchdog_last_fired.load(Ordering::SeqCst);
+        if last_fired > 0 && now.saturating_sub(last_fired) < FEED_WATCHDOG_MIN_GAP_SECS {
+            return;
+        }
+        self.feed_watchdog_last_fired.store(now, Ordering::SeqCst);
+        self.feed_half_dead_since.store(0, Ordering::SeqCst);
+        tracing::warn!(
+            "피드 감시견: {reason} 상태가 {FEED_HALF_DEAD_RECONNECT_SECS}초 지속 — 웹소켓 전체 재접속(새 접속키·전체 재구독)을 요청합니다"
+        );
+        self.feed_reconnect.notify_one();
+    }
+
     /// 재연결 직후 이전 연결의 10초 이내 시세가 우연히 신선해 보이는 것을 막는다.
     /// 가격 표시는 보존하되 세 종목 모두 새 체결·호가를 받은 뒤에만 LLM 입력을 허용한다.
     fn invalidate_automation_quote_freshness(&self) {
@@ -4476,6 +4588,9 @@ impl Engine {
         let now = self.automation_now();
         let monotonic = self.monotonic_now();
         let market_open = self.market_is_open();
+        if market_open {
+            self.feed_watchdog_tick(now);
+        }
         let schedule_changed = if !market_open {
             // 장부 Replaced와 runtime 그룹 제거 사이에 체결 확정이 끼지 않게
             // feed consumer와 같은 gate에서 두 전이를 연속 수행한다.
@@ -10679,6 +10794,9 @@ mod tests {
             automation_feed_seen_connection: AtomicBool::new(true),
             automation_feed_generation: AtomicU64::new(0),
             automation_feed_reset_epoch: AtomicI64::new(0),
+            feed_reconnect: Arc::new(tokio::sync::Notify::new()),
+            feed_half_dead_since: AtomicI64::new(0),
+            feed_watchdog_last_fired: AtomicI64::new(0),
             auto_flatten_pending: AtomicBool::new(false),
             entry_reconcile_pending: AtomicBool::new(false),
             exit_reconcile_pending: AtomicBool::new(false),
@@ -10888,6 +11006,173 @@ mod tests {
             .unwrap();
         assert_eq!(cached.volume, 321.0);
         assert_eq!(MarketQuoteInput::from(&cached).last_trade_volume, 321.0);
+    }
+
+    #[tokio::test]
+    async fn 체결_전에_도착한_호가는_버리지_않고_신규_엔트리로_병합한다() {
+        let settings = Settings::default();
+        let engine = test_engine(Arc::new(MockBroker::new(&settings)), settings);
+        let now = test_automation_now();
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(FeedEvent::Book {
+            code: "000660".into(),
+            ask1: 185_100.0,
+            bid1: 185_000.0,
+            ask1_qty: 2_000,
+            bid1_qty: 1_500,
+            ts: now,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        consume_feed(Arc::clone(&engine), rx).await;
+
+        let cached = engine
+            .quotes
+            .read()
+            .unwrap()
+            .get("000660")
+            .cloned()
+            .unwrap();
+        assert_eq!(cached.book_ts, now, "호가 시각이 유실되면 안 됨");
+        assert_eq!(cached.ask1, 185_100.0);
+        assert_eq!(cached.trade_ts, 0, "체결 수신 전이므로 체결 시각은 비어야 함");
+        assert_eq!(cached.price, 0.0, "체결 전에는 가격을 만들어내지 않는다");
+    }
+
+    /// 000660 체결은 흐르는데 호가만 미수신인 관측 사례를 그대로 재현한다.
+    fn make_half_dead(engine: &Engine, at: i64) {
+        let mut quotes = engine.quotes.write().unwrap();
+        let quote = quotes.get_mut("000660").unwrap();
+        quote.trade_ts = at;
+        quote.book_ts = 0;
+    }
+
+    #[test]
+    fn half_dead_판정은_반대쪽_스트림이_신선할_때만_참이다() {
+        let settings = Settings::default();
+        let engine = test_engine(Arc::new(MockBroker::new(&settings)), settings);
+        seed_shadow_quotes(&engine, 10, 10);
+        let now = test_automation_now();
+
+        assert!(engine.automation_feed_half_dead(now).is_none(), "정상 상태");
+
+        make_half_dead(&engine, now);
+        let reason = engine.automation_feed_half_dead(now).unwrap();
+        assert!(reason.contains("000660"), "{reason}");
+        assert!(reason.contains("호가 미수신"), "{reason}");
+
+        // 체결까지 낡으면 조용한 시장·완전 두절과 구분할 수 없으므로 미판정
+        engine
+            .quotes
+            .write()
+            .unwrap()
+            .get_mut("000660")
+            .unwrap()
+            .trade_ts = now - QUOTE_FRESH_SECS - 5;
+        assert!(engine.automation_feed_half_dead(now).is_none());
+
+        // 완전 두절(둘 다 0)도 미판정 — 연결 판정과 신선도 검사 소관
+        {
+            let mut quotes = engine.quotes.write().unwrap();
+            let quote = quotes.get_mut("000660").unwrap();
+            quote.trade_ts = 0;
+            quote.book_ts = 0;
+        }
+        assert!(engine.automation_feed_half_dead(now).is_none());
+    }
+
+    #[tokio::test]
+    async fn 감시견은_반사망_60초_지속_시_한_번만_재접속을_요청한다() {
+        let settings = Settings::default();
+        let engine = test_engine(Arc::new(MockBroker::new(&settings)), settings);
+        seed_shadow_quotes(&engine, 10, 10);
+        let start = test_automation_now();
+        let no_permit = |engine: &Arc<Engine>| {
+            let engine = Arc::clone(engine);
+            async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(10),
+                    engine.feed_reconnect.notified(),
+                )
+                .await
+                .is_err()
+            }
+        };
+
+        make_half_dead(&engine, start);
+        engine.feed_watchdog_tick(start);
+        make_half_dead(&engine, start + 30);
+        engine.feed_watchdog_tick(start + 30);
+        assert!(no_permit(&engine).await, "60초 전에는 요청하면 안 됨");
+
+        make_half_dead(&engine, start + 60);
+        engine.feed_watchdog_tick(start + 60);
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                engine.feed_reconnect.notified(),
+            )
+            .await
+            .is_ok(),
+            "60초 지속이면 재접속을 요청해야 함"
+        );
+
+        // 발동 후 5분(FEED_WATCHDOG_MIN_GAP_SECS) 이내에는 재요청하지 않는다
+        make_half_dead(&engine, start + 90);
+        engine.feed_watchdog_tick(start + 90);
+        make_half_dead(&engine, start + 200);
+        engine.feed_watchdog_tick(start + 200);
+        assert!(no_permit(&engine).await, "5분 이내 재요청 금지");
+
+        // 간격이 지나면 다시 요청할 수 있다
+        make_half_dead(&engine, start + 60 + FEED_WATCHDOG_MIN_GAP_SECS + 20);
+        engine.feed_watchdog_tick(start + 60 + FEED_WATCHDOG_MIN_GAP_SECS + 20);
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                engine.feed_reconnect.notified(),
+            )
+            .await
+            .is_ok(),
+            "간격 경과 후에는 다시 요청해야 함"
+        );
+    }
+
+    #[tokio::test]
+    async fn 감시견은_복구되면_지속_시간을_처음부터_다시_센다() {
+        let settings = Settings::default();
+        let engine = test_engine(Arc::new(MockBroker::new(&settings)), settings);
+        seed_shadow_quotes(&engine, 10, 10);
+        let start = test_automation_now();
+
+        make_half_dead(&engine, start);
+        engine.feed_watchdog_tick(start);
+
+        // 호가 복구 → 지속 시간 리셋
+        {
+            let mut quotes = engine.quotes.write().unwrap();
+            let quote = quotes.get_mut("000660").unwrap();
+            quote.trade_ts = start + 30;
+            quote.book_ts = start + 30;
+        }
+        engine.feed_watchdog_tick(start + 30);
+
+        // 다시 반사망 — 60초는 새로 세야 하므로 55초 지속으로는 미발동
+        make_half_dead(&engine, start + 40);
+        engine.feed_watchdog_tick(start + 40);
+        make_half_dead(&engine, start + 95);
+        engine.feed_watchdog_tick(start + 95);
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                engine.feed_reconnect.notified(),
+            )
+            .await
+            .is_err(),
+            "복구 후에는 지속 시간을 새로 계산해야 함"
+        );
     }
 
     #[tokio::test]
@@ -11365,6 +11650,7 @@ mod tests {
             &self,
             _codes: Vec<String>,
             _tx: mpsc::Sender<FeedEvent>,
+            _reconnect: std::sync::Arc<tokio::sync::Notify>,
         ) -> AppResult<Vec<JoinHandle<()>>> {
             Ok(Vec::new())
         }
@@ -11479,6 +11765,7 @@ mod tests {
             &self,
             _codes: Vec<String>,
             _tx: mpsc::Sender<FeedEvent>,
+            _reconnect: std::sync::Arc<tokio::sync::Notify>,
         ) -> AppResult<Vec<JoinHandle<()>>> {
             Ok(Vec::new())
         }
@@ -11583,6 +11870,7 @@ mod tests {
             &self,
             _codes: Vec<String>,
             _tx: mpsc::Sender<FeedEvent>,
+            _reconnect: std::sync::Arc<tokio::sync::Notify>,
         ) -> AppResult<Vec<JoinHandle<()>>> {
             Ok(Vec::new())
         }
@@ -11657,6 +11945,7 @@ mod tests {
             &self,
             _codes: Vec<String>,
             _tx: mpsc::Sender<FeedEvent>,
+            _reconnect: std::sync::Arc<tokio::sync::Notify>,
         ) -> AppResult<Vec<JoinHandle<()>>> {
             Ok(Vec::new())
         }
@@ -11771,6 +12060,7 @@ mod tests {
             &self,
             _codes: Vec<String>,
             _tx: mpsc::Sender<FeedEvent>,
+            _reconnect: std::sync::Arc<tokio::sync::Notify>,
         ) -> AppResult<Vec<JoinHandle<()>>> {
             Ok(Vec::new())
         }
@@ -11919,6 +12209,7 @@ mod tests {
             &self,
             _codes: Vec<String>,
             _tx: mpsc::Sender<FeedEvent>,
+            _reconnect: std::sync::Arc<tokio::sync::Notify>,
         ) -> AppResult<Vec<JoinHandle<()>>> {
             Ok(Vec::new())
         }
@@ -13981,6 +14272,7 @@ mod tests {
             &self,
             _codes: Vec<String>,
             _tx: mpsc::Sender<FeedEvent>,
+            _reconnect: std::sync::Arc<tokio::sync::Notify>,
         ) -> AppResult<Vec<JoinHandle<()>>> {
             Ok(Vec::new())
         }
@@ -14087,6 +14379,7 @@ mod tests {
             &self,
             _codes: Vec<String>,
             _tx: mpsc::Sender<FeedEvent>,
+            _reconnect: std::sync::Arc<tokio::sync::Notify>,
         ) -> AppResult<Vec<JoinHandle<()>>> {
             Ok(Vec::new())
         }
@@ -14145,6 +14438,7 @@ mod tests {
             &self,
             _codes: Vec<String>,
             _tx: mpsc::Sender<FeedEvent>,
+            _reconnect: std::sync::Arc<tokio::sync::Notify>,
         ) -> AppResult<Vec<JoinHandle<()>>> {
             Ok(Vec::new())
         }
@@ -15344,6 +15638,7 @@ mod tests {
             &self,
             _codes: Vec<String>,
             _tx: mpsc::Sender<FeedEvent>,
+            _reconnect: std::sync::Arc<tokio::sync::Notify>,
         ) -> AppResult<Vec<JoinHandle<()>>> {
             Ok(Vec::new())
         }
@@ -15780,6 +16075,7 @@ mod tests {
             &self,
             _codes: Vec<String>,
             _tx: mpsc::Sender<FeedEvent>,
+            _reconnect: std::sync::Arc<tokio::sync::Notify>,
         ) -> AppResult<Vec<JoinHandle<()>>> {
             Ok(Vec::new())
         }

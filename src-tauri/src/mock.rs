@@ -435,6 +435,7 @@ impl Broker for MockBroker {
         &self,
         codes: Vec<String>,
         tx: mpsc::Sender<FeedEvent>,
+        _reconnect: std::sync::Arc<tokio::sync::Notify>,
     ) -> AppResult<Vec<JoinHandle<()>>> {
         *self.tx.lock().unwrap() = Some(tx.clone());
         let market = Arc::clone(&self.market);

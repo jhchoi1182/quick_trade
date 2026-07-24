@@ -21,6 +21,9 @@ const SUBSCRIBE_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 /// 거절·미확인 구독의 재구독 주기. 일시적 거절이나 ack 유실을 연결을 유지한 채
 /// 자기치유한다 — 이미 구독된 경우는 ALREADY IN SUBSCRIBE 응답이 성공 처리된다.
 const RESUBSCRIBE_INTERVAL: Duration = Duration::from_secs(30);
+/// 재구독을 이 횟수까지 시도해도 미확인 구독이 남으면 세션 상태가 꼬였다고 보고
+/// 전체 재접속(새 접속키·전체 재구독)으로 승격한다. 30초 주기 기준 약 5분.
+const RESUBSCRIBE_MAX_ATTEMPTS: u32 = 10;
 
 type SubscriptionId = (String, String);
 
@@ -43,6 +46,9 @@ pub struct WsConfig {
     pub subs: Vec<(String, String)>,
     /// 체결통보 구독: (tr_id, HTS ID)
     pub notice: Option<(String, String)>,
+    /// 엔진 감시견의 전체 재접속 요청 신호. notify_one의 저장 퍼밋 덕분에
+    /// 재접속 중에 도착한 요청도 다음 수신 루프 진입 시 소비된다.
+    pub reconnect: std::sync::Arc<tokio::sync::Notify>,
 }
 
 pub fn spawn_ws(cfg: WsConfig, tx: mpsc::Sender<FeedEvent>) -> JoinHandle<()> {
@@ -145,6 +151,14 @@ fn is_already_subscribed(msg: &str) -> bool {
     msg.to_ascii_uppercase().contains("ALREADY IN SUBSCRIBE")
 }
 
+/// 같은 app key의 웹소켓 세션이 이미 살아있을 때의 접속 거절(OPSP8996
+/// "ALREADY IN USE appkey"). KIS는 app key당 세션 1개만 허용하며 두 번째 접속은
+/// 이 응답 후 즉시 리셋된다. 다른 앱 인스턴스(개발 실행·설치본 동시 구동)나
+/// 직전 세션의 서버측 정리 지연이 원인이다.
+fn is_appkey_in_use(msg: &str) -> bool {
+    msg.to_ascii_uppercase().contains("ALREADY IN USE")
+}
+
 fn apply_subscribe_ack(
     state: &mut SubscriptionConfirmation,
     aes_key_iv: &mut Option<(String, String)>,
@@ -157,6 +171,17 @@ fn apply_subscribe_ack(
                 "요청 목록에 없는 웹소켓 구독 성공 응답: {}/{}",
                 ack.tr_id,
                 ack.tr_key
+            );
+        } else if ack.success {
+            tracing::info!("웹소켓 구독 성공: {}/{}", ack.tr_id, ack.tr_key);
+        } else {
+            // KIS 등록은 세션 단위라 새 세션의 첫 확인에서 ALREADY IN SUBSCRIBE는
+            // 정상적으로 나올 수 없다 — 데이터가 다른 세션으로 흐르는 혼선의 증거로 남긴다.
+            tracing::warn!(
+                "새 세션 구독 확인에서 ALREADY IN SUBSCRIBE({}/{}) — 세션 혼선 의심: {}",
+                ack.tr_id,
+                ack.tr_key,
+                ack.message
             );
         }
         // ack의 tr_key가 요청과 어긋나도 접속키가 살아있다는 증거이므로 성공으로 센다.
@@ -225,6 +250,14 @@ where
                                 .await
                                 .map_err(ws_err)?;
                         } else if let Some(ack) = subscribe_ack(txt) {
+                            // 이 응답 뒤 서버가 연결을 리셋하므로 5초 타임아웃을
+                            // 기다리지 않고 즉시 실패시켜 백오프 재접속으로 넘긴다.
+                            if is_appkey_in_use(&ack.message) {
+                                return Err(AppError::Kis(format!(
+                                    "같은 app key의 웹소켓 세션이 이미 존재해 접속이 거절됐습니다({}) — 다른 앱 인스턴스(개발 실행/설치본 동시 구동)를 종료했는지 확인하세요",
+                                    ack.message
+                                )));
+                            }
                             apply_subscribe_ack(&mut state, aes_key_iv, ack);
                         }
                     } else {
@@ -330,12 +363,15 @@ async fn run_once(cfg: &WsConfig, tx: &mpsc::Sender<FeedEvent>) -> AppResult<()>
         unconfirmed,
         aes_key_iv,
         RESUBSCRIBE_INTERVAL,
+        &cfg.reconnect,
     )
     .await
 }
 
 /// 구독 확인 이후의 수신 루프. 미확인 구독은 주기적으로 재구독을 시도해
-/// 일시적 거절·ack 유실을 연결을 유지한 채 자기치유한다.
+/// 일시적 거절·ack 유실을 연결을 유지한 채 자기치유한다. 재구독이 상한을
+/// 넘거나 엔진 감시견이 재접속을 요청하면 Err로 탈출해 전체 재접속한다.
+#[allow(clippy::too_many_arguments)]
 async fn consume_stream<R, W>(
     read: &mut R,
     write: &mut W,
@@ -344,6 +380,7 @@ async fn consume_stream<R, W>(
     mut unconfirmed: HashSet<SubscriptionId>,
     mut aes_key_iv: Option<(String, String)>,
     resubscribe_interval: Duration,
+    reconnect: &tokio::sync::Notify,
 ) -> AppResult<()>
 where
     R: Stream<Item = Result<Message, WsError>> + Unpin,
@@ -354,12 +391,25 @@ where
         resubscribe_interval,
     );
     resubscribe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut resubscribe_attempts = 0u32;
     loop {
         let msg = tokio::select! {
             msg = read.next() => msg,
+            _ = reconnect.notified() => {
+                return Err(AppError::Kis(
+                    "엔진 감시견 요청으로 웹소켓을 전체 재접속합니다".into(),
+                ));
+            }
             _ = resubscribe.tick(), if !unconfirmed.is_empty() => {
+                resubscribe_attempts += 1;
+                if resubscribe_attempts > RESUBSCRIBE_MAX_ATTEMPTS {
+                    return Err(AppError::Kis(format!(
+                        "웹소켓 재구독 {RESUBSCRIBE_MAX_ATTEMPTS}회 시도에도 미확인 구독이 남아 전체 재접속합니다: {}",
+                        pending_subscriptions(&unconfirmed)
+                    )));
+                }
                 tracing::info!(
-                    "웹소켓 미확인 구독 {}건 재구독 시도: {}",
+                    "웹소켓 미확인 구독 {}건 재구독 시도({resubscribe_attempts}/{RESUBSCRIBE_MAX_ATTEMPTS}): {}",
                     unconfirmed.len(),
                     pending_subscriptions(&unconfirmed)
                 );
@@ -397,6 +447,13 @@ where
                             if let Some(keys) = ack.aes_key_iv {
                                 aes_key_iv = Some(keys);
                             }
+                        } else if is_appkey_in_use(&ack.message) {
+                            // 서버가 이 세션을 두 번째 접속으로 판정한 상태 — 곧
+                            // 리셋되므로 즉시 전체 재접속으로 넘긴다.
+                            return Err(AppError::Kis(format!(
+                                "웹소켓 세션이 app key 중복으로 거절됐습니다({}) — 전체 재접속합니다",
+                                ack.message
+                            )));
                         } else {
                             // 지연 도착한 거절 ack가 살아있는 연결을 통째로 끊지 않게 한다
                             tracing::warn!(
@@ -1121,6 +1178,7 @@ mod tests {
         let sent = Arc::clone(&write.sent);
         let (tx, _rx) = mpsc::channel(4);
         let unconfirmed = HashSet::from([("H0STASP0".to_string(), "0197X0".to_string())]);
+        let reconnect = tokio::sync::Notify::new();
 
         let _ = tokio::time::timeout(
             Duration::from_millis(90),
@@ -1132,6 +1190,7 @@ mod tests {
                 unconfirmed,
                 None,
                 Duration::from_millis(20),
+                &reconnect,
             ),
         )
         .await;
@@ -1157,6 +1216,7 @@ mod tests {
         let sent = Arc::clone(&write.sent);
         let (tx, _rx) = mpsc::channel(4);
         let unconfirmed = HashSet::from([("H0STASP0".to_string(), "0197X0".to_string())]);
+        let reconnect = tokio::sync::Notify::new();
 
         let _ = tokio::time::timeout(
             Duration::from_millis(80),
@@ -1168,6 +1228,7 @@ mod tests {
                 unconfirmed,
                 None,
                 Duration::from_millis(20),
+                &reconnect,
             ),
         )
         .await;
@@ -1192,6 +1253,7 @@ mod tests {
         let mut write = RecordingSink::default();
         let (tx, mut rx) = mpsc::channel(4);
 
+        let reconnect = tokio::sync::Notify::new();
         let error = consume_stream(
             &mut read,
             &mut write,
@@ -1200,6 +1262,7 @@ mod tests {
             HashSet::new(),
             None,
             Duration::from_secs(1),
+            &reconnect,
         )
         .await
         .unwrap_err()
@@ -1207,5 +1270,96 @@ mod tests {
 
         assert!(error.contains("스트림 종료"), "{error}");
         assert!(matches!(rx.recv().await, Some(FeedEvent::Quote(_))));
+    }
+
+    #[tokio::test]
+    async fn 재구독_상한을_넘기면_전체_재접속으로_승격한다() {
+        let mut read = futures_util::stream::pending::<Result<Message, WsError>>();
+        let mut write = RecordingSink::default();
+        let (tx, _rx) = mpsc::channel(4);
+        let unconfirmed = HashSet::from([("H0STASP0".to_string(), "000660".to_string())]);
+        let reconnect = tokio::sync::Notify::new();
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            consume_stream(
+                &mut read,
+                &mut write,
+                &tx,
+                "approval",
+                unconfirmed,
+                None,
+                Duration::from_millis(5),
+                &reconnect,
+            ),
+        )
+        .await
+        .expect("상한 도달 전에 시간 초과")
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("재구독"), "{error}");
+        assert!(error.contains("H0STASP0/000660"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn 감시견_재접속_요청은_저장_퍼밋으로도_수신루프를_탈출시킨다() {
+        let mut read = futures_util::stream::pending::<Result<Message, WsError>>();
+        let mut write = RecordingSink::default();
+        let (tx, _rx) = mpsc::channel(4);
+        let reconnect = tokio::sync::Notify::new();
+        // 수신 루프 진입 전에 도착한 요청도 notify_one의 저장 퍼밋으로 소비돼야 한다.
+        reconnect.notify_one();
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            consume_stream(
+                &mut read,
+                &mut write,
+                &tx,
+                "approval",
+                HashSet::new(),
+                None,
+                Duration::from_secs(30),
+                &reconnect,
+            ),
+        )
+        .await
+        .expect("감시견 요청이 소비되지 않아 시간 초과")
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("감시견"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn appkey_중복_접속_거절은_확인_단계에서_즉시_실패한다() {
+        // 프로브로 실측한 실제 응답: tr_id "(null)", tr_key 없음, OPSP8996
+        let rejection = Message::Text(
+            r#"{"header":{"tr_id":"(null)","tr_key":"","encrypt":"N"},"body":{"rt_cd":"9","msg_cd":"OPSP8996","msg1":"ALREADY IN USE appkey"}}"#
+                .to_string()
+                .into(),
+        );
+        let subscriptions = vec![("H0STCNT0".into(), "000660".into())];
+        let mut read = futures_util::stream::iter(vec![Ok(rejection)])
+            .chain(futures_util::stream::pending::<Result<Message, WsError>>());
+        let mut write = RecordingSink::default();
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut aes = None;
+
+        let error = confirm_subscriptions(
+            &mut read,
+            &mut write,
+            &tx,
+            &subscriptions,
+            &mut aes,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("app key"), "{error}");
+        assert!(rx.try_recv().is_err(), "Conn(true)가 발신되면 안 됨");
     }
 }

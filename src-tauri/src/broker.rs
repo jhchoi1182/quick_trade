@@ -204,10 +204,12 @@ pub trait Broker: Send + Sync {
         Ok(None)
     }
 
-    /// 실시간 피드 시작. 생성된 백그라운드 태스크 핸들을 반환한다 (엔진 재시작 시 abort용)
+    /// 실시간 피드 시작. 생성된 백그라운드 태스크 핸들을 반환한다 (엔진 재시작 시 abort용).
+    /// `reconnect`는 엔진 감시견의 전체 재접속 요청 신호 — 실브로커만 사용한다.
     async fn start_feed(
         &self,
         codes: Vec<String>,
         tx: mpsc::Sender<FeedEvent>,
+        reconnect: std::sync::Arc<tokio::sync::Notify>,
     ) -> AppResult<Vec<JoinHandle<()>>>;
 }
