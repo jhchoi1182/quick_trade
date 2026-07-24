@@ -3028,9 +3028,9 @@ impl Engine {
         self.persist_automation();
     }
 
-    fn auto_quotes_fresh(&self, now: i64) -> bool {
+    fn auto_quotes_freshness_error(&self, now: i64) -> Option<String> {
         if !self.connected.load(Ordering::SeqCst) {
-            return false;
+            return Some("자동매매 시세 신선도 검사 실패: 실시간 웹소켓 연결 끊김".into());
         }
         let settings = self.settings.read().unwrap();
         let symbols = [
@@ -3039,17 +3039,58 @@ impl Engine {
             settings.auto_symbols.inverse.as_str(),
         ];
         let quotes = self.quotes.read().unwrap();
-        symbols.iter().all(|code| {
-            quotes.get(*code).is_some_and(|quote| {
-                quote.price > 0.0
-                    && quote.ask1 > 0.0
-                    && quote.bid1 > 0.0
-                    && quote.trade_ts <= now
-                    && quote.book_ts <= now
-                    && now.saturating_sub(quote.trade_ts) <= QUOTE_FRESH_SECS
-                    && now.saturating_sub(quote.book_ts) <= QUOTE_FRESH_SECS
-            })
-        })
+        let mut issues = Vec::new();
+        for code in symbols {
+            let Some(quote) = quotes.get(code) else {
+                issues.push(format!("{code}[시세 없음]"));
+                continue;
+            };
+            let mut quote_issues = Vec::new();
+            if !(quote.price > 0.0) {
+                quote_issues.push("현재가 오류".to_string());
+            }
+            if !(quote.ask1 > 0.0) {
+                quote_issues.push("매도1호가 오류".to_string());
+            }
+            if !(quote.bid1 > 0.0) {
+                quote_issues.push("매수1호가 오류".to_string());
+            }
+            if quote.trade_ts <= 0 {
+                quote_issues.push("체결 미수신".to_string());
+            } else if quote.trade_ts > now {
+                quote_issues.push(format!(
+                    "체결 시각이 {}초 미래",
+                    quote.trade_ts.saturating_sub(now)
+                ));
+            } else {
+                let age = now.saturating_sub(quote.trade_ts);
+                if age > QUOTE_FRESH_SECS {
+                    quote_issues.push(format!("체결 {age}초 경과"));
+                }
+            }
+            if quote.book_ts <= 0 {
+                quote_issues.push("호가 미수신".to_string());
+            } else if quote.book_ts > now {
+                quote_issues.push(format!(
+                    "호가 시각이 {}초 미래",
+                    quote.book_ts.saturating_sub(now)
+                ));
+            } else {
+                let age = now.saturating_sub(quote.book_ts);
+                if age > QUOTE_FRESH_SECS {
+                    quote_issues.push(format!("호가 {age}초 경과"));
+                }
+            }
+            if !quote_issues.is_empty() {
+                issues.push(format!("{code}[{}]", quote_issues.join(", ")));
+            }
+        }
+        (!issues.is_empty())
+            .then(|| format!("자동매매 시세 신선도 검사 실패: {}", issues.join("; ")))
+    }
+
+    fn auto_quotes_fresh(&self, now: i64) -> bool {
+        self.auto_quotes_freshness_error(now).is_none()
     }
 
     fn mark_automation_feed_reset(&self) {
@@ -4631,8 +4672,8 @@ impl Engine {
         let (bars, as_of_epoch, underlying, leverage, inverse, marker) = {
             let _market_guard = self.automation_market_gate.lock().await;
             let now = now_kst_fake_epoch();
-            if !self.auto_quotes_fresh(now) {
-                return Err("세 종목의 체결·호가가 모두 10초 이내가 아닙니다".into());
+            if let Some(error) = self.auto_quotes_freshness_error(now) {
+                return Err(error);
             }
             let bars = self
                 .market_history
@@ -4703,8 +4744,8 @@ impl Engine {
             .await
             .map_err(|error| format!("응답 적용용 최근 1분봉 확인 실패: {error}"))?;
         let now = now_kst_fake_epoch();
-        if !self.auto_quotes_fresh(now) {
-            return Err("응답 적용 시 세 종목의 최신 체결·호가를 확인할 수 없습니다".into());
+        if let Some(error) = self.auto_quotes_freshness_error(now) {
+            return Err(format!("응답 적용 시 {error}"));
         }
         let quote = self
             .quotes
@@ -10923,6 +10964,43 @@ mod tests {
         assert_eq!(engine.automation_feed_generation.load(Ordering::SeqCst), 2);
         assert!(engine.automation_feed_reset_epoch.load(Ordering::SeqCst) > 0);
         assert!(!engine.auto_quotes_fresh(test_automation_now()));
+    }
+
+    #[test]
+    fn 자동시세_신선도오류는_종목과_체결호가원인을_구분한다() {
+        let settings = Settings::default();
+        let engine = test_engine(Arc::new(MockBroker::new(&settings)), settings);
+        let now = engine.automation_now();
+        seed_shadow_quotes(&engine, 10_000, 10_000);
+
+        assert!(engine.auto_quotes_fresh(now));
+        assert_eq!(engine.auto_quotes_freshness_error(now), None);
+
+        engine
+            .quotes
+            .write()
+            .unwrap()
+            .get_mut("0197X0")
+            .unwrap()
+            .book_ts = now - QUOTE_FRESH_SECS - 1;
+        let stale_book = engine.auto_quotes_freshness_error(now).unwrap();
+        assert!(stale_book.contains("0197X0"), "{stale_book}");
+        assert!(stale_book.contains("호가 11초 경과"), "{stale_book}");
+        assert!(!stale_book.contains("000660["), "{stale_book}");
+
+        {
+            let mut quotes = engine.quotes.write().unwrap();
+            let inverse = quotes.get_mut("0197X0").unwrap();
+            inverse.book_ts = now;
+            inverse.trade_ts = 0;
+        }
+        let missing_trade = engine.auto_quotes_freshness_error(now).unwrap();
+        assert!(missing_trade.contains("0197X0"), "{missing_trade}");
+        assert!(missing_trade.contains("체결 미수신"), "{missing_trade}");
+
+        engine.connected.store(false, Ordering::SeqCst);
+        let disconnected = engine.auto_quotes_freshness_error(now).unwrap();
+        assert!(disconnected.contains("웹소켓 연결 끊김"), "{disconnected}");
     }
 
     fn prepare_shadow_scenario(engine: &Engine) -> (u64, i64, Duration) {
