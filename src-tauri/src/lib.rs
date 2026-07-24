@@ -39,6 +39,7 @@ pub fn run() {
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let state = handle.state::<AppState>();
+                let _lifecycle = state.engine_lifecycle.write().await;
                 let settings = state.settings.read().unwrap().clone();
                 match engine::start(handle.clone(), settings, Arc::clone(&state.ledger)).await {
                     Ok(engine_handle) => {

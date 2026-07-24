@@ -55,6 +55,7 @@ pub async fn save_settings(
     if settings.auto_symbols != AutoSymbols::default() {
         return Err("자동매매 종목은 SK하이닉스 000660 / 0193T0 / 0197X0으로 고정됩니다".into());
     }
+    let _lifecycle = state.engine_lifecycle.write().await;
     let old = state.settings.read().unwrap().clone();
     let mut guard = state.engine.lock().await;
     let restart = guard.is_none() || needs_engine_restart(&old, &settings);
@@ -89,24 +90,28 @@ pub async fn save_settings(
 
 #[tauri::command]
 pub async fn get_candles(state: State<'_, AppState>, code: String) -> Result<Vec<Candle>, String> {
+    let _lifecycle = state.engine_lifecycle.read().await;
     let engine = engine_of(&state).await?;
     engine.candles(&code).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn get_account(state: State<'_, AppState>) -> Result<AccountSnapshot, String> {
+    let _lifecycle = state.engine_lifecycle.read().await;
     let engine = engine_of(&state).await?;
     Ok(engine.account_snapshot())
 }
 
 #[tauri::command]
 pub async fn buy_max(state: State<'_, AppState>, code: String) -> Result<OrderResult, String> {
+    let _lifecycle = state.engine_lifecycle.read().await;
     let engine = engine_of(&state).await?;
     Ok(engine.buy_max(&code).await)
 }
 
 #[tauri::command]
 pub async fn sell_all(state: State<'_, AppState>, code: String) -> Result<OrderResult, String> {
+    let _lifecycle = state.engine_lifecycle.read().await;
     let engine = engine_of(&state).await?;
     Ok(engine.sell_all(&code).await)
 }
@@ -118,6 +123,7 @@ pub async fn place_reserved_sell(
     code: String,
     target_pct: f64,
 ) -> Result<OrderResult, String> {
+    let _lifecycle = state.engine_lifecycle.read().await;
     let engine = engine_of(&state).await?;
     Ok(engine.place_reserved_sell(&code, target_pct).await)
 }
@@ -127,12 +133,14 @@ pub async fn cancel_reserved_sell(
     state: State<'_, AppState>,
     code: String,
 ) -> Result<OrderResult, String> {
+    let _lifecycle = state.engine_lifecycle.read().await;
     let engine = engine_of(&state).await?;
     Ok(engine.cancel_reserved_sell(&code).await)
 }
 
 #[tauri::command]
 pub async fn get_reservations(state: State<'_, AppState>) -> Result<Vec<ReservationInfo>, String> {
+    let _lifecycle = state.engine_lifecycle.read().await;
     let engine = engine_of(&state).await?;
     Ok(engine.get_reservations())
 }
@@ -141,6 +149,7 @@ pub async fn get_reservations(state: State<'_, AppState>) -> Result<Vec<Reservat
 pub async fn get_automation_status(
     state: State<'_, AppState>,
 ) -> Result<AutomationSnapshot, String> {
+    let _lifecycle = state.engine_lifecycle.read().await;
     let engine = engine_of(&state).await?;
     Ok(engine.automation_snapshot())
 }
@@ -150,6 +159,7 @@ pub async fn set_control_mode(
     state: State<'_, AppState>,
     mode: ControlMode,
 ) -> Result<AutomationSnapshot, String> {
+    let _lifecycle = state.engine_lifecycle.read().await;
     let engine = engine_of(&state).await?;
     engine.set_control_mode(mode).await
 }
@@ -163,6 +173,7 @@ pub async fn reset_runtime_and_resync(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<RuntimeResyncResult, String> {
+    let _lifecycle = state.engine_lifecycle.write().await;
     let settings = state.settings.read().unwrap().clone();
     let mut guard = state.engine.lock().await;
     if let Some(handle) = guard.as_ref() {

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { AutomationSnapshot } from "../types";
+import type { AutomationSnapshot, ControlMode } from "../types";
 
 const { getAutomationStatusMock, setControlModeMock } = vi.hoisted(() => ({
   getAutomationStatusMock: vi.fn(),
@@ -13,12 +13,17 @@ vi.mock("../lib/tauri", () => ({
 
 import { useAutomationStore } from "./automationStore";
 
-function snapshot(runtimeId: string, runtimeGeneration: number, revision: number): AutomationSnapshot {
+function snapshot(
+  runtimeId: string,
+  runtimeGeneration: number,
+  revision: number,
+  mode: ControlMode = "auto",
+): AutomationSnapshot {
   return {
     runtimeId,
     runtimeGeneration,
     revision,
-    mode: "auto",
+    mode,
     phase: "idle",
     nextDecisionAt: null,
     scenarios: [],
@@ -32,7 +37,7 @@ describe("automationStore 스냅샷 순서", () => {
     useAutomationStore.getState().stopPolling();
     getAutomationStatusMock.mockReset();
     setControlModeMock.mockReset();
-    useAutomationStore.setState({ snapshot: null, loading: false, changing: false });
+    useAutomationStore.setState({ snapshot: null, loading: false, changingTo: null });
   });
 
   afterEach(() => {
@@ -116,5 +121,67 @@ describe("automationStore 스냅샷 순서", () => {
       runtimeId: "engine-a",
       revision: 2,
     });
+  });
+
+  it("백엔드 응답 전에는 기존 모드를 유지하고 대상 모드만 전환 중으로 표시한다", async () => {
+    let resolveRequest: ((value: AutomationSnapshot) => void) | undefined;
+    setControlModeMock.mockImplementation(
+      () =>
+        new Promise<AutomationSnapshot>((resolve) => {
+          resolveRequest = resolve;
+        }),
+    );
+    useAutomationStore.setState({
+      snapshot: snapshot("engine-a", 1, 1, "manual"),
+    });
+
+    const changing = useAutomationStore.getState().changeMode("auto");
+
+    expect(useAutomationStore.getState().snapshot?.mode).toBe("manual");
+    expect(useAutomationStore.getState().changingTo).toBe("auto");
+    resolveRequest?.(snapshot("engine-a", 1, 2, "auto"));
+    await changing;
+
+    expect(useAutomationStore.getState().snapshot?.mode).toBe("auto");
+    expect(useAutomationStore.getState().changingTo).toBeNull();
+  });
+
+  it("화면상 이미 선택된 모드도 백엔드에 보내 실제 상태를 재확인한다", async () => {
+    useAutomationStore.setState({
+      snapshot: snapshot("engine-a", 1, 1, "auto"),
+    });
+    setControlModeMock.mockResolvedValue(snapshot("engine-a", 1, 2, "auto"));
+
+    await useAutomationStore.getState().changeMode("auto");
+
+    expect(setControlModeMock).toHaveBeenCalledWith("auto");
+    expect(useAutomationStore.getState().snapshot?.revision).toBe(2);
+  });
+
+  it("전환 실패 후 현재 백엔드 상태를 강제 조회해 화면을 복구한다", async () => {
+    useAutomationStore.setState({
+      snapshot: snapshot("engine-a", 1, 1, "manual"),
+    });
+    setControlModeMock.mockRejectedValue(new Error("전환 실패"));
+    getAutomationStatusMock.mockResolvedValue(snapshot("engine-b", 2, 1, "auto"));
+
+    await expect(useAutomationStore.getState().changeMode("auto")).rejects.toThrow("전환 실패");
+
+    expect(getAutomationStatusMock).toHaveBeenCalledTimes(1);
+    expect(useAutomationStore.getState().snapshot?.mode).toBe("auto");
+    expect(useAutomationStore.getState().changingTo).toBeNull();
+  });
+
+  it("이전 엔진의 명령 응답이면 현재 엔진 상태를 다시 조회한다", async () => {
+    useAutomationStore.setState({
+      snapshot: snapshot("engine-b", 11, 1, "manual"),
+    });
+    setControlModeMock.mockResolvedValue(snapshot("engine-a", 10, 999, "auto"));
+    getAutomationStatusMock.mockResolvedValue(snapshot("engine-b", 11, 2, "auto"));
+
+    const confirmed = await useAutomationStore.getState().changeMode("auto");
+
+    expect(getAutomationStatusMock).toHaveBeenCalledTimes(1);
+    expect(confirmed).toMatchObject({ runtimeId: "engine-b", mode: "auto", revision: 2 });
   });
 });

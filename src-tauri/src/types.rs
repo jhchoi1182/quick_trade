@@ -47,9 +47,12 @@ pub enum ControlMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "camelCase")]
 pub enum MarketDayStatus {
     Open,
+    /// KIS 개장일 조회가 불명확하지만 세 자동 종목의 KRX 실시간 체결·호가가
+    /// 모두 신선해 장중으로 판정한 휘발성 상태.
+    OpenByQuotes,
     Closed,
     #[default]
     Unknown,
@@ -515,5 +518,13 @@ mod tests {
         assert_eq!(value["scenarios"][0]["referencePrice"], 185_200);
         assert_eq!(value["scenarios"][0]["confirmationPrice"], 184_800);
         assert_eq!(value["scenarios"][0]["invalidationPrice"], 185_400);
+    }
+
+    #[test]
+    fn 시세기반_개장상태는_프론트계약의_camel_case로_직렬화된다() {
+        assert_eq!(
+            serde_json::to_value(MarketDayStatus::OpenByQuotes).unwrap(),
+            "openByQuotes"
+        );
     }
 }

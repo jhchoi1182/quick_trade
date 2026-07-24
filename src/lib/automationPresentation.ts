@@ -5,6 +5,7 @@ import type {
   DecisionScenarioProduct,
   DecisionSetupType,
   MarketRegime,
+  MarketDayStatus,
   ScenarioProduct,
   SetupType,
 } from "../types";
@@ -12,6 +13,15 @@ import type {
 type AnyProduct = ScenarioProduct | DecisionScenarioProduct;
 type AnySetupType = SetupType | DecisionSetupType | null | undefined;
 type AnyMarketRegime = MarketRegime | DecisionMarketRegime | null | undefined;
+
+export function formatAutomationPhaseLabel(
+  marketDayStatus: MarketDayStatus,
+  phaseLabel: string,
+): string {
+  if (marketDayStatus === "closed") return "휴장일 · 자동 일시정지";
+  if (marketDayStatus === "unknown") return "개장일 확인 대기 · 신규 진입 중지";
+  return phaseLabel;
+}
 
 /** 시나리오가 없는 판단을 SKIP·검증 실패·폐기 등 실제 종결 상태대로 표시한다. */
 export function formatEmptyDecisionMessage(

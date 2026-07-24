@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  formatAutomationPhaseLabel,
   formatDecisionStatus,
   formatEmptyDecisionMessage,
   formatLiveScenarioProgress,
@@ -8,6 +9,11 @@ import {
 } from "./automationPresentation";
 
 describe("전문 스캘퍼 판단 표시", () => {
+  it("실시간 KRX 시세 기반 개장 상태는 자동 판단 단계를 그대로 표시한다", () => {
+    expect(formatAutomationPhaseLabel("openByQuotes", "다음 판단 대기")).toBe("다음 판단 대기");
+    expect(formatAutomationPhaseLabel("unknown", "다음 판단 대기")).toContain("신규 진입 중지");
+  });
+
   it("상품 방향과 셋업 조합을 네 진입 패턴으로 표시한다", () => {
     expect(formatSetupLabel("LEVERAGE", "CONTINUATION")).toBe("상승 돌파");
     expect(formatSetupLabel("INVERSE", "CONTINUATION")).toBe("하락 이탈");

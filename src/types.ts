@@ -6,7 +6,7 @@ export interface SymbolConfig {
 }
 
 export type ControlMode = "manual" | "auto" | "shadow";
-export type MarketDayStatus = "open" | "closed" | "unknown";
+export type MarketDayStatus = "open" | "openByQuotes" | "closed" | "unknown";
 
 export interface AutoSymbols {
   underlying: string;

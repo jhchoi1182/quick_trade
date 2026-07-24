@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import type { AutomationPhase, AutomationScenario, ScenarioProduct } from "../types";
 import { formatCompactKrw, formatPrice, formatRate, rateClass } from "../lib/format";
 import {
+  formatAutomationPhaseLabel,
   formatEmptyDecisionMessage,
   formatLiveScenarioProgress,
   formatMarketRegime,
@@ -106,11 +107,7 @@ export function AutomationPanel() {
   const marketDayStatus = useAutomationStore((s) => s.snapshot?.marketDayStatus ?? "unknown");
   const marketDayMessage = useAutomationStore((s) => s.snapshot?.marketDayMessage ?? null);
   const remainingSeconds = useDeadlineSeconds(position?.exitDeadline);
-  const phaseLabel = marketDayStatus === "closed"
-    ? "휴장일 · 자동 일시정지"
-    : marketDayStatus === "unknown"
-      ? "개장일 확인 대기 · 신규 진입 중지"
-      : PHASE_LABEL[phase];
+  const phaseLabel = formatAutomationPhaseLabel(marketDayStatus, PHASE_LABEL[phase]);
 
   return (
     <section className={`automation-panel ${mode === "shadow" ? "shadow" : "auto"}`} aria-live="polite">
